@@ -1,0 +1,61 @@
+// Shared types mirroring the real tradefinder.in /api_be data model.
+// See docs/04-COMPLETE-DATA-MODEL.md for the source-of-truth mapping.
+
+export type Signal = 'BULL' | 'BEAR';
+// 'stale' = real NSE data from an earlier successful fetch, re-served while NSE is
+// unreachable. Real prices, just not current — distinct from fabricated 'mock' data.
+export type Source = 'nse' | 'mock' | 'stale';
+
+export interface Envelope<T> {
+  payload: { data: T };
+  status: 'SUCCESS';
+  source: Source;
+}
+
+// ---- Market Pulse ----
+// The real tradefinder API uses a flat param_N schema per row. The meaning of
+// each param differs by widget (see marketPulse() in services.ts):
+//   breakout_beacon:      param_0=%chg  param_1=signal%  param_2="BULL"/"BEAR"  param_3=epoch(s)
+//   intraday_boost /      param_0=LTP   param_1=prevClose param_2=%chg          param_3=R.Factor
+//     top_gainers/losers
+//   high_powered_stocks:  param_0=LTP   param_1=prevClose param_2=%chg          param_3=turnover(₹Cr)
+//   top_level/low_level:  param_0=LTP   param_1=prevClose param_2=%chg          param_3=diff (dist from day high/low)
+export interface BeaconRow { Symbol: string; param_0: number; param_1: number; param_2: Signal; param_3: number; }
+export interface ParamRow { Symbol: string; param_0: number; param_1: number; param_2: number; param_3: number; }
+export interface MarketPulse {
+  breakout_beacon: BeaconRow[];
+  intraday_boost: ParamRow[];
+  top_gainers: ParamRow[];
+  top_losers: ParamRow[];
+  high_powered_stocks: ParamRow[];
+  top_level_stocks: ParamRow[];
+  low_level_stocks: ParamRow[];
+}
+
+// ---- Sector Scope ----
+export interface SectorStock { Symbol: string; ltp: number; open: number; prevClose: number; pChange: number; rFactor: number; weight: number; }
+export type SectorScope = Record<string, SectorStock[]>;
+
+// ---- Index Mover ----
+export interface MoverStock { Symbol: string; per_change: number; per_to_index: number; point_to_index: number; }
+export interface IndexMover {
+  index: string; level: number; points: number | null; pct: number | null;
+  gainers: number; losers: number; stocks: MoverStock[];
+}
+
+// ---- Option Analysis ----
+export interface OiRow { strike: number; ceOI: number; peOI: number; ceChg: number; peChg: number; }
+export interface OptionAnalysis {
+  symbol: string; spot: number; atm: number; expiry: string | null; expiries: string[];
+  rows: OiRow[]; pcr: number; maxPainStrike: number;
+}
+
+// ---- Scanners (Swing / Insider) ----
+export interface ScanRow { Symbol: string; pChange: number; price: number; signal?: Signal; when: string; score?: number; }
+export type ScannerGroups = Record<string, ScanRow[]>;
+
+// ---- FII / DII ----
+export interface FiiDiiRow {
+  date: string; fiiBuy: number; fiiSell: number; fiiNet: number;
+  inMarket: number; diiNet: number; diiBuy: number; diiSell: number;
+}

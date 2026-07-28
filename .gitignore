@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.cache/
+dev-out.log
+dev-err.log
+*.log
