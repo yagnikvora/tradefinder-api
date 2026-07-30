@@ -49,6 +49,11 @@ async function refreshCookie(force = false): Promise<void> {
         cookie = set.map((c: string) => c.split(';')[0]).join('; ');
         cookieAt = Date.now();
       }
+    } catch {
+      // A failed handshake must not fail the request that asked for it. The homepage
+      // is the first thing NSE tarpits, and rejecting here threw out of every nseGet
+      // at once — one slow homepage hit took down the whole page. An expired cookie is
+      // often still accepted, and if it isn't, the 401/403 replay below gets another go.
     } finally {
       refreshing = null;
     }
@@ -166,13 +171,20 @@ export async function fnoSymbols(): Promise<string[]> {
 export async function liveBroadConstituents(): Promise<NseConstituent[]> {
   const bySymbol = new Map<string, NseConstituent>();
   let anyOk = false;
+  let rehandshaked = false;
   for (const idx of BROAD_INDICES) {
     try {
       const j = await indexConstituents(idx);
       const rows = (j.data || []).filter((r) => r.symbol && r.symbol !== idx && r.lastPrice != null);
       if (rows.length) anyOk = true;
       for (const r of rows) if (!bySymbol.has(r.symbol)) bySymbol.set(r.symbol, r);
-    } catch { /* skip an index NSE won't serve right now */ }
+    } catch {
+      // Skip an index NSE won't serve right now — but the usual reason all three fail
+      // together is a session NSE has stopped answering, and that shows up as a timeout
+      // rather than the 401/403 nseGet replays on. Force one fresh handshake and let the
+      // remaining indices try with it, instead of losing the whole universe to a dead cookie.
+      if (!rehandshaked) { rehandshaked = true; await refreshCookie(true); }
+    }
   }
   if (!anyOk) throw new Error('no broad index returned live data');
   return [...bySymbol.values()];
@@ -183,26 +195,55 @@ export async function liveBroadConstituents(): Promise<NseConstituent[]> {
 export async function marketConstituents(): Promise<NseConstituent[]> {
   const [fno, live] = await Promise.all([fnoSymbols(), liveBroadConstituents()]);
   const tradable = new Set(fno);
-  return live.filter((r) => tradable.has(r.symbol));
+  const rows = live.filter((r) => tradable.has(r.symbol));
+  // Coverage guard. NIFTY 500 carries nearly the whole F&O list on its own, so when it
+  // is the index NSE declines and MIDSMALLCAP is the one that answers, this returns a
+  // universe with every large cap (RELIANCE, HDFCBANK, TCS…) quietly missing — around
+  // half the usual rows. That renders as a plausible-looking but wrong board, which is
+  // worse than an outage, so fail and let the caller serve the last good snapshot.
+  if (rows.length < tradable.size * 0.7)
+    throw new Error(`partial universe: ${rows.length}/${tradable.size} F&O symbols priced`);
+  return rows;
 }
 
+export interface NseOptionLeg { openInterest: number; changeinOpenInterest: number; }
+export interface NseOptionRow {
+  strikePrice: number;
+  // v3 omits this on the rows — the chain it returns is already a single expiry.
+  expiryDate?: string;
+  CE?: NseOptionLeg;
+  PE?: NseOptionLeg;
+}
 export interface NseOptionChain {
   records: {
-    data: Array<{ strikePrice: number; expiryDate: string;
-      CE?: { openInterest: number; changeinOpenInterest: number };
-      PE?: { openInterest: number; changeinOpenInterest: number }; }>;
-    expiryDates: string[]; underlyingValue: number;
+    data: NseOptionRow[];
+    expiryDates: string[];
+    underlyingValue: number;
+    timestamp?: string; // "30-Jul-2026 15:30:00", IST — when NSE last stamped the chain
   };
 }
-export async function optionChain(symbol = 'NIFTY'): Promise<NseOptionChain> {
-  const paths = [
-    `/api/option-chain-v3?type=Indices&symbol=${encodeURIComponent(symbol)}`,
-    `/api/option-chain-indices?symbol=${encodeURIComponent(symbol)}`,
-  ];
-  let lastErr: unknown;
-  for (const p of paths) {
-    try { const j = await nseGet<NseOptionChain>(p); if (j?.records) return j; }
-    catch (e) { lastErr = e; }
-  }
-  throw lastErr ?? new Error('option chain unavailable');
+
+// Expiry dates for an index, nearest first ("04-Aug-2026"). Separate call because the
+// option chain itself now needs an expiry up front, so there's nothing to read it from.
+export async function optionExpiries(symbol = 'NIFTY'): Promise<string[]> {
+  const j = await nseGet<{ expiryDates?: string[] }>(
+    `/api/option-chain-contract-info?symbol=${encodeURIComponent(symbol)}`,
+  );
+  const list = j?.expiryDates ?? [];
+  if (!list.length) throw new Error(`no expiries for ${symbol}`);
+  return list;
+}
+
+// One expiry's option chain, with open interest and today's OI change per strike.
+//
+// The `expiry` parameter is not optional to NSE even though it reads that way: v3
+// answers 200 with an empty body when it's missing, and the older
+// /api/option-chain-indices path — which did serve the whole chain at once — now 404s.
+export async function optionChain(symbol = 'NIFTY', expiry?: string): Promise<NseOptionChain> {
+  const exp = expiry || (await optionExpiries(symbol))[0];
+  const j = await nseGet<NseOptionChain>(
+    `/api/option-chain-v3?type=Indices&symbol=${encodeURIComponent(symbol)}&expiry=${encodeURIComponent(exp)}`,
+  );
+  if (!j?.records?.data?.length) throw new Error(`empty option chain for ${symbol} ${exp}`);
+  return j;
 }

@@ -50,6 +50,18 @@ export interface OptionAnalysis {
   rows: OiRow[]; pcr: number; maxPainStrike: number;
 }
 
+// ---- Option Clock ----
+// The feed is deliberately shaped exactly like the real one: a map of snapshot
+// timestamp -> { "NFO:<underlying><expiry code><strike><CE|PE>": openInterest, atm }.
+// CE legs are the bears, PE legs the bulls; the clock plots the change between two
+// snapshots. See docs/04-COMPLETE-DATA-MODEL.md.
+export type OiSnapshot = Record<string, number>;
+export type OiSnapshots = Record<string, OiSnapshot>;
+// [epoch(s) of expiry day at 15:30 IST, "wk" | "mo"]
+export type RunningExpiry = [number, 'wk' | 'mo'];
+// One reading of the PCR trend: [epoch(s), PCR, total put OI, total call OI]
+export type PcrPoint = [number, number, number, number];
+
 // ---- Scanners (Swing / Insider) ----
 export interface ScanRow { Symbol: string; pChange: number; price: number; signal?: Signal; when: string; score?: number; }
 export type ScannerGroups = Record<string, ScanRow[]>;

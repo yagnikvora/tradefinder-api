@@ -74,6 +74,17 @@ function sessionFraction(nowUtcMs: number): number {
   return (istMin - open) / (close - open);
 }
 
+// NSE cash session in IST: 09:15–15:30, Mon–Fri. Outside it the numbers are frozen
+// for the day, which is what lets the cache in index.ts stop re-fetching. (Trading
+// holidays aren't tracked — one just reads as "open" and re-fetches unchanged data.)
+export function marketOpen(nowMs: number = Date.now()): boolean {
+  const ist = new Date(nowMs + 330 * 60_000); // shift so the UTC getters read IST
+  const dow = ist.getUTCDay();
+  if (dow === 0 || dow === 6) return false;
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
+}
+
 // Level calibration onto tradefinder's published R.Factor scale.
 //
 // The raw ratio below has the right SHAPE but sits about a quarter low: scored against
@@ -185,7 +196,7 @@ export async function marketPulse(): Promise<Result<MarketPulse>> {
     const lowLevel = [...s].map((q) => ({ q, d: diffFromLow(q) })).sort((a, b) => a.d - b.d).slice(0, 25)
       .map(({ q, d }) => ({ Symbol: q.Symbol, param_0: q.ltp, param_1: q.prevClose, param_2: q.pChange, param_3: d }));
 
-    return { source: 'nse', data: {
+    const data: MarketPulse = {
       breakout_beacon: beacon,
       intraday_boost: boost,
       top_gainers: gainers,
@@ -193,8 +204,16 @@ export async function marketPulse(): Promise<Result<MarketPulse>> {
       high_powered_stocks: highPower,
       top_level_stocks: topLevel,
       low_level_stocks: lowLevel,
-    } };
-  } catch (e) { return { source: 'mock', error: String((e as Error).message), data: mock.mockMarketPulse() }; }
+    };
+    return { source: 'nse', data: await remember('market_pulse', data) };
+  } catch (e) {
+    // Same reasoning as sector scope: NSE drops out often enough that a refresh can
+    // land on an outage, and swapping a live board for invented prices is the most
+    // visible way this app can be wrong. Re-serve the last real board instead.
+    const prev = await recall<MarketPulse>('market_pulse');
+    if (prev) return { source: 'stale', error: `NSE unreachable, showing last live data (${ageLabel(prev.ageMs)} old)`, data: prev.data };
+    return { source: 'mock', error: String((e as Error).message), data: mock.mockMarketPulse() };
+  }
 }
 
 // Treemap group labels: the NIFTY prefix is dropped for sector indices, but kept
@@ -271,7 +290,8 @@ export async function optionAnalysis(symbol = 'NIFTY'): Promise<Result<OptionAna
   try {
     const j = await optionChain(symbol); const rec = j.records; const spot = rec.underlyingValue;
     const atm = Math.round(spot/50)*50; const exp = rec.expiryDates[0];
-    const rows = rec.data.filter((d)=>d.expiryDate===exp && Math.abs(d.strikePrice-atm)<=500)
+    // No expiryDate filter: v3 serves one expiry per call and leaves the field off the rows.
+    const rows = rec.data.filter((d)=>Math.abs(d.strikePrice-atm)<=500)
       .map((d)=>({ strike: d.strikePrice, ceOI: d.CE?.openInterest||0, peOI: d.PE?.openInterest||0,
         ceChg: d.CE?.changeinOpenInterest||0, peChg: d.PE?.changeinOpenInterest||0 }));
     const ce = rows.reduce((a,r)=>a+r.ceOI,0), pe = rows.reduce((a,r)=>a+r.peOI,0);

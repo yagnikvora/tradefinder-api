@@ -1,0 +1,41 @@
+# systemd unit for the Option Clock OI recorder — for a Raspberry Pi, mini PC or VPS
+# that stays on. On Windows use tools/install-recorder.ps1 instead.
+#
+# Run tools/check-nse.mjs on the host first: NSE refuses a lot of datacentre address
+# space, and a blocked host records nothing but gaps.
+#
+#   1. Edit User= / WorkingDirectory= / the two log paths below.
+#   2. sudo cp tools/tradefinder-recorder.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#      sudo systemctl enable --now tradefinder-recorder
+#   4. journalctl -u tradefinder-recorder -f      # or: tail -f api/recorder.log
+#
+# The recorder idles outside 09:15-15:30 IST Mon-Fri, so it is meant to stay running.
+
+[Unit]
+Description=TradeFinder OI recorder (Option Clock PCR trend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- edit for this host -------------------------------------------------------
+User=pi
+WorkingDirectory=/home/pi/tradefinder-app/api
+ExecStart=/usr/bin/npm run record
+StandardOutput=append:/home/pi/tradefinder-app/api/recorder.log
+StandardError=append:/home/pi/tradefinder-app/api/recorder.log
+# ------------------------------------------------------------------------------
+
+# Market hours are computed in IST from the clock, whatever the host's timezone is set
+# to; TZ here only affects anything the runtime itself prints.
+Environment=NODE_ENV=production
+
+# A crashed recorder is a hole in the day's data, so always come back. The delay keeps a
+# host with no network from spinning on restarts.
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
