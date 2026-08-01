@@ -1,6 +1,12 @@
 node_modules/
 dist/
+
+# Snapshot cache and volume history — regenerated from the feeds, not source.
 .cache/
-dev-out.log
-dev-err.log
+
+# Holds UPSTOX_ACCESS_TOKEN — credentials must never be committed.
+# .env.example is the template.
+.env
+.env.local
+
 *.log

@@ -2,15 +2,13 @@
 // See docs/04-COMPLETE-DATA-MODEL.md for the source-of-truth mapping.
 
 export type Signal = 'BULL' | 'BEAR';
-// 'stale' = real NSE data from an earlier successful fetch, re-served while NSE is
-// unreachable. Real prices, just not current — distinct from fabricated 'mock' data.
-export type Source = 'nse' | 'mock' | 'stale';
-
-export interface Envelope<T> {
-  payload: { data: T };
-  status: 'SUCCESS';
-  source: Source;
-}
+// Where a payload came from.
+//   'nse'    — read live from NSE's public API
+//   'upstox' — read live from Upstox's market API (Option Apex's PCR)
+//   'stale'  — real data from an earlier successful fetch, re-served while the upstream is
+//              unreachable. Real numbers, just not current — distinct from fabricated data.
+//   'mock'   — deterministic demo data, invented
+export type Source = 'nse' | 'upstox' | 'mock' | 'stale';
 
 // ---- Market Pulse ----
 // The real tradefinder API uses a flat param_N schema per row. The meaning of
@@ -41,13 +39,6 @@ export interface MoverStock { Symbol: string; per_change: number; per_to_index: 
 export interface IndexMover {
   index: string; level: number; points: number | null; pct: number | null;
   gainers: number; losers: number; stocks: MoverStock[];
-}
-
-// ---- Option Analysis ----
-export interface OiRow { strike: number; ceOI: number; peOI: number; ceChg: number; peChg: number; }
-export interface OptionAnalysis {
-  symbol: string; spot: number; atm: number; expiry: string | null; expiries: string[];
-  rows: OiRow[]; pcr: number; maxPainStrike: number;
 }
 
 // ---- Option Clock ----

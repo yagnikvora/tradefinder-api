@@ -39,4 +39,3 @@ export const SECTOR_BASKETS: Record<string, string[]> = {
 
 // OTHERS is a catch-all bucket: it appears in the treemap but not in the strength
 // bars or the per-sector tables, matching the real page.
-export const TREEMAP_ONLY = new Set(['OTHERS']);

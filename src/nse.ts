@@ -68,7 +68,7 @@ async function get(path: string): Promise<Response> {
   });
 }
 
-export async function nseGet<T = any>(path: string): Promise<T> {
+async function nseGet<T = any>(path: string): Promise<T> {
   await refreshCookie();
   let res = await get(path);
   // A rejected session is usually recoverable: re-handshake once and replay, rather
@@ -87,7 +87,7 @@ export interface NseConstituent {
   totalTradedValue?: number; totalTradedVolume?: number; priority?: number; change?: number;
   dayHigh?: number; dayLow?: number; open?: number;
 }
-export interface NseIndexResp { data: NseConstituent[]; }
+interface NseIndexResp { data: NseConstituent[]; }
 
 export function indexConstituents(index = 'NIFTY 50') {
   return nseGet<NseIndexResp>(`/api/equity-stock-indices?index=${encodeURIComponent(index)}`);
@@ -150,7 +150,7 @@ const DAY = 24 * 60 * 60 * 1000;
 
 // The list of NSE stocks that have options (F&O-enabled), fetched live from
 // master-quote and cached ~1 day. Falls back to the static list if unreachable.
-export async function fnoSymbols(): Promise<string[]> {
+async function fnoSymbols(): Promise<string[]> {
   if (fnoCache && Date.now() - fnoCache.at < DAY) return fnoCache.symbols;
   try {
     const arr = await nseGet<string[]>(FNO_MASTER_URL);
@@ -204,46 +204,4 @@ export async function marketConstituents(): Promise<NseConstituent[]> {
   if (rows.length < tradable.size * 0.7)
     throw new Error(`partial universe: ${rows.length}/${tradable.size} F&O symbols priced`);
   return rows;
-}
-
-export interface NseOptionLeg { openInterest: number; changeinOpenInterest: number; }
-export interface NseOptionRow {
-  strikePrice: number;
-  // v3 omits this on the rows — the chain it returns is already a single expiry.
-  expiryDate?: string;
-  CE?: NseOptionLeg;
-  PE?: NseOptionLeg;
-}
-export interface NseOptionChain {
-  records: {
-    data: NseOptionRow[];
-    expiryDates: string[];
-    underlyingValue: number;
-    timestamp?: string; // "30-Jul-2026 15:30:00", IST — when NSE last stamped the chain
-  };
-}
-
-// Expiry dates for an index, nearest first ("04-Aug-2026"). Separate call because the
-// option chain itself now needs an expiry up front, so there's nothing to read it from.
-export async function optionExpiries(symbol = 'NIFTY'): Promise<string[]> {
-  const j = await nseGet<{ expiryDates?: string[] }>(
-    `/api/option-chain-contract-info?symbol=${encodeURIComponent(symbol)}`,
-  );
-  const list = j?.expiryDates ?? [];
-  if (!list.length) throw new Error(`no expiries for ${symbol}`);
-  return list;
-}
-
-// One expiry's option chain, with open interest and today's OI change per strike.
-//
-// The `expiry` parameter is not optional to NSE even though it reads that way: v3
-// answers 200 with an empty body when it's missing, and the older
-// /api/option-chain-indices path — which did serve the whole chain at once — now 404s.
-export async function optionChain(symbol = 'NIFTY', expiry?: string): Promise<NseOptionChain> {
-  const exp = expiry || (await optionExpiries(symbol))[0];
-  const j = await nseGet<NseOptionChain>(
-    `/api/option-chain-v3?type=Indices&symbol=${encodeURIComponent(symbol)}&expiry=${encodeURIComponent(exp)}`,
-  );
-  if (!j?.records?.data?.length) throw new Error(`empty option chain for ${symbol} ${exp}`);
-  return j;
 }

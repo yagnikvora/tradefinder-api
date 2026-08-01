@@ -192,6 +192,9 @@ export async function avgDailyRanges(now: Date = new Date()): Promise<Record<str
 }
 
 /** How many trading days of history are currently cached (for diagnostics). */
+// NOTE: historyDepth and avgDailyVolumes are reached through a dynamic import() in
+// index.ts (/health/volume), so a grep for a static import of them finds nothing. They are
+// used — don't delete them on the strength of a dead-code sweep.
 export async function historyDepth(): Promise<number> {
   if (!mem) mem = await loadCache();
   return Object.keys(mem.days).length;

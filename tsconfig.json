@@ -7,7 +7,12 @@
     "strict": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "types": ["node"]
+    "types": ["node"],
+    // `npm run build` emits plain ESM here, so a host can run `node dist/index.js`
+    // without tsx. Imports already carry .js extensions, which is what Node's ESM
+    // loader needs. Development still runs the TypeScript directly.
+    "outDir": "dist",
+    "rootDir": "src"
   },
   "include": ["src"]
 }

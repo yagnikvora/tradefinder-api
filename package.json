@@ -6,8 +6,11 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "record": "tsx src/recorder.ts",
-    "check-nse": "node tools/check-nse.mjs"
+    "build": "tsc",
+    "start:prod": "node dist/index.js",
+    "check-nse": "node tools/check-nse.mjs",
+    "check-flux": "tsx tools/flux-validate.ts",
+    "check-upstox": "tsx tools/upstox-validate.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

@@ -1,6 +1,6 @@
 // Deterministic mock data — identical shapes to live — so the app always runs.
 import type {
-  MarketPulse, SectorScope, IndexMover, OptionAnalysis, ScannerGroups, FiiDiiRow, Signal,
+  MarketPulse, SectorScope, IndexMover, ScannerGroups, FiiDiiRow, Signal,
 } from './types.js';
 import { SECTOR_BASKETS } from './sectors.js';
 
@@ -96,16 +96,6 @@ export function mockIndexMover(index = 'NIFTY 50'): IndexMover {
   return { index, level, points: +tot.toFixed(2), pct: +(tot/level*100).toFixed(2), gainers: up, losers: down, stocks };
 }
 
-export function mockOption(symbol = 'NIFTY'): OptionAnalysis {
-  const spot = 24081; const atm = Math.round(spot/50)*50; const rows = [];
-  for (let k = atm-500; k <= atm+500; k += 50) { const d = Math.abs(k-atm)/50;
-    rows.push({ strike: k,
-      ceOI: Math.round((k>=atm?120000:40000)*(1+rnd())/(1+d*0.2)), peOI: Math.round((k<=atm?120000:40000)*(1+rnd())/(1+d*0.2)),
-      ceChg: Math.round((rnd()-0.5)*20000), peChg: Math.round((rnd()-0.5)*20000) }); }
-  const pcr = rows.reduce((a,r)=>a+r.peOI,0)/rows.reduce((a,r)=>a+r.ceOI,0);
-  const maxPain = rows.slice().sort((a,b)=>(a.ceOI+a.peOI)-(b.ceOI+b.peOI))[0].strike;
-  return { symbol, spot, atm, expiry: '07-Jul-2026', expiries: ['07-Jul-2026','14-Jul-2026','31-Jul-2026'], rows, pcr: +pcr.toFixed(2), maxPainStrike: atm };
-}
 
 export function mockScanners(keys: string[]): ScannerGroups {
   const out: ScannerGroups = {};

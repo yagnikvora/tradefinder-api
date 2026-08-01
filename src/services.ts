@@ -1,13 +1,13 @@
 // Service layer: transform live NSE data into typed payloads; fall back to mock.
 import {
-  indexConstituents, liveBroadConstituents, marketConstituents, optionChain, type NseConstituent,
+  indexConstituents, liveBroadConstituents, marketConstituents, type NseConstituent,
 } from './nse.js';
 import { avgDailyRanges } from './volume.js';
 import { SECTOR_BASKETS } from './sectors.js';
 import { remember, recall, ageLabel } from './snapshot.js';
 import * as mock from './mock.js';
 import type {
-  MarketPulse, SectorScope, IndexMover, OptionAnalysis, ScannerGroups, FiiDiiRow, Source,
+  MarketPulse, SectorScope, IndexMover, ScannerGroups, FiiDiiRow, Source,
 } from './types.js';
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -286,19 +286,6 @@ export async function indexMover(index = 'NIFTY 50'): Promise<Result<IndexMover>
   } catch (e) { return { source: 'mock', error: String((e as Error).message), data: mock.mockIndexMover(index) }; }
 }
 
-export async function optionAnalysis(symbol = 'NIFTY'): Promise<Result<OptionAnalysis>> {
-  try {
-    const j = await optionChain(symbol); const rec = j.records; const spot = rec.underlyingValue;
-    const atm = Math.round(spot/50)*50; const exp = rec.expiryDates[0];
-    // No expiryDate filter: v3 serves one expiry per call and leaves the field off the rows.
-    const rows = rec.data.filter((d)=>Math.abs(d.strikePrice-atm)<=500)
-      .map((d)=>({ strike: d.strikePrice, ceOI: d.CE?.openInterest||0, peOI: d.PE?.openInterest||0,
-        ceChg: d.CE?.changeinOpenInterest||0, peChg: d.PE?.changeinOpenInterest||0 }));
-    const ce = rows.reduce((a,r)=>a+r.ceOI,0), pe = rows.reduce((a,r)=>a+r.peOI,0);
-    const maxPain = rows.slice().sort((a,b)=>(a.ceOI+a.peOI)-(b.ceOI+b.peOI))[0]?.strike ?? atm;
-    return { source: 'nse', data: { symbol, spot, atm, expiry: exp, expiries: rec.expiryDates.slice(0,6), rows, pcr: +(pe/(ce||1)).toFixed(2), maxPainStrike: maxPain } };
-  } catch (e) { return { source: 'mock', error: String((e as Error).message), data: mock.mockOption(symbol) }; }
-}
 
 // These need a licensed tick/daily feed to compute for real — served as structured mock.
 export async function swing(): Promise<Result<ScannerGroups>> {

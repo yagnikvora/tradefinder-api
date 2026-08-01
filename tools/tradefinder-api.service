@@ -1,0 +1,34 @@
+# systemd unit for the API. Pairs with tradefinder-recorder.service — run both on the
+# same always-on host and it serves whatever has been recorded, to whoever asks.
+#
+#   1. Edit User= / WorkingDirectory= / EnvironmentFile= below.
+#   2. sudo cp tools/tradefinder-api.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#      sudo systemctl enable --now tradefinder-api
+#   4. curl http://localhost:4100/health
+#
+# The two services are deliberately separate: the recorder is the thing that must never
+# miss a tick, and it should not go down because the API was restarted.
+
+[Unit]
+Description=TradeFinder API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- edit for this host -------------------------------------------------------
+User=pi
+WorkingDirectory=/home/pi/tradefinder-app/api
+ExecStart=/usr/bin/npm start
+# Holds DATABASE_URL. Keep it 0600 — it carries the database password.
+EnvironmentFile=/home/pi/tradefinder-app/api/.env
+# ------------------------------------------------------------------------------
+
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
