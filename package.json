@@ -8,7 +8,6 @@
     "start": "tsx src/index.ts",
     "build": "tsc",
     "start:prod": "node dist/index.js",
-    "check-nse": "node tools/check-nse.mjs",
     "check-flux": "tsx tools/flux-validate.ts",
     "check-upstox": "tsx tools/upstox-validate.ts"
   },

@@ -1,7 +1,6 @@
-// Service layer: transform live NSE data into typed payloads; fall back to mock.
-import {
-  indexConstituents, liveBroadConstituents, marketConstituents, type NseConstituent,
-} from './nse.js';
+// Service layer: transform live Upstox quotes into typed payloads; fall back to mock.
+import { allQuotes, fnoSymbols, quotesFor, type EquityQuote } from './equity.js';
+import { INDEX_MEMBERS } from './indices.js';
 import { avgDailyRanges } from './volume.js';
 import { SECTOR_BASKETS } from './sectors.js';
 import { remember, recall, ageLabel } from './snapshot.js';
@@ -12,48 +11,13 @@ import type {
 
 const now = () => Math.floor(Date.now() / 1000);
 
-function norm(j: { data: NseConstituent[] }, index: string) {
-  return (j.data || [])
-    .filter((r) => r.priority !== 1 && r.symbol && r.symbol !== index)
-    .map((r) => ({
-      Symbol: r.symbol, ltp: r.lastPrice,
-      prevClose: r.previousClose ?? r.lastPrice / (1 + (r.pChange || 0) / 100),
-      pChange: r.pChange ?? 0,
-      turnover: r.totalTradedValue ? +(r.totalTradedValue / 1e7).toFixed(1) : 0, // raw ₹ -> ₹Cr
-    }));
-}
 const rFactor = (p: number) => +Math.min(Math.abs(p || 0) / 1.5, 8).toFixed(2);
 
 export interface Result<T> { data: T; source: Source; error?: string; }
 
-// A live equity quote enriched with everything Market Pulse widgets need.
-interface FnoQuote {
-  Symbol: string; ltp: number; prevClose: number; pChange: number;
-  turnover: number; dayHigh: number; dayLow: number; volume: number; open: number;
-}
-
-function normFno(rows: NseConstituent[]): FnoQuote[] {
-  return rows
-    .filter((r) => r.symbol && r.lastPrice)
-    .map((r) => {
-      const ltp = r.lastPrice;
-      const prevClose = r.previousClose ?? ltp / (1 + (r.pChange || 0) / 100);
-      return {
-        Symbol: r.symbol,
-        ltp,
-        prevClose: +(+prevClose).toFixed(2),
-        pChange: +(r.pChange ?? 0).toFixed(2),
-        turnover: r.totalTradedValue ? +(r.totalTradedValue / 1e7).toFixed(2) : 0, // ₹ -> ₹Cr
-        dayHigh: r.dayHigh ?? ltp,
-        dayLow: r.dayLow ?? ltp,
-        volume: r.totalTradedVolume ?? 0, // today's cumulative traded shares
-        // Today's open drives the Sector Scope signal arrow: the arrow tracks
-        // LTP vs open (intraday direction), not the % change vs previous close —
-        // a stock can be up on the day but red because it's faded from the open.
-        open: r.open ?? prevClose,
-      };
-    });
-}
+// Everything the Market Pulse widgets need, which is exactly what a quote already carries.
+// Upstox derives previousClose and turnover in equity.ts; both were verified against NSE.
+type FnoQuote = EquityQuote;
 
 // Stable pseudo-random in [0,1) from a symbol string — keeps derived signals
 // deterministic across the 60s cache window instead of jittering each request.
@@ -152,8 +116,10 @@ function marketOpenEpoch(nowMs: number): number {
 
 export async function marketPulse(): Promise<Result<MarketPulse>> {
   try {
-    const [rows, avgRange] = await Promise.all([marketConstituents(), avgDailyRanges()]);
-    const s = normFno(rows);
+    const [s, avgRange] = await Promise.all([
+      fnoSymbols().then((syms) => quotesFor(syms, marketOpen())),
+      avgDailyRanges(),
+    ]);
     if (s.length < 20) throw new Error(`only ${s.length} market rows`);
     const nowMs = Date.now();
 
@@ -205,13 +171,13 @@ export async function marketPulse(): Promise<Result<MarketPulse>> {
       top_level_stocks: topLevel,
       low_level_stocks: lowLevel,
     };
-    return { source: 'nse', data: await remember('market_pulse', data) };
+    return { source: 'upstox', data: await remember('market_pulse', data) };
   } catch (e) {
     // Same reasoning as sector scope: NSE drops out often enough that a refresh can
     // land on an outage, and swapping a live board for invented prices is the most
     // visible way this app can be wrong. Re-serve the last real board instead.
     const prev = await recall<MarketPulse>('market_pulse');
-    if (prev) return { source: 'stale', error: `NSE unreachable, showing last live data (${ageLabel(prev.ageMs)} old)`, data: prev.data };
+    if (prev) return { source: 'stale', error: `Upstox unreachable, showing last live data (${ageLabel(prev.ageMs)} old)`, data: prev.data };
     return { source: 'mock', error: String((e as Error).message), data: mock.mockMarketPulse() };
   }
 }
@@ -223,17 +189,10 @@ const sectorLabel = (sec: string) => (KEEP_NIFTY.has(sec) ? sec : sec.replace('N
 
 export async function sectorScope(): Promise<Result<SectorScope>> {
   try {
-    // One broad-market pull, then sliced into the baskets — cheaper and far more
-    // reliable than 16 separate index calls, and it carries the volume needed for a
-    // real R.Factor.
-    //
-    // Deliberately the broad universe, NOT marketConstituents(): that one narrows to
-    // NSE's F&O master list, which drops names tradefinder's own baskets carry —
-    // SAMMAANCAP sits in their FIN SERVICE and in NIFTY 500, but not in master-quote,
-    // so the F&O filter silently deleted a row the real page shows. SECTOR_BASKETS is
-    // already the membership filter here, so the extra one only ever costs us rows.
-    const [rows, avgRange] = await Promise.all([liveBroadConstituents(), avgDailyRanges()]);
-    const quotes = new Map(normFno(rows).map((q) => [q.Symbol, q]));
+    // One quote call covers every basket member — equity.ts asks for the union of the
+    // whole app's universe, so this is the same request Market Pulse already made and
+    // costs nothing extra.
+    const [quotes, avgRange] = await Promise.all([allQuotes(marketOpen()), avgDailyRanges()]);
 
     // Coverage guard. marketConstituents() merges several broad indices and silently
     // tolerates any that NSE won't serve — so when NIFTY 500 fails we get a universe
@@ -264,25 +223,55 @@ export async function sectorScope(): Promise<Result<SectorScope>> {
       if (stocks.length) out[sector] = stocks;
     }
     if (!Object.keys(out).length) throw new Error('no sectors');
-    return { source: 'nse', data: await remember('sector_scope', out) };
+    return { source: 'upstox', data: await remember('sector_scope', out) };
   } catch (e) {
     // Prefer the last real snapshot over fabricated prices — see snapshot.ts.
     const prev = await recall<SectorScope>('sector_scope');
-    if (prev) return { source: 'stale', error: `NSE unreachable, showing last live data (${ageLabel(prev.ageMs)} old)`, data: prev.data };
+    if (prev) return { source: 'stale', error: `Upstox unreachable, showing last live data (${ageLabel(prev.ageMs)} old)`, data: prev.data };
     return { source: 'mock', error: String((e as Error).message), data: mock.mockSectorScope() };
   }
 }
 
+/**
+ * Point contribution per constituent.
+ *
+ * Membership comes from indices.ts, because no quote feed publishes index composition. The
+ * index level and the day's points come from the index's own quote, which is in the same
+ * batch as the constituents — so this is arithmetic over one request.
+ *
+ * The per-stock weight is an approximation from price, not the exchange's free-float
+ * weight, which is not in any public feed. It was that before this moved off NSE too; the
+ * ranking is right and the individual point figures are indicative. The index total is
+ * exact, because it is the index's own net change rather than a sum of these.
+ */
 export async function indexMover(index = 'NIFTY 50'): Promise<Result<IndexMover>> {
   try {
-    const j = await indexConstituents(index);
-    const sum = (j.data||[]).find((r)=>r.symbol===index);
-    const level = sum?.lastPrice || 24080;
-    const s = norm(j, index); const stocks = []; let up=0, down=0;
-    for (const x of s) { const w = (x.ltp||100)/(level*25); const pts = level*w*(x.pChange/100);
-      stocks.push({ Symbol: x.Symbol, per_change: x.pChange, per_to_index: +(w*x.pChange/100).toFixed(6), point_to_index: +pts.toFixed(3) });
-      x.pChange>=0?up++:down++; }
-    return { source: 'nse', data: { index, level, points: sum?.change ?? null, pct: sum?.pChange ?? null, gainers: up, losers: down, stocks } };
+    const members = INDEX_MEMBERS[index];
+    if (!members) throw new Error(`no constituent list for "${index}"`);
+    const quotes = await allQuotes(marketOpen());
+    const idx = quotes.get(index);
+    if (!idx) throw new Error(`no quote for ${index}`);
+
+    const level = idx.ltp;
+    const stocks = [];
+    let up = 0, down = 0;
+    for (const sym of members) {
+      const q = quotes.get(sym);
+      if (!q) continue;
+      const w = (q.ltp || 100) / (level * 25);
+      stocks.push({
+        Symbol: q.Symbol,
+        per_change: q.pChange,
+        per_to_index: +((w * q.pChange) / 100).toFixed(6),
+        point_to_index: +(level * w * (q.pChange / 100)).toFixed(3),
+      });
+      q.pChange >= 0 ? up++ : down++;
+    }
+    const points = +(idx.ltp - idx.prevClose).toFixed(2);
+    return {
+      source: 'upstox',
+      data: { index, level, points, pct: idx.pChange, gainers: up, losers: down, stocks },
+    };
   } catch (e) { return { source: 'mock', error: String((e as Error).message), data: mock.mockIndexMover(index) }; }
 }
 

@@ -48,7 +48,8 @@ class UpstoxError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
 }
 
-async function call<T>(path: string): Promise<T> {
+/** The one authenticated GET. Exported so equity.ts shares the token and error handling. */
+export async function call<T>(path: string): Promise<T> {
   const bearer = token();
   if (!bearer)
     throw new UpstoxError(
@@ -365,6 +366,24 @@ export interface Ladder {
  */
 const ladderCache = new Map<string, { at: number; v: Ladder }>();
 
+/**
+ * How long a fetched ladder stands.
+ *
+ * This is a rate-limit control, not a nicety. A ladder is ~42 requests, and Upstox allows
+ * 2000 per API per 30 minutes. At a 45-second TTL against a page polling every minute, one
+ * index in one browser tab burned ~1260 calls per 30 minutes — 63% of the budget, and two
+ * tabs would have exceeded it.
+ *
+ * Half the candle interval is the honest ceiling: the underlying candles only change every
+ * `interval` minutes, so refreshing faster than that cannot produce a new number. At the
+ * five minutes the ladder is built on this is 150s, which is ~10 refreshes per 30 minutes,
+ * or ~420 calls — a fifth of the budget, with room for several indices at once.
+ *
+ * A finished session is immutable, so it is held for hours.
+ */
+const ladderTtl = (isToday: boolean, intervalMin: number) =>
+  isToday ? Math.max(30e3, (intervalMin * 60e3) / 2) : 6 * 60 * 60e3;
+
 export async function ladder(
   script: string, expiry: string, day: string, today: string,
   atm: number, window = 10, interval = 5,
@@ -379,8 +398,7 @@ export async function ladder(
 
   const cacheKey = `${script}|${expiry}|${day}|${wanted[0]}-${wanted[wanted.length - 1]}|${interval}`;
   const hit = ladderCache.get(cacheKey);
-  // A finished session is immutable; today's is still being written.
-  if (hit && Date.now() - hit.at < (day === today ? 45e3 : 6 * 60 * 60e3)) return hit.v;
+  if (hit && Date.now() - hit.at < ladderTtl(day === today, interval)) return hit.v;
 
   const legs = forExpiry.filter((c) => wanted.includes(c.strike));
   const series = new Map<string, UpstoxCandle[]>();
