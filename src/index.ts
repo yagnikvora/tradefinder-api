@@ -4,6 +4,7 @@ import './env.js'; // must precede anything that reads process.env
 import express from 'express';
 import cors from 'cors';
 import * as svc from './services.js';
+import { overview } from './overview.js';
 import * as clock from './clock.js';
 import * as apex from './apex.js';
 import { isTimeframe } from './candles.js';
@@ -49,6 +50,7 @@ const send = <T>(res: express.Response, r: Result<T>) =>
   res.json({ payload: { data: r.data }, status: 'SUCCESS', source: r.source, ...(r.error ? { note: r.error } : {}) });
 
 app.get('/api_be/servertime', (_req, res) => res.json({ payload: { data: String(Date.now()) }, status: 'SUCCESS' }));
+app.get('/api_be/data/overview', async (_q, res) => send(res, await cached('ov', 15e3, overview)));
 app.get('/api_be/data/market_pulse', async (_q, res) => send(res, await cached('mp', 15e3, svc.marketPulse)));
 app.get('/api_be/data/sector_scope', async (_q, res) => send(res, await cached('ss', 60e3, svc.sectorScope)));
 app.get('/api_be/data/swing_spectrum', async (_q, res) => send(res, await cached('sw', 60e3, svc.swing)));

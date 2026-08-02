@@ -35,13 +35,45 @@ export const INDEX_MEMBERS: Record<string, string[]> = {
 };
 
 /**
- * Upstox instrument keys for the index levels themselves.
+ * The indices the app quotes, in the order the home-page ticker shows them.
  *
- * These ride in the same quote batch as the constituents, so Index Mover's headline costs
- * no extra request. Keys read off Upstox's instrument master — the display name is not the
- * trading symbol, and `NSE_INDEX|BANKNIFTY` is rejected where `NSE_INDEX|Nifty Bank` works.
+ * All of these ride in the same quote batch as the equity universe, so the whole ticker
+ * costs no extra request. Keys are read off Upstox's instrument master — the display name
+ * is not the trading symbol, and `NSE_INDEX|BANKNIFTY` is rejected where
+ * `NSE_INDEX|Nifty Bank` is accepted.
+ *
+ * Every entry here was confirmed to price. BSE's SENSEX is deliberately absent: it is not
+ * in NSE's instrument file, and a headline index showing an invented number is worse than
+ * one that is simply not listed.
  */
-export const INDEX_QUOTE_KEY: Record<string, string> = {
-  'NIFTY 50': 'NSE_INDEX|Nifty 50',
-  'NIFTY BANK': 'NSE_INDEX|Nifty Bank',
-};
+export const MARQUEE: { name: string; label: string; key: string }[] = [
+  { name: 'NIFTY 50', label: 'NIFTY 50', key: 'NSE_INDEX|Nifty 50' },
+  { name: 'NIFTY BANK', label: 'BANK NIFTY', key: 'NSE_INDEX|Nifty Bank' },
+  { name: 'FINNIFTY', label: 'FIN NIFTY', key: 'NSE_INDEX|Nifty Fin Service' },
+  { name: 'MIDCPNIFTY', label: 'MIDCP NIFTY', key: 'NSE_INDEX|NIFTY MID SELECT' },
+  { name: 'NIFTY NEXT 50', label: 'NEXT 50', key: 'NSE_INDEX|Nifty Next 50' },
+  { name: 'NIFTY 100', label: 'NIFTY 100', key: 'NSE_INDEX|Nifty 100' },
+  { name: 'NIFTY 500', label: 'NIFTY 500', key: 'NSE_INDEX|Nifty 500' },
+  { name: 'INDIA VIX', label: 'INDIA VIX', key: 'NSE_INDEX|India VIX' },
+  { name: 'NIFTY IT', label: 'IT', key: 'NSE_INDEX|Nifty IT' },
+  { name: 'NIFTY AUTO', label: 'AUTO', key: 'NSE_INDEX|Nifty Auto' },
+  { name: 'NIFTY PHARMA', label: 'PHARMA', key: 'NSE_INDEX|Nifty Pharma' },
+  { name: 'NIFTY FMCG', label: 'FMCG', key: 'NSE_INDEX|Nifty FMCG' },
+  { name: 'NIFTY METAL', label: 'METAL', key: 'NSE_INDEX|Nifty Metal' },
+  { name: 'NIFTY ENERGY', label: 'ENERGY', key: 'NSE_INDEX|Nifty Energy' },
+  { name: 'NIFTY REALTY', label: 'REALTY', key: 'NSE_INDEX|Nifty Realty' },
+  { name: 'NIFTY PSU BANK', label: 'PSU BANK', key: 'NSE_INDEX|Nifty PSU Bank' },
+];
+
+/**
+ * Index name -> Upstox instrument key.
+ *
+ * Derived from MARQUEE rather than written twice: the quote batch maps responses back by
+ * instrument key, so listing one index under two different names would make the two
+ * collide and silently drop one of them.
+ */
+export const INDEX_QUOTE_KEY: Record<string, string> =
+  Object.fromEntries(MARQUEE.map((m) => [m.name, m.key]));
+
+/** The four the home page gives full cards to, with a sparkline each. */
+export const HEADLINE_INDICES = ['NIFTY 50', 'NIFTY BANK', 'FINNIFTY', 'MIDCPNIFTY'] as const;
