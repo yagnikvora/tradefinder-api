@@ -51,13 +51,41 @@ export interface EquityQuote {
 
 /* ------------------------------------------------------------- instrument master --- */
 
+/** One listed futures contract on a stock or index underlying. */
+export interface FuturesContract {
+  instrumentKey: string;
+  tradingSymbol: string;
+  /** Expiry as epoch ms, which is how the master carries it for FUT rows. */
+  expiry: number;
+  lotSize: number;
+}
+
 interface Master {
   /** NSE_EQ trading symbol -> instrument key. */
   equity: Record<string, string>;
   /** Stock symbols that have equity derivatives — the option-tradable universe. */
   fno: string[];
+  /**
+   * Underlying symbol -> its listed futures, NEAREST EXPIRY FIRST.
+   *
+   * Read off the same master rather than fetched separately, because the momentum scanner
+   * needs open interest and OI lives on the FUTURE, not the share: an NSE_EQ quote answers
+   * `oi: 0` by definition. Index underlyings (NIFTY, BANKNIFTY) are carried too — the index
+   * itself publishes no volume, so its future is the only place an index VWAP exists.
+   */
+  futures: Record<string, FuturesContract[]>;
+  /** NSE_INDEX trading symbol, UPPERCASED -> instrument key. Sector strength reads this. */
+  indices: Record<string, string>;
   at: number;
+  /**
+   * Disk-cache format. Bump when the shape above changes: a v1 file has no `futures`, and
+   * reading it back would look like "this account has no derivatives" rather than "this
+   * cache predates the field", which is the kind of empty that gets debugged for an hour.
+   */
+  v?: number;
 }
+
+const MASTER_VERSION = 2;
 
 let master: Master | null = null;
 let loadingMaster: Promise<Master> | null = null;
@@ -65,6 +93,7 @@ let loadingMaster: Promise<Master> | null = null;
 interface RawInstrument {
   segment?: string; trading_symbol?: string; instrument_key?: string;
   instrument_type?: string; underlying_type?: string; underlying_symbol?: string;
+  expiry?: number; lot_size?: number; name?: string;
 }
 
 async function fetchMaster(): Promise<Master> {
@@ -93,9 +122,34 @@ async function fetchMaster(): Promise<Master> {
       .filter((s): s is string => !!s),
   )].sort();
 
+  // Futures, grouped by underlying and sorted nearest-expiry-first. The near month is the
+  // liquid one and the only contract worth reading open interest off; the far months are
+  // kept so a caller can roll on expiry day rather than reading a dying contract.
+  const futures: Record<string, FuturesContract[]> = {};
+  for (const r of rows) {
+    if (r.segment !== 'NSE_FO' || r.instrument_type !== 'FUT') continue;
+    if (!r.instrument_key || !r.underlying_symbol) continue;
+    (futures[r.underlying_symbol] ??= []).push({
+      instrumentKey: r.instrument_key,
+      tradingSymbol: r.trading_symbol ?? '',
+      expiry: r.expiry ?? 0,
+      lotSize: r.lot_size ?? 0,
+    });
+  }
+  for (const list of Object.values(futures)) list.sort((a, b) => a.expiry - b.expiry);
+
+  // Every NSE index Upstox prices, keyed by its uppercased trading symbol. The scanner maps
+  // a stock's sector onto one of these; hand-listing them would go stale the next time NSE
+  // launches an index.
+  const indices: Record<string, string> = {};
+  for (const r of rows)
+    if (r.segment === 'NSE_INDEX' && r.instrument_key)
+      indices[(r.trading_symbol ?? r.name ?? '').toUpperCase()] = r.instrument_key;
+
   if (Object.keys(equity).length < 1000) throw new Error(`instrument master looks short: ${Object.keys(equity).length} equities`);
   if (fno.length < 100) throw new Error(`instrument master listed only ${fno.length} F&O underlyings`);
-  return { equity, fno, at: Date.now() };
+  if (Object.keys(futures).length < 100) throw new Error(`instrument master listed futures for only ${Object.keys(futures).length} underlyings`);
+  return { equity, fno, futures, indices, at: Date.now(), v: MASTER_VERSION };
 }
 
 /**
@@ -111,7 +165,10 @@ export async function instruments(): Promise<Master> {
   if (loadingMaster) return loadingMaster;
 
   loadingMaster = (async () => {
-    const disk = await fs.readFile(MASTER_CACHE, 'utf8').then((t) => JSON.parse(t) as Master).catch(() => null);
+    const raw = await fs.readFile(MASTER_CACHE, 'utf8').then((t) => JSON.parse(t) as Master).catch(() => null);
+    // An older-format file is not "stale data", it is data with fields missing — re-download
+    // rather than serve it, or every futures lookup silently answers undefined.
+    const disk = raw && (raw.v ?? 1) >= MASTER_VERSION ? raw : null;
     if (disk && Date.now() - disk.at < DAY_MS) { master = disk; return disk; }
     try {
       const fresh = await fetchMaster();
@@ -130,6 +187,23 @@ export async function instruments(): Promise<Master> {
 
 /** Stock symbols with equity derivatives — Market Pulse's universe. */
 export const fnoSymbols = async (): Promise<string[]> => (await instruments()).fno;
+
+/**
+ * The nearest listed future for an underlying, skipping one that expires today.
+ *
+ * On expiry day the near contract stops carrying the position — open interest collapses
+ * into the next month through the session — so reading a build-up off it would report mass
+ * "long unwinding" across the whole board. Rolling a day early is the conventional fix.
+ */
+export async function nearFuture(symbol: string, nowMs = Date.now()): Promise<FuturesContract | null> {
+  const list = (await instruments()).futures[symbol] ?? [];
+  return list.find((c) => c.expiry > nowMs + 6 * 60 * 60e3) ?? list[0] ?? null;
+}
+
+/** NSE index trading symbol (case-insensitive) -> instrument key. */
+export async function indexKey(name: string): Promise<string | null> {
+  return (await instruments()).indices[name.toUpperCase()] ?? null;
+}
 
 /* ---------------------------------------------------------------------- quotes --- */
 

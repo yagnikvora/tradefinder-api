@@ -1,0 +1,69 @@
+// Disk persistence for the momentum module.
+//
+// The rest of the app already caches to `api/.cache`, so this follows it rather than
+// introducing a second convention: JSON files under `api/.cache/momentum/`, outside `src`
+// so a rebuild does not wipe them.
+//
+// Writes are atomic — tmp file then rename. That is not fussiness: the baseline is ~200
+// symbols of volume profile and takes a few seconds to serialise, and a process killed
+// mid-write would otherwise leave a truncated file that parses as "no baseline" on the next
+// boot, silently taking RVOL off every row until someone noticed.
+//
+// The interfaces below (`KeyValueStore`, and the repositories built on it) exist so this is
+// a DRIVER, not the design. Swapping in PostgreSQL is implementing the same three methods
+// against `momentum_config` / `momentum_snapshot` / `momentum_history` — the schema is in
+// `schema.sql` and nothing above this file knows which is in use.
+
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.join(__dirname, '..', '..', '.cache', 'momentum');
+
+export interface KeyValueStore {
+  read<T>(key: string): Promise<T | null>;
+  write<T>(key: string, value: T): Promise<void>;
+  remove(key: string): Promise<void>;
+}
+
+export class FileStore implements KeyValueStore {
+  constructor(private readonly root: string = ROOT) {}
+
+  private file(key: string): string {
+    // Keys are internal constants, but a traversal here would write outside .cache, so the
+    // separator is stripped rather than trusted.
+    return path.join(this.root, `${key.replace(/[^a-z0-9._-]/gi, '_')}.json`);
+  }
+
+  async read<T>(key: string): Promise<T | null> {
+    try {
+      return JSON.parse(await fs.readFile(this.file(key), 'utf8')) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  async write<T>(key: string, value: T): Promise<void> {
+    const target = this.file(key);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    const tmp = `${target}.${process.pid}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(value), 'utf8');
+    await fs.rename(tmp, target);
+  }
+
+  async remove(key: string): Promise<void> {
+    await fs.unlink(this.file(key)).catch(() => {});
+  }
+}
+
+/** The one store the module wires everywhere. Replace here to move to another backend. */
+export const store: KeyValueStore = new FileStore();
+
+export const STORE_KEYS = {
+  config: 'config',
+  baseline: 'baseline',
+  history: 'history',
+  snapshot: 'snapshot',
+  session: 'session',
+} as const;

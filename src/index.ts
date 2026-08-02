@@ -8,11 +8,20 @@ import { overview } from './overview.js';
 import * as clock from './clock.js';
 import * as apex from './apex.js';
 import { isTimeframe } from './candles.js';
+import { mountMomentum } from './momentum/index.js';
 import type { Result } from './services.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4100;
 app.use(cors());
+
+// Momentum Scanner. Self-contained under src/momentum — its own controller, services,
+// repositories, config and cron. Mounting is one line because everything it needs from this
+// app (the Upstox client, the instrument master) it imports directly.
+//
+// The scheduler is off without a token: its jobs would otherwise fail every 30 seconds on a
+// clone that has not been configured, filling the log with the same error.
+mountMomentum(app, { path: '/momentum', scheduler: process.env.MOMENTUM_SCHEDULER !== 'off' });
 
 // In-memory cache so we don't hammer NSE. Every avoidable upstream hit is another
 // chance to be tarpitted and drop to a fallback, so the window widens once the market

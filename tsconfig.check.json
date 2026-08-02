@@ -1,0 +1,16 @@
+// Typecheck everything, including the tests and the tools.
+//
+// The build tsconfig cannot do this: it sets `rootDir: src` so `npm run build` emits a flat
+// `dist/` a host can run with plain node, and adding `test/` or `tools/` to that would push
+// the output up a directory and break `node dist/index.js`.
+//
+// So `npm run typecheck` uses this one — no emit, wider net. Worth having as a separate file
+// rather than a pile of CLI flags, because the two configs must not drift.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src", "test", "tools"]
+}
