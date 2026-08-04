@@ -116,7 +116,62 @@ export function sanitise(cfg: MomentumConfig): MomentumConfig {
   cfg.refresh.baselineHourIst = Math.round(clampNumber(cfg.refresh.baselineHourIst, 0, 23, 8));
   cfg.output.limit = Math.round(clampNumber(cfg.output.limit, 1, 500, 100));
   cfg.universe.exclude = (cfg.universe.exclude ?? []).map((s) => String(s).toUpperCase());
+
+  sanitiseTiming(cfg);
   return cfg;
+}
+
+/**
+ * The timing layer's own repair pass.
+ *
+ * These are the numbers that decide whether a signal is allowed to fire at all, so a
+ * nonsense value here does not produce a wrong ranking — it produces a board that either
+ * signals on everything or on nothing, and both look plausible from the outside. The
+ * window ordering is enforced rather than clamped: a fast window longer than the slow one
+ * would make acceleration measure a rate against itself and read as permanently zero.
+ */
+function sanitiseTiming(cfg: MomentumConfig): void {
+  const p = cfg.thresholds.pulse;
+  p.fastWindowMin = clampNumber(p.fastWindowMin, 0.5, 30, 3);
+  p.slowWindowMin = clampNumber(p.slowWindowMin, p.fastWindowMin + 0.5, 60, 10);
+  p.baseWindowMin = clampNumber(p.baseWindowMin, p.fastWindowMin + 0.5, 60, 15);
+  p.minReadings = Math.round(clampNumber(p.minReadings, 2, 50, 3));
+  p.legReversalAtr = clampNumber(p.legReversalAtr, 0.02, 2, 0.3);
+  p.legReversalPctFloor = clampNumber(p.legReversalPctFloor, 0.02, 5, 0.35);
+  p.compressionAtr = clampNumber(p.compressionAtr, 0.02, 2, 0.28);
+  p.breakBufferAtr = clampNumber(p.breakBufferAtr, 0, 1, 0.08);
+  p.fullScaleVelocityAtr = clampNumber(p.fullScaleVelocityAtr, 0.001, 1, 0.02);
+  // An all-zero mix would divide by zero in `mix()` and take the factor dark.
+  const mixTotal = p.mix.burst + p.mix.velocity + p.mix.efficiency;
+  if (!(mixTotal > 0)) p.mix = { burst: 0.4, velocity: 0.4, efficiency: 0.2 };
+
+  const s = cfg.signal;
+  s.maxTriggerAgeMin = clampNumber(s.maxTriggerAgeMin, 0.5, 180, 12);
+  s.minPulseScore = clampNumber(s.minPulseScore, 0, 100, 55);
+  s.minBurstRvol = clampNumber(s.minBurstRvol, 0, 50, 1.6);
+  s.cooldownMin = clampNumber(s.cooldownMin, 0, 375, 15);
+  s.stallMinutes = clampNumber(s.stallMinutes, 0.5, 375, 8);
+  s.extension.atrUsedMax = clampNumber(s.extension.atrUsedMax, 0.1, 5, 0.8);
+  s.extension.vwapAtrMax = clampNumber(s.extension.vwapAtrMax, 0.1, 10, 1.4);
+  s.extension.legMoveAtrMax = clampNumber(s.extension.legMoveAtrMax, 0.05, 5, 0.65);
+  s.targetAtr = clampNumber(s.targetAtr, 0.05, 5, 0.45);
+  s.stopAtr = clampNumber(s.stopAtr, 0.02, 5, 0.28);
+  s.minRoomAtr = clampNumber(s.minRoomAtr, 0, 5, 0.25);
+  s.targetOptionMovePct = clampNumber(s.targetOptionMovePct, 1, 1000, 35);
+  s.pullback.minDepth = clampNumber(s.pullback.minDepth, 0, 0.95, 0.2);
+  s.pullback.maxDepth = clampNumber(s.pullback.maxDepth, s.pullback.minDepth, 1, 0.55);
+  s.enrichReservedSlots = Math.round(clampNumber(s.enrichReservedSlots, 0, 208, 12));
+
+  const k = s.strike;
+  k.itmSteps = Math.round(clampNumber(k.itmSteps, 0, 20, 1));
+  k.otmSteps = Math.round(clampNumber(k.otmSteps, 0, 20, 3));
+  // Floored well above zero on purpose: a delta of 0.02 is not a momentum trade in any
+  // configuration, and letting an admin set it there would quietly turn the strike picker
+  // into a lottery-ticket picker while every other number on the row stayed sensible.
+  k.minDelta = clampNumber(k.minDelta, 0.05, 0.95, 0.25);
+  k.minOi = Math.max(0, Math.round(clampNumber(k.minOi, 0, 1e9, 1000)));
+  k.maxSpreadPct = clampNumber(k.maxSpreadPct, 0.1, 100, 3);
+  k.maxThetaPctPerHour = clampNumber(k.maxThetaPctPerHour, 0.1, 100, 3);
 }
 
 function clampNumber(v: unknown, lo: number, hi: number, fallback: number): number {

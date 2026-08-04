@@ -1,7 +1,7 @@
 // The scoring primitives every factor service shares.
 //
 // There is exactly one way to turn a measurement into a 0–100 score in this module, and it
-// is `curve()`. That is deliberate: eleven factors each rolling their own thresholds is how
+// is `curve()`. That is deliberate: twelve factors each rolling their own thresholds is how
 // a scoring model becomes impossible to reason about, and how "configurable weights" turns
 // out to mean "configurable weights and thirty hardcoded ifs".
 //

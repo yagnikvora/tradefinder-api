@@ -23,7 +23,7 @@ import { breakerState } from './data/throttle.js';
 import { historyRepository } from './data/history.repository.js';
 import { scanOnce, schedulerStatus } from './scheduler.js';
 import { cache, single } from './cache.js';
-import { isValidationError, parseBoardQuery, parseConfigPatch, parseSymbol } from './dto.js';
+import { applySignalFilters, isValidationError, parseBoardQuery, parseConfigPatch, parseSymbol } from './dto.js';
 import { marketOpen } from './session.js';
 import { tokenSet } from '../upstox.js';
 
@@ -79,7 +79,7 @@ async function invalidateBoard(): Promise<void> {
   await cache.del(BOARD_KEY);
 }
 
-/** Rows carry their full eleven-factor breakdown; the list view does not need it. */
+/** Rows carry their full twelve-factor breakdown; the list view does not need it. */
 const slim = (r: MomentumRow): Omit<MomentumRow, 'factors'> => {
   const { factors: _factors, ...rest } = r;
   return rest;
@@ -104,6 +104,7 @@ export function momentumRouter(): express.Router {
       if (q.tradeType) rows = rows.filter((r) => r.tradeType === q.tradeType);
       if (q.confidence) rows = rows.filter((r) => r.confidence === q.confidence);
       if (q.sector) rows = rows.filter((r) => (r.sector ?? '').toUpperCase() === q.sector);
+      rows = applySignalFilters(rows, q, cfg);
 
       send(
         res,
@@ -112,6 +113,60 @@ export function momentumRouter(): express.Router {
           returned: Math.min(rows.length, q.limit),
           matched: rows.length,
           rows: rows.slice(0, q.limit).map((r) => (q.includeFactors ? r : slim(r))),
+        },
+        source,
+        note,
+      );
+    } catch (e) {
+      if (isValidationError(e)) return fail(res, 400, e.message, { issues: e.issues });
+      fail(res, 502, String((e as Error).message));
+    }
+  });
+
+  // -------------------------------------------------------- GET /momentum/signals ----
+  //
+  // The entry feed. Same board, ordered by ENTRY QUALITY rather than by score, and carrying
+  // only the rows the timing layer has something to say about.
+  //
+  // It is a separate endpoint rather than a query parameter because it answers a different
+  // question and is read at a different cadence: the board is "what is strong today" and is
+  // browsed, this is "what can I take right now" and is polled. Ordering by score here would
+  // put the most extended stock at the top, which is the failure the timing layer exists to
+  // fix — so the sort key is deliberately the one number on the row that contains nothing
+  // cumulative.
+  router.get('/signals', async (req: Request, res: Response) => {
+    if (!tokenSet())
+      return fail(res, 503, 'UPSTOX_ACCESS_TOKEN is not set — put your Upstox Analytics Token in api/.env');
+
+    try {
+      const cfg = await configRepository.get();
+      const q = parseBoardQuery(req.query as Record<string, unknown>, cfg);
+      const { board, source, note } = await currentBoard();
+
+      // Default to what is actionable; `?state=` or `?action=` overrides for a wider look.
+      const base = q.state || q.action
+        ? board.rows
+        : board.rows.filter((r) => r.signal && (r.signal.state === 'Igniting' || r.signal.state === 'Extending'));
+
+      let rows = applySignalFilters(base, q, cfg);
+      if (q.direction) rows = rows.filter((r) => r.direction === q.direction);
+      if (q.sector) rows = rows.filter((r) => (r.sector ?? '').toUpperCase() === q.sector);
+      rows = [...rows].sort((a, b) => (b.signal?.entryQuality ?? 0) - (a.signal?.entryQuality ?? 0));
+
+      send(
+        res,
+        {
+          asOf: board.asOf,
+          configVersion: board.configVersion,
+          market: board.market,
+          igniting: board.igniting,
+          entrable: board.entrable,
+          matched: rows.length,
+          returned: Math.min(rows.length, q.limit),
+          maxTriggerAgeMin: cfg.signal.maxTriggerAgeMin,
+          targetOptionMovePct: cfg.signal.targetOptionMovePct,
+          rows: rows.slice(0, q.limit).map(slim),
+          warnings: board.warnings,
         },
         source,
         note,

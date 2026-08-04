@@ -445,17 +445,24 @@ describe('default config', () => {
     for (const k of FACTOR_KEYS) assert.equal(typeof cfg.weights[k], 'number', `missing weight for ${k}`);
   });
 
-  it('ships the weights the brief specifies, totalling 100', () => {
+  it('ships weights totalling 100, with the timing factor carrying the most', () => {
     const cfg = defaultConfig();
-    assert.equal(cfg.weights.rvol, 20);
-    assert.equal(cfg.weights.liquidity, 15);
     assert.equal(FACTOR_KEYS.reduce((a, k) => a + cfg.weights[k], 0), 100);
+    // The brief's original weights were all cumulative-since-open readings, which is why the
+    // board's best scores arrived after the move. The pulse is the only factor measured over
+    // minutes, so it must outweigh any single one of them or the ranking stays a description
+    // of the last four hours.
+    const heaviestCumulative = Math.max(
+      ...FACTOR_KEYS.filter((k) => k !== 'momentumPulse').map((k) => cfg.weights[k]),
+    );
+    assert.ok(cfg.weights.momentumPulse > heaviestCumulative, 'the timing factor must lead the model');
   });
 
   it('hands out an independent copy, so a caller cannot edit the shipped defaults', () => {
     const a = defaultConfig();
+    const shipped = defaultConfig().weights.rvol;
     a.weights.rvol = 999;
-    assert.equal(defaultConfig().weights.rvol, 20);
+    assert.equal(defaultConfig().weights.rvol, shipped);
   });
 
   it('keeps every knot list sorted ascending — curve() relies on it', () => {

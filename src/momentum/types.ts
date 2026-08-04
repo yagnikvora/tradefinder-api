@@ -6,8 +6,9 @@
 // weighting, where an invented one silently moves the ranking. `available: false` plus a
 // `note` saying why is the shape that carries that through the whole pipeline.
 
-/** The eleven factors the score is built from. Order is the order the UI lists them. */
+/** The twelve factors the score is built from. Order is the order the UI lists them. */
 export type FactorKey =
+  | 'momentumPulse'
   | 'rvol'
   | 'liquidity'
   | 'relativeStrength'
@@ -21,11 +22,12 @@ export type FactorKey =
   | 'trendStructure';
 
 export const FACTOR_KEYS: FactorKey[] = [
-  'rvol', 'liquidity', 'relativeStrength', 'vwap', 'optionFlow', 'greeks',
+  'momentumPulse', 'rvol', 'liquidity', 'relativeStrength', 'vwap', 'optionFlow', 'greeks',
   'impliedVolatility', 'atrExpansion', 'sectorStrength', 'marketBreadth', 'trendStructure',
 ];
 
 export const FACTOR_LABEL: Record<FactorKey, string> = {
+  momentumPulse: 'Momentum Pulse (last minutes)',
   rvol: 'Relative Volume',
   liquidity: 'Liquidity',
   relativeStrength: 'Relative Strength',
@@ -48,6 +50,7 @@ export const FACTOR_LABEL: Record<FactorKey, string> = {
  * the direction vote, so a heavily-traded stock going nowhere does not read as bullish.
  */
 export const DIRECTIONAL: Record<FactorKey, boolean> = {
+  momentumPulse: true,
   rvol: false,
   liquidity: false,
   relativeStrength: true,
@@ -95,7 +98,21 @@ export interface FactorOutcome {
 
 export type Confidence = 'High' | 'Medium' | 'Low';
 export type Direction = 'Bullish' | 'Bearish' | 'Neutral';
-export type TradeType = 'Momentum Buy' | 'Momentum Sell' | 'Avoid';
+/**
+ * `Watch` is the state the board was missing.
+ *
+ * The eleven original factors all measure the day CUMULATIVELY — relative volume against the
+ * whole session, price against the previous close, range against ATR — so they peak once the
+ * move is finished. A row can therefore be a textbook momentum stock and a terrible entry at
+ * the same time, and until this existed the board had no way to say so: it printed
+ * "Momentum Buy" on a stock that had already travelled its whole day's range, and the option
+ * bought against it paid for a move that had already happened.
+ *
+ * `Momentum Buy` / `Momentum Sell` now mean "strong AND still entrable". `Watch` means the
+ * model likes the stock but the entry is gone or has not arrived — see `signal.blockers` for
+ * which of the two.
+ */
+export type TradeType = 'Momentum Buy' | 'Momentum Sell' | 'Watch' | 'Avoid';
 export type ActivityLevel = 'High' | 'Medium' | 'Low';
 export type LiquidityGrade = 'Excellent' | 'Good' | 'Average' | 'Poor';
 export type RvolGrade = 'Excellent' | 'Good' | 'Average' | 'Poor';
@@ -107,6 +124,215 @@ export type RvolGrade = 'Excellent' | 'Good' | 'Average' | 'Poor';
  *   'partial' — enrichment ran but one or more option calls failed for this symbol.
  */
 export type EnrichmentLevel = 'quote' | 'partial' | 'full';
+
+/* ------------------------------------------------------------------ timing layer --- */
+
+/**
+ * Where the stock is in its move RIGHT NOW, as opposed to how strong the day has been.
+ *
+ *   Igniting   the move is starting. A trigger fired within the last few minutes, volume is
+ *              bursting against its own per-minute norm, and the range travelled so far is
+ *              still small against ATR. This is the only state where a fresh option entry
+ *              has the whole leg in front of it.
+ *   Extending  the leg is real but no longer new. Entry is a pullback, not a chase.
+ *   Extended   the move is largely spent — most of a day's ATR travelled, price far from
+ *              VWAP. The score will be at its highest here and the trade is at its worst.
+ *   Stalling   the leg is intact but has stopped making new extremes and volume has faded.
+ *   Reversing  the last minutes point against the day's direction. A held position is wrong
+ *              before the score notices.
+ *   Quiet      nothing is happening on this timescale.
+ */
+export type SignalState = 'Igniting' | 'Extending' | 'Extended' | 'Stalling' | 'Reversing' | 'Quiet';
+
+/** What the timing layer says to do about it. Not advice — a label for the state above. */
+export type SignalAction = 'Buy Call' | 'Buy Put' | 'Watch' | 'Stand Aside';
+
+/**
+ * What started the move. Ordered by how early it fires, earliest first.
+ *
+ *   baseBreak    price leaving a compressed range it had been holding. The earliest honest
+ *                trigger there is — the move has by definition just begun.
+ *   vwapReclaim  crossing back over the session VWAP on volume, the classic intraday turn.
+ *   vwapLoss     the same, downward.
+ *   orbBreak     leaving the 09:15–09:30 opening range.
+ *   dayExtreme   a new session high or low after a stretch of not making one.
+ *   priorRange   through the previous session's high/low or the 20-day extreme.
+ *   thrust       no level involved — velocity and volume alone, which is what a news-driven
+ *                move looks like before it has a structure to break.
+ */
+export type TriggerKind =
+  | 'baseBreak' | 'vwapReclaim' | 'vwapLoss' | 'orbBreak' | 'dayExtreme' | 'priorRange' | 'thrust';
+
+export interface SignalTrigger {
+  kind: TriggerKind;
+  label: string;
+  /** +1 long, −1 short. */
+  direction: 1 | -1;
+  /** Epoch ms the trigger FIRST fired — not when it was last seen to still be true. */
+  at: number;
+  /** The price when it fired. Every entry/stop/target is measured from here. */
+  price: number;
+  ageMin: number;
+  /** How far the stock has already travelled since the trigger, signed with the direction. */
+  movedSincePct: number;
+}
+
+/**
+ * The micro-momentum measurement, all of it from the 15-second quote poll this module
+ * already makes. No reading here looks further back than `pulse.slowWindowMin`.
+ */
+export interface PulseSummary {
+  /** False when there are not yet enough readings to measure anything. */
+  ready: boolean;
+  /** 0–100 strength of the recent movement. Null when not ready. */
+  score: number | null;
+  /** Signed −1…+1. Which way the last minutes have gone. */
+  bias: number;
+  /** Percent moved over the fast window. */
+  movePct: number | null;
+  /** That move as a fraction of one ATR, per minute — comparable across the whole board. */
+  velocityAtrPerMin: number | null;
+  /**
+   * Volume in the fast window against what this stock normally trades in the SAME window at
+   * this time of day. Unlike day RVOL this spikes as the move starts, not after it.
+   */
+  burstRvol: number | null;
+  /** |net move| ÷ Σ|leg moves| over the window. 1 is a straight line, 0.3 is chop. */
+  efficiency: number | null;
+  /** Fast-window velocity minus the velocity of the window before it, %/min. */
+  acceleration: number | null;
+  /** The current directional leg, from an ATR-scaled zigzag over the session. */
+  legAgeMin: number | null;
+  legMovePct: number | null;
+  /** How far price has come back off the leg's extreme, as a fraction of the leg. */
+  pullback: number | null;
+  /** Minutes since the leg last made a new extreme. The stall detector. */
+  minutesSinceExtreme: number | null;
+  note?: string;
+}
+
+/** How much of the day's normal movement is already used up. */
+export interface Extension {
+  /** Today's true range ÷ ATR. Above ~0.8 the day has already done its work. */
+  atrUsed: number | null;
+  /** |price − VWAP| ÷ ATR. How stretched from the day's mean the entry would be. */
+  vwapAtr: number | null;
+  /** The current leg's size ÷ ATR. */
+  legMoveAtr: number | null;
+  extended: boolean;
+}
+
+export type OptionType = 'CE' | 'PE';
+
+/**
+ * The contract to buy — the one output of this module that ends in an order.
+ *
+ * Chosen from the near-month chain by NET payoff at the plan's target: bought at the ask,
+ * sold at the bid, so a strike whose book is wide is penalised by what that book will
+ * actually cost. A hard delta floor sits under the ranking, because a cheap enough option
+ * always shows the highest percentage and the ones below ~0.25 delta stop tracking the
+ * underlying the plan is built on.
+ */
+export interface StrikeChoice {
+  strike: number;
+  type: OptionType;
+  /** "2450 CE" — what to type into a terminal. */
+  label: string;
+  /** Upstox instrument key, for anything placing the order programmatically. */
+  instrumentKey: string;
+  expiry: string;
+  expiryDays: number;
+  /** Signed steps from the money, positive = further out of the money. */
+  stepsFromAtm: number;
+  moneyness: 'ITM' | 'ATM' | 'OTM';
+  /** Last traded premium. */
+  premium: number;
+  /** What it costs to get in — the ask, not the mid. */
+  entryCost: number;
+  bid: number;
+  ask: number;
+  /** Bid-ask as a percentage of the mid. Null when the book is one-sided. */
+  spreadPct: number | null;
+  delta: number;
+  gamma: number | null;
+  iv: number | null;
+  /** Decay as a percentage of the premium per hour, from the chain's own theta. */
+  thetaPctPerHour: number | null;
+  oi: number;
+  volume: number;
+  lotSize: number | null;
+  /** `entryCost × lotSize` — what one lot costs, in rupees. */
+  costPerLot: number | null;
+  /** Premium if the underlying reaches the plan's target, second-order in gamma. */
+  premiumAtTarget: number | null;
+  /** The gain that implies, NET of paying the ask and selling the bid. */
+  gainPctAtTarget: number | null;
+  /** That gain in rupees for one lot. */
+  profitPerLot: number | null;
+  /** Underlying price at which this contract breaks even at expiry. */
+  breakEven: number | null;
+  /** Why this strike and not its neighbours. */
+  reason: string;
+  /** Wide book, thin open interest, heavy decay — stated, never silently filtered. */
+  warnings: string[];
+}
+
+/**
+ * The arithmetic behind "can this actually pay 30–40% on the option".
+ *
+ * Stop and target are in the UNDERLYING, from ATR. `optionMovePctAtTarget` converts the
+ * target into a premium move with the ATM delta and gamma actually quoted on the chain, so
+ * the answer accounts for the option being cheap or expensive rather than assuming it.
+ */
+export interface SignalPlan {
+  entry: number;
+  stop: number;
+  target: number;
+  stopPct: number;
+  targetPct: number;
+  rewardRisk: number | null;
+  /** Estimated option premium change if the target is reached, in percent. */
+  optionMovePctAtTarget: number | null;
+  /** How far the STOCK must move for the option to gain `signal.targetOptionMovePct`. */
+  underlyingMovePctForTargetOption: number | null;
+  /** Whether that move is still inside the room the model thinks is left. */
+  meetsOptionTarget: boolean | null;
+  /**
+   * Where the option numbers came from.
+   *   'strike'   the specific contract in `signal.strike`, net of its own spread.
+   *   'chain'    ATM greeks only — the chain object was not in hand for this build.
+   *   'atr-only' price plan only; no option data at all.
+   */
+  basis: 'strike' | 'chain' | 'atr-only';
+}
+
+export interface MomentumSignal {
+  state: SignalState;
+  action: SignalAction;
+  /**
+   * 0–100. What this row is worth AS AN ENTRY, which is a different question from the score.
+   * Freshness, pulse strength, room left, alignment and liquidity — nothing cumulative.
+   */
+  entryQuality: number;
+  /** 100 at the trigger, 0 at `signal.maxTriggerAgeMin`. Null when nothing has fired. */
+  freshness: number | null;
+  trigger: SignalTrigger | null;
+  /** The direction of the last minutes, which can disagree with the day's direction. */
+  microDirection: Direction;
+  /** Whether it does agree. Null when either side is flat. */
+  aligned: boolean | null;
+  pulse: PulseSummary;
+  extension: Extension;
+  plan: SignalPlan | null;
+  /**
+   * Which contract to buy. Null when this row had no option chain this cycle — the shortlist
+   * is finite, so most of the board carries a price plan and no strike.
+   */
+  strike: StrikeChoice | null;
+  reasons: FactorReason[];
+  /** Every gate that failed, in words. Empty means the entry is clean. */
+  blockers: string[];
+}
 
 export interface MomentumRow {
   rank: number;
@@ -132,6 +358,15 @@ export interface MomentumRow {
   direction: Direction;
   tradeType: TradeType;
   institutionalActivity: ActivityLevel;
+
+  /**
+   * WHEN, as opposed to what. Null only when the timing layer is switched off in config.
+   *
+   * The score answers "is this stock moving with conviction today"; this answers "is there
+   * still a move left to buy". A row can be 88 and `Extended`, which is precisely the row
+   * that used to look like the best trade on the board and was the worst.
+   */
+  signal: MomentumSignal | null;
 
   liquidity: { score: number | null; grade: LiquidityGrade | null };
   rvol: { value: number | null; grade: RvolGrade | null };
@@ -199,6 +434,10 @@ export interface MomentumBoard {
   universeSize: number;
   scored: number;
   shortlisted: number;
+  /** Rows whose move is starting right now. */
+  igniting: number;
+  /** Rows the timing layer would take an entry in right now. */
+  entrable: number;
   market: MarketContext;
   rows: MomentumRow[];
   /** Anything degraded — a missing baseline, a refused endpoint, a warming IV history. */
@@ -304,6 +543,99 @@ export interface MomentumConfig {
       points: { higherHigh: number; higherLow: number; breakout: number; openingRangeBreak: number; aboveOpen: number };
     };
     institutional: { rvolWeight: number; turnoverWeight: number; optionWeight: number; oiWeight: number; high: number; medium: number };
+
+    /** Factor 12 — the micro-momentum measurement. Windows are in minutes of session. */
+    pulse: {
+      /** The "right now" window. Everything the ignition read is built on. */
+      fastWindowMin: number;
+      /** The comparison window behind it, for acceleration and efficiency. */
+      slowWindowMin: number;
+      /** How far back a pre-breakout base is looked for. */
+      baseWindowMin: number;
+      /** Fewer readings than this in the fast window and the pulse is `ready: false`. */
+      minReadings: number;
+      mix: { burst: number; velocity: number; efficiency: number };
+      /** Interval volume ÷ the same interval's normal volume. */
+      burstRvol: Knot[];
+      /** Fraction of one ATR travelled per minute. 0.02 is a decisive drift. */
+      velocityAtrPerMin: Knot[];
+      /** Directional persistence, 0…1. */
+      efficiency: Knot[];
+      /** Zigzag reversal threshold, in ATR. Below this a wobble is not a new leg. */
+      legReversalAtr: number;
+      /** A floor for it, in percent, for symbols with no ATR baseline. */
+      legReversalPctFloor: number;
+      /** A base narrower than this × ATR counts as compressed and is worth breaking. */
+      compressionAtr: number;
+      /** How far past the base edge price must clear, in ATR, before it counts as broken. */
+      breakBufferAtr: number;
+      /** Full-scale for the pulse's directional bias, in ATR-per-minute. */
+      fullScaleVelocityAtr: number;
+    };
+  };
+
+  /**
+   * The timing layer. Not a scoring threshold — these decide whether a strong row is still
+   * an ENTRY, which is the difference between the board describing a move and being early
+   * enough to trade it.
+   */
+  signal: {
+    enabled: boolean;
+    /**
+     * Whether a failed timing gate downgrades `Momentum Buy`/`Sell` to `Watch`. On by
+     * default: a board that says Buy on a spent move is the failure this layer exists for.
+     */
+    gateTradeType: boolean;
+    /** A trigger older than this is history, not a signal. */
+    maxTriggerAgeMin: number;
+    /** Below this the pulse is noise and no trigger is allowed to fire. */
+    minPulseScore: number;
+    /** A trigger with less interval volume than this is a drift, not an ignition. */
+    minBurstRvol: number;
+    /** How long the same trigger kind is suppressed after firing, so it fires once. */
+    cooldownMin: number;
+    /** No new extreme for this many minutes, with the leg intact, reads as Stalling. */
+    stallMinutes: number;
+    /** Past any of these the move is spent and the state is Extended. */
+    extension: { atrUsedMax: number; vwapAtrMax: number; legMoveAtrMax: number };
+    /** Target and stop distance from entry, in ATR. */
+    targetAtr: number;
+    stopAtr: number;
+    /** Less headroom than this (in ATR) before the extension ceiling and there is no trade. */
+    minRoomAtr: number;
+    /** Whether the last minutes must agree with the day's direction. */
+    requireAlignment: boolean;
+    /** The option gain the plan is measured against, in percent. */
+    targetOptionMovePct: number;
+    /**
+     * Whether failing to reach that gain REFUSES the entry rather than just costing it
+     * quality. Off by default: how big the prize is and whether the entry is valid are
+     * different questions, and conflating them hides good setups that happen to be modest.
+     */
+    requireOptionTarget: boolean;
+    /** Entering an established leg on a retracement instead of at the trigger. */
+    pullback: { enabled: boolean; minDepth: number; maxDepth: number };
+    /** How the specific contract to buy is picked out of the chain. */
+    strike: {
+      /** Strikes to consider on the in-the-money side of the money. */
+      itmSteps: number;
+      /** And on the out-of-the-money side, where the leverage is. */
+      otmSteps: number;
+      /** Below this |delta| an option stops tracking the move the plan is built on. */
+      minDelta: number;
+      /** Contracts below this open interest are not reliably exitable. */
+      minOi: number;
+      /** Bid-ask above this share of the mid, in percent, is flagged on the choice. */
+      maxSpreadPct: number;
+      /** Hourly decay above this share of the premium, in percent, is flagged. */
+      maxThetaPctPerHour: number;
+    };
+    /**
+     * How many enrichment slots are reserved for the freshest signals rather than the
+     * highest scores. Without this the option chain only ever reaches stocks that have
+     * already moved — the shortlist is chosen by the same lagging number as the ranking.
+     */
+    enrichReservedSlots: number;
   };
 
   universe: {

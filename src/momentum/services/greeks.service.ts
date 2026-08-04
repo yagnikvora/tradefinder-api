@@ -90,6 +90,15 @@ export interface GreeksReading {
   atmStrike: number | null;
   callDelta: number | null;
   putDelta: number | null;
+  /**
+   * The ATM legs' own premiums.
+   *
+   * Carried separately from `straddle` because the timing layer's plan needs ONE leg: what
+   * the trade actually costs is the call or the put, and a percentage gain computed against
+   * the pair would be roughly half the real one.
+   */
+  callLtp: number | null;
+  putLtp: number | null;
   gamma: number | null;
   /** Delta gained per 1% move in the underlying — gamma, made comparable across prices. */
   gammaPer1Pct: number | null;
@@ -110,7 +119,7 @@ export interface GreeksReading {
 }
 
 const EMPTY: GreeksReading = {
-  atmStrike: null, callDelta: null, putDelta: null, gamma: null, gammaPer1Pct: null,
+  atmStrike: null, callDelta: null, putDelta: null, callLtp: null, putLtp: null, gamma: null, gammaPer1Pct: null,
   theta: null, vega: null, straddle: null, thetaBurnPct: null, vegaPerIvPointPct: null,
   deltaShift: null, deltaBasis: 'unavailable', netChainDelta: null, expectedMove: null, expiryDays: null,
 };
@@ -173,6 +182,8 @@ export function computeGreeks(
     atmStrike: chain.atmStrike,
     callDelta: +call.delta.toFixed(4),
     putDelta: +put.delta.toFixed(4),
+    callLtp: call.ltp > 0 ? +call.ltp.toFixed(2) : null,
+    putLtp: put.ltp > 0 ? +put.ltp.toFixed(2) : null,
     gamma,
     gammaPer1Pct: +(gamma * spot / 100).toFixed(5),
     theta,

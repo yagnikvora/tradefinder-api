@@ -1,8 +1,12 @@
 // The cron jobs. Three of them, and the intervals are a rate-limit budget, not a taste.
 //
-//   SCAN        every `refresh.quoteMs` (default 30s), while the market is open.
+//   SCAN        every `refresh.quoteMs` (default 15s), while the market is open.
 //               Three quote requests plus up to `shortlistSize` chain requests, which the
 //               enrichment cache collapses to roughly one chain pass per `refresh.enrichMs`.
+//               The interval is 15s rather than 30s because the timing layer's resolution
+//               IS the poll interval: a trigger cannot be reported sooner than the reading
+//               that would have detected it. The chain tier is unaffected — its own TTL
+//               still collapses enrichment to once a minute.
 //
 //   BASELINE    once a day at `refresh.baselineHourIst` (default 08:00 IST), before the
 //               open. ~416 requests. Also runs on boot if the stored baseline is not
@@ -134,7 +138,9 @@ export async function startScheduler(): Promise<void> {
 
   every(cfg.refresh.quoteMs, () => void scanTick());
   every(5 * 60_000, () => void baselineTick());
-  every(FLUSH_MS, () => void flushSessionState());
+  // Forced on this tick: the scan's own flush is throttled to keep a 2MB write off every
+  // 15-second cycle, and this is the one that guarantees the morning reaches disk anyway.
+  every(FLUSH_MS, () => void flushSessionState(true));
 
   // Kick both immediately rather than waiting a full interval for the first board.
   void baselineTick();

@@ -24,7 +24,10 @@ describe('config repository', () => {
   it('serves the defaults when nothing has been saved', async () => {
     const repo = new StoredConfigRepository(new FakeStore());
     const cfg = await repo.get();
-    assert.equal(cfg.weights.rvol, 20);
+    // Against the shipped model rather than a literal: the weights are a calibration and
+    // are expected to be re-tuned, and a test that pins them re-fails on every re-tune
+    // without ever having checked the thing it is named for.
+    assert.equal(cfg.weights.rvol, defaultConfig().weights.rvol);
     assert.equal(cfg.version, 1);
   });
 
@@ -41,7 +44,7 @@ describe('config repository', () => {
     const repo = new StoredConfigRepository(new FakeStore());
     const saved = await repo.save({ weights: { rvol: 30 } }, 'alice');
     assert.equal(saved.weights.rvol, 30, 'the patched field changes');
-    assert.equal(saved.weights.liquidity, 15, 'and every other field survives');
+    assert.equal(saved.weights.liquidity, defaultConfig().weights.liquidity, 'and every other field survives');
     assert.equal(saved.thresholds.rvol.excellent, 3.5);
   });
 
@@ -71,7 +74,7 @@ describe('config repository', () => {
     const repo = new StoredConfigRepository(new FakeStore());
     await repo.save({ weights: { rvol: 99 } }, 'alice');
     const reset = await repo.reset('bob');
-    assert.equal(reset.weights.rvol, 20);
+    assert.equal(reset.weights.rvol, defaultConfig().weights.rvol);
     assert.ok(reset.version > 1);
     assert.equal(reset.updatedBy, 'bob');
   });
@@ -97,7 +100,7 @@ describe('sanitise', () => {
     const cfg = defaultConfig();
     for (const k of FACTOR_KEYS) cfg.weights[k] = 0;
     const out = sanitise(cfg);
-    assert.equal(out.weights.rvol, 20, 'falls back to the shipped weights');
+    assert.equal(out.weights.rvol, defaultConfig().weights.rvol, 'falls back to the shipped weights');
   });
 
   it('turns a negative or non-finite weight into zero rather than propagating NaN', () => {

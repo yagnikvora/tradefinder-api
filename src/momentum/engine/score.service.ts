@@ -1,4 +1,4 @@
-// Turning eleven factor outcomes into one number, one direction and one sentence.
+// Turning twelve factor outcomes into one number, one direction and one sentence.
 //
 // The arithmetic, in order:
 //
@@ -151,7 +151,7 @@ export function explain(factors: FactorOutcome[]): FactorReason[] {
 /**
  * Institutional activity — a separate read on whether the size looks like a desk.
  *
- * Not one of the eleven scored factors. It answers a different question: the score says
+ * Not one of the twelve scored factors. It answers a different question: the score says
  * "is this moving", this says "is somebody big behind it". Four inputs, each already
  * computed elsewhere, mixed by configurable weights.
  */

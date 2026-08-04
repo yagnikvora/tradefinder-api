@@ -11,19 +11,40 @@
 //                    does not have — whereas `ohlc.high/low` in the Tier-A quote IS the
 //                    opening range at 09:30, for free, if someone writes it down.
 //
-// So this writes it down. It is fed by the same 30-second quote poll everything else uses
+// So this writes it down. It is fed by the same 15-second quote poll everything else uses
 // and costs no upstream call at all.
+//
+// THE RING IS ALSO THE TIMING LAYER'S ONLY INPUT. `pulse.service.ts` measures the last few
+// minutes — velocity, interval volume, directional persistence, a pre-breakout base — and
+// every one of those readings is a difference between two entries of this ring. That is what
+// makes an early signal affordable across the whole 208-stock universe rather than for a
+// shortlist: the poll that already happens is the intraday feed, so the ignition read costs
+// nothing extra and is available on every stock, including the ones the score has not
+// noticed yet.
 //
 // State is persisted after every update because the alternative is losing the morning to a
 // restart: a process that comes up at 11:00 with no opening range cannot recover one from
-// the quote feed, and would have that factor dark for the rest of the day.
+// the quote feed, and would have that factor dark for the rest of the day. The ring is
+// persisted for the same reason — a restart at 13:00 would otherwise have no price path and
+// no leg, and the timing layer would sit at `ready: false` while the market moved.
 
 import { store, STORE_KEYS } from '../store.js';
 import { istDay, minuteOfSession } from '../session.js';
 import type { MomentumQuote } from './quotes.js';
+import type { TriggerKind } from '../types.js';
 
-/** ~15 minutes of 30-second polls. Enough to measure a slope, small enough to persist. */
-const RING = 30;
+/**
+ * ~25 minutes of 15-second polls.
+ *
+ * Sized off the longest window anything reads — `pulse.baseWindowMin` at 15 — plus enough
+ * behind it to measure the base against what came before. Every reading is six numbers, so
+ * the whole universe is ~200 symbols × 100 × 6, which serialises to a couple of megabytes
+ * and is written at most once a cycle.
+ */
+const RING = 100;
+
+/** A hard age cap as well as a count cap, so a slow poll cannot stretch the window silently. */
+const MAX_READING_AGE_MS = 45 * 60_000;
 
 export interface VwapReading {
   at: number;
@@ -33,7 +54,50 @@ export interface VwapReading {
   /** Cumulative rupee turnover, `vwap × volume`. Kept so interval VWAP is exact. */
   turnover: number;
   ltp: number;
+  /** Session high and low as of this reading — how a new day extreme is dated. */
+  high: number;
+  low: number;
 }
+
+/**
+ * The current directional swing, from an ATR-scaled zigzag.
+ *
+ * This is what lets the board answer "how long has this been going" without keeping a full
+ * tick history. Price extends the leg while it makes new extremes and starts a new one when
+ * it gives back `reversal` rupees, which is set from ATR so a 0.4% wobble ends a leg in
+ * HDFCBANK and does not in a midcap that ranges 4% a day.
+ *
+ * The leg is the difference between "this stock is up 3%" and "this stock has been going up
+ * for four minutes" — the second is a trade and the first is a fact about the past.
+ */
+export interface PriceLeg {
+  direction: 1 | -1;
+  startAt: number;
+  startPrice: number;
+  /** The furthest the leg has gone, and when. */
+  extremeAt: number;
+  extremePrice: number;
+  /** The reversal distance in rupees this leg is being tracked with. */
+  reversal: number;
+}
+
+/**
+ * A trigger that has fired, kept so it has an AGE.
+ *
+ * Without this the board can only say "price is above the opening range", which is true for
+ * the four hours after the break and says nothing about whether the break is new. What makes
+ * a signal early is knowing it fired at 11:04, and that is only knowable by having recorded
+ * it at 11:04.
+ */
+export interface FiredTrigger {
+  kind: TriggerKind;
+  direction: 1 | -1;
+  at: number;
+  price: number;
+}
+
+/** How many fired triggers are kept per symbol. Only the freshest is ever surfaced. */
+const EVENT_RING = 8;
 
 export interface OpeningRange {
   high: number;
@@ -50,6 +114,10 @@ export interface SymbolSessionState {
   lastAtmDelta: { at: number; delta: number } | null;
   /** Futures open interest from the last enrichment pass. */
   lastFuturesOi: { at: number; oi: number } | null;
+  /** The active directional swing. Null until price has moved enough to define one. */
+  leg: PriceLeg | null;
+  /** Triggers that have fired today, newest last. */
+  events: FiredTrigger[];
 }
 
 export interface SessionState {
@@ -77,7 +145,15 @@ export async function sessionState(nowMs = Date.now()): Promise<SessionState> {
 }
 
 function forSymbol(s: SessionState, symbol: string): SymbolSessionState {
-  return (s.symbols[symbol] ??= { readings: [], openingRange: null, lastAtmDelta: null, lastFuturesOi: null });
+  const sym = (s.symbols[symbol] ??= {
+    readings: [], openingRange: null, lastAtmDelta: null, lastFuturesOi: null, leg: null, events: [],
+  });
+  // A state file written before the timing layer existed has neither field. Filled here
+  // rather than at load, so one migration covers both the disk copy and anything a test
+  // constructs by hand.
+  sym.leg ??= null;
+  sym.events ??= [];
+  return sym;
 }
 
 /**
@@ -87,8 +163,18 @@ function forSymbol(s: SessionState, symbol: string): SymbolSessionState {
  * taken from `ohlc.high`/`ohlc.low`, which are the session's extremes to date — so at any
  * point inside the first fifteen minutes they ARE the opening range so far, and at 09:30
  * they are the finished one.
+ *
+ * `reversalRupees` is the zigzag threshold for the leg tracker, passed in rather than derived
+ * here because it comes from the ATR baseline, which this module deliberately does not know
+ * about. Zero or absent means "no ATR for this symbol" and falls back to a percentage.
  */
-export function observe(s: SessionState, q: MomentumQuote, openingMinutes: number, nowMs = Date.now()): void {
+export function observe(
+  s: SessionState,
+  q: MomentumQuote,
+  openingMinutes: number,
+  nowMs = Date.now(),
+  reversalRupees = 0,
+): void {
   const minute = minuteOfSession(nowMs);
   if (minute <= 0) return; // pre-open: nothing has traded, and ohlc is last session's shell
 
@@ -105,10 +191,16 @@ export function observe(s: SessionState, q: MomentumQuote, openingMinutes: numbe
       volume: q.volume,
       turnover: q.vwap * q.volume,
       ltp: q.ltp,
+      high: q.high,
+      low: q.low,
     });
+    const cutoff = nowMs - MAX_READING_AGE_MS;
+    while (sym.readings.length > 1 && sym.readings[0].at < cutoff) sym.readings.shift();
     if (sym.readings.length > RING) sym.readings.splice(0, sym.readings.length - RING);
     dirty = true;
   }
+
+  trackLeg(sym, q.ltp, nowMs, reversalRupees);
 
   if (!sym.openingRange?.complete && q.high > 0 && q.low > 0) {
     sym.openingRange = {
@@ -119,6 +211,107 @@ export function observe(s: SessionState, q: MomentumQuote, openingMinutes: numbe
     };
     dirty = true;
   }
+}
+
+/**
+ * Advance the zigzag by one price.
+ *
+ * Extending an existing leg is free; ending one requires giving back the full reversal
+ * distance from the extreme, which is what stops a leg being restarted by every tick against
+ * it. The new leg starts AT THE OLD EXTREME, not at the current price — the turn happened up
+ * there, and dating it from here would report every reversal as a few minutes younger and a
+ * few rupees smaller than it was.
+ */
+function trackLeg(sym: SymbolSessionState, ltp: number, nowMs: number, reversalRupees: number): void {
+  if (!(ltp > 0)) return;
+  const reversal = reversalRupees > 0 ? reversalRupees : ltp * 0.0035;
+
+  if (!sym.leg) {
+    sym.leg = { direction: 1, startAt: nowMs, startPrice: ltp, extremeAt: nowMs, extremePrice: ltp, reversal };
+    dirty = true;
+    return;
+  }
+
+  const leg = sym.leg;
+  leg.reversal = reversal;
+
+  const extending = leg.direction === 1 ? ltp > leg.extremePrice : ltp < leg.extremePrice;
+  if (extending) {
+    leg.extremePrice = ltp;
+    leg.extremeAt = nowMs;
+    dirty = true;
+    return;
+  }
+
+  const givenBack = leg.direction === 1 ? leg.extremePrice - ltp : ltp - leg.extremePrice;
+  if (givenBack >= reversal) {
+    sym.leg = {
+      direction: leg.direction === 1 ? -1 : 1,
+      startAt: leg.extremeAt,
+      startPrice: leg.extremePrice,
+      extremeAt: nowMs,
+      extremePrice: ltp,
+      reversal,
+    };
+    dirty = true;
+  }
+}
+
+/**
+ * Record that a trigger fired, unless the same one already fired inside the cooldown.
+ *
+ * Returns the live trigger either way, so the caller always has the FIRST firing's timestamp
+ * and price rather than this cycle's. That is the whole point: a signal's age is measured
+ * from when the move began, and re-stamping it every cycle would make every trigger
+ * permanently fifteen seconds old and permanently "fresh".
+ */
+export function recordTrigger(
+  sym: SymbolSessionState,
+  kind: TriggerKind,
+  direction: 1 | -1,
+  price: number,
+  nowMs: number,
+  cooldownMs: number,
+): FiredTrigger {
+  sym.events ??= [];
+  const existing = [...sym.events]
+    .reverse()
+    .find((e) => e.kind === kind && e.direction === direction && nowMs - e.at < cooldownMs);
+  if (existing) return existing;
+
+  const fired: FiredTrigger = { kind, direction, at: nowMs, price };
+  sym.events.push(fired);
+  if (sym.events.length > EVENT_RING) sym.events.splice(0, sym.events.length - EVENT_RING);
+  dirty = true;
+  return fired;
+}
+
+/** The most recent trigger, whatever kind. Null when nothing has fired today. */
+export const lastTrigger = (sym: SymbolSessionState | undefined): FiredTrigger | null =>
+  sym?.events?.length ? sym.events[sym.events.length - 1] : null;
+
+/**
+ * The reading closest to `msAgo` before now, or null when the ring does not reach back
+ * that far. Closest rather than first-older-than, because at a 15-second poll the two
+ * differ by up to a whole interval and every velocity would inherit that bias.
+ */
+export function readingAt(sym: SymbolSessionState | undefined, msAgo: number, nowMs: number): VwapReading | null {
+  const r = sym?.readings ?? [];
+  if (r.length < 2) return null;
+  const target = nowMs - msAgo;
+  if (r[0].at > target) return null; // the window predates the ring — do not pretend otherwise
+
+  let best = r[0];
+  for (const p of r) {
+    if (Math.abs(p.at - target) < Math.abs(best.at - target)) best = p;
+  }
+  return best;
+}
+
+/** Every reading at or after `msAgo`. The slice the pulse windows are measured over. */
+export function readingsSince(sym: SymbolSessionState | undefined, msAgo: number, nowMs: number): VwapReading[] {
+  const from = nowMs - msAgo;
+  return (sym?.readings ?? []).filter((p) => p.at >= from);
 }
 
 /** Record an enrichment-tier reading, so the next pass can measure what changed. */
@@ -182,15 +375,39 @@ export function intervalVwap(sym: SymbolSessionState | undefined): number | null
   return +(dt / dv).toFixed(3);
 }
 
-/** Persist, at most one write in flight. Called after a full cycle, not per symbol. */
-export async function flushSessionState(): Promise<void> {
+/**
+ * The shortest gap between two writes.
+ *
+ * The ring grew from 30 readings to 100 when the timing layer started reading it, which took
+ * the serialised state from a few hundred kilobytes to a couple of megabytes — and the scan
+ * interval halved to 15 seconds at the same time. Writing all of it every cycle is ~2MB of
+ * `JSON.stringify` plus a file replace eight times a minute, for state that is worth at most
+ * a few seconds of warm-up on a restart.
+ *
+ * Thirty seconds is the trade: a crash costs at most that much of the price ring, which
+ * refills within one pulse window, while the opening range and any fired trigger were
+ * already written by an earlier flush.
+ */
+const MIN_FLUSH_MS = 30_000;
+let lastFlushAt = 0;
+
+/**
+ * Persist, at most one write in flight and at most one per `MIN_FLUSH_MS`.
+ *
+ * Called after a full cycle, not per symbol. `force` is for the paths where losing the
+ * write actually costs something — the end of a session, or a deliberate shutdown.
+ */
+export async function flushSessionState(force = false, nowMs = Date.now()): Promise<void> {
   if (!dirty || !state) return;
   if (flushing) return flushing;
+  if (!force && nowMs - lastFlushAt < MIN_FLUSH_MS) return;
+
   dirty = false;
+  lastFlushAt = nowMs;
   const payload = state;
   flushing = store.write(STORE_KEYS.session, payload).finally(() => { flushing = null; });
   return flushing;
 }
 
 /** Test seam — drops the in-memory copy so the next read comes off disk. */
-export const resetSessionState = (): void => { state = null; dirty = false; };
+export const resetSessionState = (): void => { state = null; dirty = false; lastFlushAt = 0; };

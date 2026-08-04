@@ -146,11 +146,112 @@ async function main() {
     );
   }
 
+  hr('Timing layer — is the board early, or is it describing finished moves?');
+  //
+  // The single most useful line this tool prints. If almost every high-scoring row reads
+  // `Extended`, the model is working exactly as designed and is telling you the truth: the
+  // scan arrived after the moves. If nothing is `Igniting` all session, either the market is
+  // genuinely flat or `signal.minPulseScore` / `minBurstRvol` are set above what this
+  // universe actually produces, and they want lowering against real fills rather than taste.
+  {
+    const withSignal = board.rows.filter((r) => r.signal);
+    const byState = new Map<string, number>();
+    for (const r of withSignal) byState.set(r.signal!.state, (byState.get(r.signal!.state) ?? 0) + 1);
+
+    console.log(
+      'states: ' +
+        [...byState.entries()].sort((a, b) => b[1] - a[1]).map(([s, c]) => `${s}=${c}`).join('  ') +
+        `  (${withSignal.length} rows carry a signal)`,
+    );
+
+    const warming = withSignal.filter((r) => !r.signal!.pulse.ready).length;
+    if (warming)
+      console.log(`  ! ${warming} rows have no pulse yet — the price ring needs ~${cfg.thresholds.pulse.fastWindowMin} minutes of polling after a restart`);
+
+    // How the score and the timing read disagree. This is the whole point of the layer, and
+    // if the two never disagree the layer is not doing anything.
+    const strong = withSignal.filter((r) => r.score >= cfg.output.buyScore);
+    const strongSpent = strong.filter((r) => r.signal!.state === 'Extended' || r.signal!.state === 'Reversing');
+    console.log(
+      `  of ${strong.length} rows scoring ${cfg.output.buyScore}+, ${strongSpent.length} are already spent or reversing` +
+        (strong.length ? ` (${((strongSpent.length / strong.length) * 100).toFixed(0)}%)` : ''),
+    );
+
+    const entries = withSignal
+      .filter((r) => r.signal!.action === 'Buy Call' || r.signal!.action === 'Buy Put')
+      .sort((a, b) => b.signal!.entryQuality - a.signal!.entryQuality);
+
+    console.log(`\nentrable right now: ${entries.length}`);
+    if (entries.length) {
+      console.log(
+        pad('symbol', 12) + padL('entry', 6) + padL('score', 6) + pad('  state', 12) +
+        pad('trigger', 20) + padL('age', 5) + padL('burst', 6) +
+        pad('  contract', 15) + padL('cost', 8) + padL('lot ₹', 10) + padL('gain%', 7),
+      );
+      for (const r of entries.slice(0, 15)) {
+        const s = r.signal!;
+        const k = s.strike;
+        console.log(
+          pad(r.symbol, 12) +
+            padL(String(s.entryQuality), 6) +
+            padL(r.score.toFixed(1), 6) +
+            pad('  ' + s.state, 12) +
+            pad(s.trigger ? s.trigger.label : '—', 20) +
+            padL(s.trigger ? `${s.trigger.ageMin.toFixed(0)}m` : '—', 5) +
+            padL(s.pulse.burstRvol?.toFixed(1) ?? '—', 6) +
+            pad('  ' + (k ? k.label + (k.warnings.length ? ' ⚠' : '') : '—'), 15) +
+            padL(k ? k.entryCost.toFixed(2) : '—', 8) +
+            padL(k?.costPerLot?.toLocaleString('en-IN') ?? '—', 10) +
+            padL(k?.gainPctAtTarget?.toFixed(0) ?? s.plan?.optionMovePctAtTarget?.toFixed(0) ?? '—', 7),
+        );
+      }
+
+      // The contract's own problems, spelled out. A strike nobody is quoting is the most
+      // common reason a perfect-looking stock setup is not a trade, and a table cell cannot
+      // carry that.
+      const flagged = entries.filter((r) => (r.signal!.strike?.warnings.length ?? 0) > 0);
+      if (flagged.length) {
+        console.log('');
+        for (const r of flagged.slice(0, 6)) {
+          for (const w of r.signal!.strike!.warnings) console.log(`  ⚠ ${r.symbol} ${r.signal!.strike!.label}: ${w}`);
+        }
+      }
+
+      const noStrike = entries.filter((r) => !r.signal!.strike).length;
+      if (noStrike)
+        console.log(`\n  ${noStrike} entrable rows have no contract named — they were not in the enrichment shortlist this cycle`);
+    } else {
+      console.log('  (none — every strong row has already moved, stalled or turned. That is a finding, not a bug.)');
+    }
+
+    // The shortlist reservation, checked rather than assumed: if no fresh signal ever gets
+    // enriched, the reserved slots are not doing their job.
+    const enrichedFresh = withSignal.filter((r) => r.signal!.state === 'Igniting' && r.enrichment === 'full').length;
+    const totalFresh = withSignal.filter((r) => r.signal!.state === 'Igniting').length;
+    console.log(`\nigniting rows with an option chain: ${enrichedFresh}/${totalFresh} (${cfg.signal.enrichReservedSlots} slots reserved for them)`);
+  }
+
   hr('Explanation of the top row — the score and its ✓ list must agree');
   const top = board.rows[0];
   if (top) {
     console.log(`${top.symbol}  score ${top.score} (raw ${top.rawScore}, coverage ${(top.coverage * 100).toFixed(0)}%)`);
     console.log(`price ₹${top.price} (${top.changePct >= 0 ? '+' : ''}${top.changePct}%), ${top.direction}, ${top.confidence} confidence, ${top.tradeType}`);
+    if (top.signal) {
+      const s = top.signal;
+      console.log(
+        `timing: ${s.state} / ${s.action}, entry quality ${s.entryQuality}` +
+          (s.trigger ? `, ${s.trigger.label} ${s.trigger.ageMin.toFixed(0)}m ago at ₹${s.trigger.price}` : ', no trigger') +
+          (s.extension.atrUsed === null ? '' : `, ${(s.extension.atrUsed * 100).toFixed(0)}% of a normal day used`),
+      );
+      for (const b of s.blockers) console.log(`  blocked: ${b}`);
+      if (s.strike)
+        console.log(
+          `contract: ${s.strike.label} @ ₹${s.strike.entryCost} (${s.strike.moneyness}, delta ${Math.abs(s.strike.delta).toFixed(2)}, ` +
+            `${s.strike.spreadPct?.toFixed(1) ?? '—'}% spread)` +
+            (s.strike.costPerLot ? ` — ₹${s.strike.costPerLot.toLocaleString('en-IN')} a lot` : '') +
+            (s.strike.gainPctAtTarget !== null ? `, ${s.strike.gainPctAtTarget.toFixed(0)}% at target` : ''),
+        );
+    }
     console.log(`institutional activity: ${top.institutionalActivity}`);
     if (top.expectedMove) console.log(`expected move to expiry: ±₹${top.expectedMove.rupees} (${top.expectedMove.pct}%) over ${top.expectedMove.days}d`);
     console.log('');

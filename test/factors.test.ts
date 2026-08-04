@@ -18,7 +18,10 @@ import { gradeRvol, computeRvol } from '../src/momentum/services/rvol.service.js
 import { trueRange } from '../src/momentum/services/atr.service.js';
 import { computeRelativeStrength } from '../src/momentum/services/relative-strength.service.js';
 import { computeSector } from '../src/momentum/services/sector.service.js';
-import { vwapSlopePctPerMin, intervalVwap } from '../src/momentum/data/session-state.js';
+import {
+  vwapSlopePctPerMin, intervalVwap,
+  type SymbolSessionState, type VwapReading,
+} from '../src/momentum/data/session-state.js';
 import { candleMinute, minuteOfSession, SESSION_MINUTES } from '../src/momentum/session.js';
 import { noteRefusal, resetBreakers, throttledFor, assertNotThrottled } from '../src/momentum/data/throttle.js';
 import { defaultConfig } from '../src/momentum/config/defaults.js';
@@ -27,6 +30,11 @@ import type { MomentumQuote } from '../src/momentum/data/quotes.js';
 import type { SymbolBaseline } from '../src/momentum/data/baseline.js';
 
 /* --------------------------------------------------------------------- helpers --- */
+
+/** A session state around a price ring, with everything else empty. */
+const symState = (readings: VwapReading[]): SymbolSessionState => ({
+  readings, openingRange: null, lastAtmDelta: null, lastFuturesOi: null, leg: null, events: [],
+});
 
 const leg = (over: Partial<ChainLeg> = {}): ChainLeg => ({
   instrumentKey: 'NSE_FO|1', ltp: 10, closePrice: 10, volume: 0, oi: 0, prevOi: 0,
@@ -480,57 +488,54 @@ describe('expectedMoveFrom', () => {
 /* ---------------------------------------------------------------- VWAP slope --- */
 
 describe('vwapSlopePctPerMin', () => {
-  const readings = (vwaps: number[], stepMs = 30_000) =>
-    vwaps.map((vwap, i) => ({ at: 1_000_000 + i * stepMs, minute: i, vwap, volume: (i + 1) * 100, turnover: vwap * (i + 1) * 100, ltp: vwap }));
+  const readings = (vwaps: number[], stepMs = 30_000): VwapReading[] =>
+    vwaps.map((vwap, i) => ({
+      at: 1_000_000 + i * stepMs, minute: i, vwap, volume: (i + 1) * 100,
+      turnover: vwap * (i + 1) * 100, ltp: vwap, high: vwap, low: vwap,
+    }));
 
   it('is positive on a rising VWAP and negative on a falling one', () => {
-    const up = vwapSlopePctPerMin({ readings: readings([100, 100.05, 100.1, 100.15, 100.2]), openingRange: null, lastAtmDelta: null, lastFuturesOi: null });
-    const down = vwapSlopePctPerMin({ readings: readings([100, 99.95, 99.9, 99.85, 99.8]), openingRange: null, lastAtmDelta: null, lastFuturesOi: null });
+    const up = vwapSlopePctPerMin(symState(readings([100, 100.05, 100.1, 100.15, 100.2])));
+    const down = vwapSlopePctPerMin(symState(readings([100, 99.95, 99.9, 99.85, 99.8])));
     assert.ok((up as number) > 0);
     assert.ok((down as number) < 0);
   });
 
   it('is ~0 on a flat VWAP', () => {
-    const flat = vwapSlopePctPerMin({ readings: readings([100, 100, 100, 100, 100]), openingRange: null, lastAtmDelta: null, lastFuturesOi: null });
-    assert.equal(flat, 0);
+    assert.equal(vwapSlopePctPerMin(symState(readings([100, 100, 100, 100, 100]))), 0);
   });
 
   it('is null until there is enough of a window to fit a line to', () => {
-    assert.equal(vwapSlopePctPerMin({ readings: readings([100, 100.1]), openingRange: null, lastAtmDelta: null, lastFuturesOi: null }), null);
+    assert.equal(vwapSlopePctPerMin(symState(readings([100, 100.1]))), null);
     // Three readings but only 20 seconds of span — a slope off that is noise.
-    assert.equal(
-      vwapSlopePctPerMin({ readings: readings([100, 100.1, 100.2], 10_000), openingRange: null, lastAtmDelta: null, lastFuturesOi: null }),
-      null,
-    );
+    assert.equal(vwapSlopePctPerMin(symState(readings([100, 100.1, 100.2], 10_000))), null);
     assert.equal(vwapSlopePctPerMin(undefined), null);
   });
 
   it('resists a single outlier better than a two-point slope would', () => {
     // Least squares over the window, not last-minus-first.
-    const clean = readings([100, 100.1, 100.2, 100.3, 100.4]);
-    const spiked = readings([100, 100.1, 100.2, 100.3, 100.34]);
-    const a = vwapSlopePctPerMin({ readings: clean, openingRange: null, lastAtmDelta: null, lastFuturesOi: null }) as number;
-    const b = vwapSlopePctPerMin({ readings: spiked, openingRange: null, lastAtmDelta: null, lastFuturesOi: null }) as number;
+    const a = vwapSlopePctPerMin(symState(readings([100, 100.1, 100.2, 100.3, 100.4]))) as number;
+    const b = vwapSlopePctPerMin(symState(readings([100, 100.1, 100.2, 100.3, 100.34]))) as number;
     assert.ok(Math.abs(a - b) < a * 0.25, 'one soft reading must not swing the slope');
   });
 });
 
 describe('intervalVwap', () => {
   it('is Δturnover ÷ Δvolume — the price of what actually traded in the window', () => {
-    const readings = [
-      { at: 0, minute: 0, vwap: 100, volume: 1000, turnover: 100_000, ltp: 100 },
-      { at: 60_000, minute: 1, vwap: 101, volume: 2000, turnover: 204_000, ltp: 102 },
+    const readings: VwapReading[] = [
+      { at: 0, minute: 0, vwap: 100, volume: 1000, turnover: 100_000, ltp: 100, high: 100, low: 100 },
+      { at: 60_000, minute: 1, vwap: 101, volume: 2000, turnover: 204_000, ltp: 102, high: 102, low: 100 },
     ];
     // 104,000 rupees over 1,000 shares = 104, well above the 101 session VWAP.
-    assert.equal(intervalVwap({ readings, openingRange: null, lastAtmDelta: null, lastFuturesOi: null }), 104);
+    assert.equal(intervalVwap(symState(readings)), 104);
   });
 
   it('is null when nothing traded in the window', () => {
-    const readings = [
-      { at: 0, minute: 0, vwap: 100, volume: 1000, turnover: 100_000, ltp: 100 },
-      { at: 60_000, minute: 1, vwap: 100, volume: 1000, turnover: 100_000, ltp: 100 },
+    const readings: VwapReading[] = [
+      { at: 0, minute: 0, vwap: 100, volume: 1000, turnover: 100_000, ltp: 100, high: 100, low: 100 },
+      { at: 60_000, minute: 1, vwap: 100, volume: 1000, turnover: 100_000, ltp: 100, high: 100, low: 100 },
     ];
-    assert.equal(intervalVwap({ readings, openingRange: null, lastAtmDelta: null, lastFuturesOi: null }), null);
+    assert.equal(intervalVwap(symState(readings)), null);
   });
 });
 

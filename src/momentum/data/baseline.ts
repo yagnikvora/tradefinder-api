@@ -1,6 +1,6 @@
 // Tier C — everything that needs history, built once a day.
 //
-// This is the file that makes the scanner cheap at runtime. Four of the eleven factors are
+// This is the file that makes the scanner cheap at runtime. Four of the twelve factors are
 // comparisons against a stock's own past, and every one of them is settled here before the
 // market opens:
 //

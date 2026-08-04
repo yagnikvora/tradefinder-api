@@ -1,7 +1,7 @@
 // The engine. Two stages, because the rate limit only allows two stages.
 //
 // Upstox allows 2000 requests per 30 minutes PER API PER USER. Scoring 208 F&O stocks on
-// every factor every 30 seconds would need 208 option-chain calls per cycle — 12,480 per
+// every factor every cycle would need 208 option-chain calls per cycle — 12,480 per
 // 30 minutes against that endpoint, six times the ceiling. The scanner would work for four
 // minutes and then be throttled off for the rest of the session.
 //
@@ -9,10 +9,15 @@
 //
 //   STAGE 1 — every symbol, every cycle, THREE requests total.
 //     One batched quote call covers 208 shares, 208 futures, the sector indices, the Nifty,
-//     its future and the VIX. Eight of the eleven factors come out of that plus the daily
-//     baseline: volume, liquidity, relative strength, VWAP, ATR, sector, breadth, trend.
-//     Futures open interest rides along too, so the build-up classification is available
-//     universe-wide even before enrichment.
+//     its future and the VIX. Nine of the twelve factors come out of that plus the daily
+//     baseline: momentum pulse, volume, liquidity, relative strength, VWAP, ATR, sector,
+//     breadth, trend. Futures open interest rides along too, so the build-up classification
+//     is available universe-wide even before enrichment.
+//
+//     The momentum pulse — and with it the whole timing layer — costs nothing extra here:
+//     it is measured from successive readings of this same poll. That is what makes an
+//     early signal available on all 208 stocks rather than on the shortlist, which matters
+//     because the stock about to move is by definition not yet a highly-ranked one.
 //
 //   STAGE 2 — the top N only, one request each.
 //     Ranked by the stage-1 score, the shortlist gets its option chain: greeks, implied
@@ -24,9 +29,17 @@
 // mean over AVAILABLE weight, and `enrichment: 'quote'` says which read it was. Enrichment
 // results are cached for their own TTL and reused across stage-1 cycles, so a stock that
 // drops out of the shortlist for one cycle keeps its option data until it goes stale.
+//
+// HOW THE SHORTLIST IS CHOSEN, AND WHY IT CHANGED. Ranking it by the stage-1 score alone
+// meant the option chain only ever reached stocks that had ALREADY moved — the score is
+// built from cumulative readings, so the shortlist was a list of finished moves and the one
+// stock igniting at 11:04 could not get enriched until it had climbed a ranking built on the
+// previous four hours. `signal.enrichReservedSlots` of the shortlist is now taken by the
+// freshest timing signals instead, whatever they score. The cost is unchanged: the same
+// number of chain requests, pointed at stocks where the move is still in front.
 
 import type {
-  FactorOutcome, MomentumBoard, MomentumConfig, MomentumRow,
+  FactorOutcome, MomentumBoard, MomentumConfig, MomentumRow, MomentumSignal,
 } from '../types.js';
 import { marketOpen, minuteOfSession, sessionFraction, istDay } from '../session.js';
 import { getBaseline, type SymbolBaseline } from '../data/baseline.js';
@@ -50,6 +63,8 @@ import { computeBreadth, breadthFactor, marketContext, type BreadthReading } fro
 import { computeOptionFlow, optionFlowFactor, type OptionFlowReading } from '../services/option-analytics.service.js';
 import { computeGreeks, greeksFactor, type GreeksReading } from '../services/greeks.service.js';
 import { computeIv, ivFactor, type IvReading } from '../services/iv.service.js';
+import { computePulse, pulseFactor, type PulseReading } from '../services/pulse.service.js';
+import { buildSignal, gateTradeType } from './signal.service.js';
 import { institutionalActivity, scoreRow } from './score.service.js';
 import { cache } from '../cache.js';
 
@@ -78,6 +93,15 @@ interface StageOne {
   rvol: number | null;
   optionFlow: OptionFlowReading;
   provisionalScore: number;
+  pulse: PulseReading;
+  /**
+   * The timing read, built before enrichment so it can decide who GETS enriched.
+   *
+   * Rebuilt in `buildRow` once the chain is in hand — the trigger it records is deduplicated
+   * inside the cooldown, so the second build returns the first firing's timestamp rather
+   * than re-stamping the signal as brand new every cycle.
+   */
+  signal: MomentumSignal;
   metricsCarry: {
     vwap: ReturnType<typeof computeVwap>;
     trend: ReturnType<typeof computeTrend>;
@@ -134,8 +158,13 @@ function stageOne(
   // Futures OI is on the Tier-A quote, so the build-up class is known for the whole
   // universe. Only the chain half of this factor waits for enrichment.
   const optionFlow = computeOptionFlow(future, baseline, null);
+  // The timing read, from the ring the quote poll has been filling. No request, so it is
+  // available on every stock in the universe rather than on the enrichment shortlist —
+  // which is the point, since the stock about to move is not yet a highly-ranked one.
+  const pulseReading = computePulse(quote, symState, baseline, cfg, nowMs);
 
   const factors: FactorOutcome[] = [
+    pulseFactor(pulseReading, cfg),
     rvolFactor(rvolReading, cfg),
     liquidityFactor(liquidityReading, cfg),
     relativeStrengthFactor(relStrength, cfg),
@@ -152,6 +181,23 @@ function stageOne(
 
   const provisional = scoreRow({ factors, liquidityScore: liquidityReading.score, config: cfg });
 
+  const signal = buildSignal({
+    quote,
+    pulse: pulseReading,
+    pulseScore: factors.find((f) => f.key === 'momentumPulse')?.score ?? null,
+    symState,
+    baseline,
+    openingRange: symState?.openingRange ?? null,
+    // No chain yet — the plan is priced off ATR and names no strike until enrichment lands.
+    greeks: null,
+    chain: null,
+    lotSize: member.future?.lotSize ?? null,
+    direction: provisional.direction,
+    liquidityScore: liquidityReading.score,
+    config: cfg,
+    nowMs,
+  });
+
   return {
     member,
     quote,
@@ -163,6 +209,8 @@ function stageOne(
     rvol: rvolReading.rvol,
     optionFlow,
     provisionalScore: provisional.score,
+    pulse: pulseReading,
+    signal,
     metricsCarry: {
       vwap: vwapReading,
       trend: trendReading,
@@ -186,6 +234,47 @@ function directionOf(factors: FactorOutcome[]): number {
     den += f.weight * strength;
   }
   return den > 0 ? num / den : 0;
+}
+
+/* -------------------------------------------------------------- shortlist policy --- */
+
+/**
+ * Who gets the option chain this cycle.
+ *
+ * Two lists, merged. The first is the old one — highest provisional score — and it is still
+ * most of the shortlist, because a board that dropped it would lose the ability to say
+ * anything about the stocks people are actually watching.
+ *
+ * The second is the fix. `enrichReservedSlots` go to the rows the TIMING layer likes most,
+ * ranked by entry quality, taken from whatever is left after the score has had its pick.
+ * Without it the enrichment tier had a structural blind spot: option data only reached
+ * stocks that had already climbed a ranking built entirely from cumulative readings, so the
+ * stock igniting right now was always the one being scored without its Greeks — and the
+ * missing Greeks are 9 of the weight, which pushed it further down the very ranking that
+ * decides who gets enriched.
+ */
+export function chooseShortlist(staged: StageOne[], cfg: MomentumConfig): StageOne[] {
+  const size = cfg.universe.shortlistSize;
+  if (size <= 0 || !staged.length) return [];
+
+  const reserved = cfg.signal.enabled ? Math.min(cfg.signal.enrichReservedSlots, Math.floor(size / 2)) : 0;
+  const byScore = [...staged].sort((a, b) => b.provisionalScore - a.provisionalScore);
+
+  const picked = byScore.slice(0, size - reserved);
+  if (reserved <= 0) return picked;
+
+  const taken = new Set(picked.map((s) => s.member.symbol));
+  const byEntry = [...staged]
+    .filter((s) => !taken.has(s.member.symbol) && s.signal.entryQuality > 0)
+    .sort((a, b) => {
+      // Igniting first whatever it scores — that is the whole reason these slots exist.
+      const ai = a.signal.state === 'Igniting' ? 1 : 0;
+      const bi = b.signal.state === 'Igniting' ? 1 : 0;
+      return bi - ai || b.signal.entryQuality - a.signal.entryQuality;
+    })
+    .slice(0, reserved);
+
+  return [...picked, ...byEntry];
 }
 
 /* ------------------------------------------------------------ stage 2: enrichment --- */
@@ -229,6 +318,7 @@ function buildRow(
   ivReading: IvReading | null,
   breadth: BreadthReading,
   cfg: MomentumConfig,
+  nowMs: number,
 ): MomentumRow {
   const chain = enrichment?.chain ?? null;
   const carry = s.metricsCarry;
@@ -268,6 +358,31 @@ function buildRow(
 
   const result = scoreRow({ factors, liquidityScore, config: cfg });
 
+  // The timing read, rebuilt against the final direction and — where the chain arrived —
+  // against the delta and premium actually quoted, so the plan says what the option does
+  // rather than only what the stock does. `recordTrigger` dedupes inside the cooldown, so
+  // this does not restamp the trigger the stage-1 build already dated.
+  const signal = cfg.signal.enabled
+    ? buildSignal({
+        quote: s.quote,
+        pulse: s.pulse,
+        pulseScore: factors.find((f) => f.key === 'momentumPulse')?.score ?? null,
+        symState: s.symState,
+        baseline: s.baseline,
+        openingRange: s.symState?.openingRange ?? null,
+        greeks,
+        // With the chain in hand the plan names a specific contract rather than pricing a
+        // notional ATM one; the lot comes off the future, which NSE lists identically for
+        // that underlying's options.
+        chain,
+        lotSize: s.member.future?.lotSize ?? null,
+        direction: result.direction,
+        liquidityScore,
+        config: cfg,
+        nowMs,
+      })
+    : null;
+
   const activity = institutionalActivity(
     {
       rvol: s.rvol,
@@ -296,8 +411,11 @@ function buildRow(
     coverage: result.coverage,
     confidence: result.confidence,
     direction: result.direction,
-    tradeType: result.tradeType,
+    // The headline label is only allowed to say Buy/Sell when the timing layer agrees the
+    // entry is still there. Everything else the model liked becomes Watch.
+    tradeType: gateTradeType(result.tradeType, signal, cfg),
     institutionalActivity: activity.level,
+    signal,
 
     liquidity: { score: liquidityScore, grade: carry.liquidity.grade },
     rvol: { value: s.rvol, grade: carry.rvolReading.grade },
@@ -374,10 +492,19 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   const failedBaselines = Object.keys(baseline?.failures ?? {}).length;
   if (failedBaselines > 0) warnings.push(`${failedBaselines} symbols have no baseline (Upstox would not serve their history).`);
 
-  // Fold this reading into the session state before anything reads it, so the VWAP slope
-  // and opening range include the current tick.
+  // Fold this reading into the session state before anything reads it, so the VWAP slope,
+  // the opening range and the price ring all include the current tick.
+  //
+  // The reversal distance handed to the leg tracker is ATR-scaled per symbol: what counts as
+  // "it turned" is a fraction of that stock's own daily range, not a fixed percentage that
+  // would end a leg on every wobble in a heavy name and never end one in a volatile midcap.
   const openingMinutes = cfg.thresholds.trendStructure.openingRangeMinutes;
-  for (const q of snap.equity.values()) observe(state, q, openingMinutes, nowMs);
+  const p = cfg.thresholds.pulse;
+  for (const q of snap.equity.values()) {
+    const atr = baseline?.symbols[q.symbol]?.atr ?? 0;
+    const reversal = atr > 0 ? atr * p.legReversalAtr : q.ltp * (p.legReversalPctFloor / 100);
+    observe(state, q, openingMinutes, nowMs, reversal);
+  }
 
   const breadth = computeBreadth(snap);
 
@@ -389,9 +516,7 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   }
 
   // ---- stage 2 ----
-  const shortlist = [...staged]
-    .sort((a, b) => b.provisionalScore - a.provisionalScore)
-    .slice(0, cfg.universe.shortlistSize);
+  const shortlist = chooseShortlist(staged, cfg);
 
   const enrichments = shortlist.length ? await enrich(shortlist, cfg, nowMs) : new Map<string, Enrichment>();
   const enrichFailures = [...enrichments.values()].filter((e) => e.error).length;
@@ -406,7 +531,7 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   }
 
   const rows = staged
-    .map((s) => buildRow(s, enrichments.get(s.member.symbol), ivReadings.get(s.member.symbol) ?? null, breadth, cfg))
+    .map((s) => buildRow(s, enrichments.get(s.member.symbol), ivReadings.get(s.member.symbol) ?? null, breadth, cfg, nowMs))
     .filter((r) => r.coverage >= cfg.scoring.minCoverage)
     .sort((a, b) => b.score - a.score);
 
@@ -417,6 +542,18 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   await persistSessionLearning(shortlist, enrichments, ivReadings, rows, nowMs);
 
   const open = marketOpen(nowMs);
+
+  // A restart mid-session leaves the price ring empty, and the timing layer is dark until it
+  // refills. That is a real state and is said out loud rather than looking like "nothing is
+  // igniting today" — the two are indistinguishable on screen and opposite in meaning.
+  const pulseWarming = rows.filter((r) => r.signal && !r.signal.pulse.ready).length;
+  if (pulseWarming > rows.length * 0.5 && rows.length > 0)
+    warnings.push(
+      `The timing layer is warming up for ${pulseWarming} of ${rows.length} rows — it measures the last ` +
+      `${cfg.thresholds.pulse.fastWindowMin} minutes from the quote poll, so it needs about that long after a restart ` +
+      'before it can call an entry.',
+    );
+
   const ivWarming = [...ivReadings.values()].filter((r) => r.basis === 'hv-proxy').length;
   if (ivWarming)
     warnings.push(
@@ -430,6 +567,8 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
     universeSize: uni.members.length,
     scored: rows.length,
     shortlisted: shortlist.length,
+    igniting: rows.filter((r) => r.signal?.state === 'Igniting').length,
+    entrable: rows.filter((r) => r.signal?.action === 'Buy Call' || r.signal?.action === 'Buy Put').length,
     market: marketContext(snap, breadth, open, sessionFraction(nowMs), minuteOfSession(nowMs)),
     rows,
     warnings,
