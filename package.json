@@ -12,6 +12,7 @@
     "check-flux": "tsx tools/flux-validate.ts",
     "check-upstox": "tsx tools/upstox-validate.ts",
     "check-momentum": "tsx tools/momentum-validate.ts",
+    "replay-trend": "tsx tools/trend-replay.ts",
     "test": "node --import tsx --test \"test/**/*.test.ts\""
   },
   "dependencies": {

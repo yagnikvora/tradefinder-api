@@ -1,7 +1,5 @@
 // Deterministic mock data — identical shapes to live — so the app always runs.
-import type {
-  MarketPulse, SectorScope, IndexMover, ScannerGroups, FiiDiiRow, Signal,
-} from './types.js';
+import type { MarketPulse, SectorScope, IndexMover, Signal } from './types.js';
 import { SECTOR_BASKETS } from './sectors.js';
 
 // Broad Indian-market sample used when NSE is unreachable — spans large/mid/small caps
@@ -36,7 +34,6 @@ const pct = () => +(rnd() * 8 - 3).toFixed(2);
 const price = () => +(rnd() * 4000 + 100).toFixed(1);
 const now = () => Math.floor(Date.now() / 1000);
 const sig = (p: number): Signal => (p >= 0 ? 'BULL' : 'BEAR');
-const dt = (h = 6) => new Date(Date.now() - Math.floor(rnd() * h * 3600e3)).toISOString().slice(0, 19).replace('T', ' ');
 
 // A mock snapshot over a broad Indian-market sample, matching the live param_N schema.
 export function mockMarketPulse(): MarketPulse {
@@ -97,19 +94,3 @@ export function mockIndexMover(index = 'NIFTY 50'): IndexMover {
 }
 
 
-export function mockScanners(keys: string[]): ScannerGroups {
-  const out: ScannerGroups = {};
-  for (const k of keys) out[k] = SYM.slice(0, 12 + Math.floor(rnd()*8)).map((s) => { const p = pct();
-    return { Symbol: s, pChange: p, price: price(), signal: sig(p), when: dt(), score: +(rnd()*4).toFixed(2) }; });
-  return out;
-}
-
-export function mockFiiDii(): FiiDiiRow[] {
-  const rows: FiiDiiRow[] = [];
-  for (let i = 0; i < 20; i++) { const ts = now()-i*86400;
-    const fb = +(10000+rnd()*15000).toFixed(2), fs = +(10000+rnd()*15000).toFixed(2);
-    const db = +(10000+rnd()*10000).toFixed(2), ds = +(8000+rnd()*10000).toFixed(2);
-    rows.push({ date: new Date(ts*1000).toISOString().slice(0,10), fiiBuy: fb, fiiSell: fs, fiiNet: +(fb-fs).toFixed(2),
-      inMarket: +(fb+fs).toFixed(2), diiNet: +(db-ds).toFixed(2), diiBuy: db, diiSell: ds }); }
-  return rows;
-}

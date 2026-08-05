@@ -92,8 +92,25 @@ export interface PulseReading {
   minutesSinceDayHigh: number | null;
   minutesSinceDayLow: number | null;
 
-  /** Today's true range ÷ ATR — how much of a normal day is already spent. */
+  /** Today's true range ÷ ATR — how big today is against a normal day, gap included. */
   atrUsed: number | null;
+  /**
+   * Today's INTRADAY range ÷ ATR — `(high − low) / atr`, with the gap excluded.
+   *
+   * This, not `atrUsed`, is what "how much room is left" has to be measured against, and
+   * conflating the two disqualified every gapper for a whole session. True range includes
+   * `|high − prevClose|`, so a stock that opens a full ATR away from yesterday's close has
+   * spent its entire movement budget before a single share has traded — and the extension
+   * gate would refuse it for the rest of the day on the strength of a move nobody could have
+   * been in. NHPC on 2026-08-05 read 1.13 ATR used at 09:15 and was `Extended` from the first
+   * minute of a session it then trended one direction through.
+   *
+   * The gap is real and is reported separately below; what it is not is travel that a trade
+   * taken now has to compete with.
+   */
+  intradayAtrUsed: number | null;
+  /** The opening gap in ATR, signed. Reported rather than folded into the budget. */
+  gapAtr: number | null;
   /** |price − VWAP| ÷ ATR, signed. How stretched an entry here would be. */
   vwapAtr: number | null;
 
@@ -108,8 +125,8 @@ const EMPTY: PulseReading = {
   ready: false, windowMin: 0, movePct: null, velocityAtrPerMin: null, burstRvol: null,
   efficiency: null, acceleration: null, base: null, legDirection: null, legAgeMin: null,
   legMovePct: null, legMoveAtr: null, pullback: null, minutesSinceExtreme: null,
-  minutesSinceDayHigh: null, minutesSinceDayLow: null, atrUsed: null, vwapAtr: null,
-  atr: null, atrPct: null,
+  minutesSinceDayHigh: null, minutesSinceDayLow: null, atrUsed: null, intradayAtrUsed: null,
+  gapAtr: null, vwapAtr: null, atr: null, atrPct: null,
 };
 
 const minutesBetween = (from: number, to: number): number => (to - from) / 60_000;
@@ -196,6 +213,14 @@ export function computePulse(
     Math.abs(quote.low - quote.prevClose),
   );
   const atrUsed = atr ? round(trueRange / atr, 3) : null;
+  // The intraday range, which is what a trade taken NOW has to compete with. See the field's
+  // doc comment: the gap is movement nobody could have been in, and charging it against the
+  // budget marks every gapper spent before the session has traded.
+  const intradayRange = quote.high > 0 && quote.low > 0 ? Math.max(0, quote.high - quote.low) : 0;
+  const intradayAtrUsed = atr ? round(intradayRange / atr, 3) : null;
+  const gapAtr = atr && quote.open > 0 && quote.prevClose > 0
+    ? round((quote.open - quote.prevClose) / atr, 3)
+    : null;
   const vwapAtr = atr && quote.vwap > 0 ? round((quote.ltp - quote.vwap) / atr, 3) : null;
 
   const leg = sym?.leg ?? null;
@@ -213,6 +238,8 @@ export function computePulse(
     atr,
     atrPct,
     atrUsed,
+    intradayAtrUsed,
+    gapAtr,
     vwapAtr,
     legDirection: leg?.direction ?? null,
     legAgeMin: leg ? round(minutesBetween(leg.startAt, nowMs), 1) : null,
@@ -400,6 +427,8 @@ export function pulseFactor(reading: PulseReading, cfg: MomentumConfig) {
       legMoveAtr: reading.legMoveAtr,
       pullbackFromExtreme: reading.pullback,
       minutesSinceExtreme: reading.minutesSinceExtreme,
+      intradayAtrUsed: reading.intradayAtrUsed,
+      gapAtr: reading.gapAtr,
       baseHigh: reading.base?.high ?? null,
       baseLow: reading.base?.low ?? null,
       baseRangeAtr: reading.base?.rangeAtr ?? null,

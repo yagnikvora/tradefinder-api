@@ -9,7 +9,9 @@
 // weight at zero.
 
 import type { DeepPartial } from './config/config.repository.js';
-import type { FactorKey, MomentumConfig, MomentumRow, SignalAction, SignalState } from './types.js';
+import type {
+  FactorKey, MomentumConfig, MomentumRow, SignalAction, SignalState, TrendPhase,
+} from './types.js';
 import { FACTOR_KEYS } from './types.js';
 
 export class ValidationError extends Error {
@@ -26,7 +28,7 @@ export interface BoardQuery {
   tradeType: 'Momentum Buy' | 'Momentum Sell' | 'Watch' | 'Avoid' | null;
   confidence: 'High' | 'Medium' | 'Low' | null;
   sector: string | null;
-  /** Include the full twelve-factor breakdown on every row. Heavy — off by default. */
+  /** Include the full thirteen-factor breakdown on every row. Heavy — off by default. */
   includeFactors: boolean;
   /** Timing-layer filters. `state`/`action` are exact; `minEntryQuality` is a floor. */
   state: SignalState | null;
@@ -34,10 +36,19 @@ export interface BoardQuery {
   minEntryQuality: number;
   /** Only rows with a trigger inside `signal.maxTriggerAgeMin`. */
   freshOnly: boolean;
+  /** Conviction-layer filters — what the Trend Day view is built on. */
+  phase: TrendPhase | null;
+  minConviction: number;
+  /** Shorthand for `phase in (Forming, Confirmed)`, which is the useful default. */
+  trendOnly: boolean;
+  /** Sort key. `conviction` is what the trend view ranks by; the board defaults to rank. */
+  sort: 'rank' | 'score' | 'conviction' | 'entryQuality';
 }
 
-const SIGNAL_STATES = ['Igniting', 'Extending', 'Extended', 'Stalling', 'Reversing', 'Quiet'] as const;
+const SIGNAL_STATES = ['Igniting', 'Trending', 'Extending', 'Extended', 'Stalling', 'Reversing', 'Quiet'] as const;
 const SIGNAL_ACTIONS = ['Buy Call', 'Buy Put', 'Watch', 'Stand Aside'] as const;
+const TREND_PHASES = ['None', 'Forming', 'Confirmed', 'Faded'] as const;
+const SORTS = ['rank', 'score', 'conviction', 'entryQuality'] as const;
 
 const asInt = (v: unknown, fallback: number, lo: number, hi: number): number => {
   const n = Number(v);
@@ -65,10 +76,14 @@ export function parseBoardQuery(q: Record<string, unknown>, cfg: MomentumConfig)
     action: oneOf(q.action, SIGNAL_ACTIONS),
     minEntryQuality: asInt(q.minEntryQuality, 0, 0, 100),
     freshOnly: asBool(q.freshOnly),
+    phase: oneOf(q.phase, TREND_PHASES),
+    minConviction: asInt(q.minConviction, 0, 0, 100),
+    trendOnly: asBool(q.trendOnly),
+    sort: oneOf(q.sort, SORTS) ?? 'rank',
   };
 }
 
-/** Apply the timing-layer filters. Shared by the board and the signals feed. */
+/** Apply the timing- and conviction-layer filters. Shared by the board and the feeds. */
 export function applySignalFilters(rows: MomentumRow[], q: BoardQuery, cfg: MomentumConfig): MomentumRow[] {
   let out = rows;
   if (q.state) out = out.filter((r) => r.signal?.state === q.state);
@@ -76,6 +91,45 @@ export function applySignalFilters(rows: MomentumRow[], q: BoardQuery, cfg: Mome
   if (q.minEntryQuality > 0) out = out.filter((r) => (r.signal?.entryQuality ?? 0) >= q.minEntryQuality);
   if (q.freshOnly)
     out = out.filter((r) => r.signal?.trigger != null && r.signal.trigger.ageMin <= cfg.signal.maxTriggerAgeMin);
+
+  if (q.phase) out = out.filter((r) => r.conviction?.phase === q.phase);
+  // `Faded` is deliberately excluded from `trendOnly`. It IS a trend day and it is the most
+  // dangerous row on the board, but it is not one to open a position in — it belongs in a
+  // warning list, not a candidate list.
+  if (q.trendOnly)
+    out = out.filter((r) => r.conviction?.phase === 'Forming' || r.conviction?.phase === 'Confirmed');
+  if (q.minConviction > 0) out = out.filter((r) => (r.conviction?.score ?? 0) >= q.minConviction);
+
+  return sortRows(out, q.sort);
+}
+
+/**
+ * Order the rows.
+ *
+ * `rank` is the engine's own smoothed ordering and is left alone — re-sorting on the raw score
+ * here would undo the whole point of smoothing it there. The other three are explicit user
+ * choices, and `conviction` is what the Trend Day view is built on: it puts the stock that has
+ * walked one direction for four hours above the one that spiked ninety seconds ago, which is
+ * the opposite of what the momentum board is for and exactly what that view is for.
+ */
+function sortRows(rows: MomentumRow[], sort: BoardQuery['sort']): MomentumRow[] {
+  if (sort === 'rank') return rows;
+  const out = [...rows];
+  if (sort === 'score') out.sort((a, b) => b.score - a.score);
+  else if (sort === 'entryQuality')
+    out.sort((a, b) => (b.signal?.entryQuality ?? 0) - (a.signal?.entryQuality ?? 0));
+  else
+    out.sort((a, b) => {
+      // Confirmed above Forming above everything, then by conviction, then by how long it has
+      // held — because on two equally one-sided days the older one has proved more.
+      const rank = (r: MomentumRow): number =>
+        r.conviction?.phase === 'Confirmed' ? 2 : r.conviction?.phase === 'Forming' ? 1 : 0;
+      return (
+        rank(b) - rank(a) ||
+        (b.conviction?.score ?? 0) - (a.conviction?.score ?? 0) ||
+        (b.conviction?.heldMin ?? 0) - (a.conviction?.heldMin ?? 0)
+      );
+    });
   return out;
 }
 
@@ -131,6 +185,28 @@ function walkThresholds(node: unknown, path: string, issues: string[]): void {
 }
 
 /**
+ * Every leaf under `node` must be a finite number or a boolean, at any depth.
+ *
+ * Recursive rather than one level deep, which is what it was: `signal.trend` nests two levels
+ * (`signal.trend.strike.minDelta`) and a flat walk rejected the whole trend block as
+ * "not a number" — a validation failure that would have looked like a server bug from an admin
+ * panel and had nothing to do with the value being sent.
+ */
+function walkScalars(node: Record<string, unknown>, path: string, issues: string[], depth = 0): void {
+  if (depth > 4) {
+    issues.push(`${path} is nested too deeply to be a config value`);
+    return;
+  }
+  for (const [k, v] of Object.entries(node)) {
+    const at = `${path}.${k}`;
+    if (isPlainObject(v)) walkScalars(v, at, issues, depth + 1);
+    else if (typeof v === 'boolean') continue;
+    else if (typeof v !== 'number' || !Number.isFinite(v))
+      issues.push(`${at} must be a finite number or a boolean`);
+  }
+}
+
+/**
  * Validate a PATCH — every field is optional, but any field present must be well-formed.
  *
  * Unknown top-level keys are rejected rather than ignored: a typo in an admin panel that
@@ -143,6 +219,7 @@ export function parseConfigPatch(body: unknown): DeepPartial<MomentumConfig> {
   const issues: string[] = [];
   const allowed = new Set([
     'weights', 'scoring', 'confidence', 'thresholds', 'universe', 'refresh', 'output', 'signal',
+    'ranking',
     // Accepted and ignored: an admin panel that GETs the config and PUTs it back should not
     // be rejected for echoing the fields the server owns.
     'version', 'updatedAt', 'updatedBy',
@@ -205,20 +282,18 @@ export function parseConfigPatch(body: unknown): DeepPartial<MomentumConfig> {
   }
 
   if ('signal' in body) {
-    const s = body.signal;
-    if (!isPlainObject(s)) issues.push('signal must be an object');
+    if (!isPlainObject(body.signal)) issues.push('signal must be an object');
+    else walkScalars(body.signal, 'signal', issues);
+  }
+
+  if ('ranking' in body) {
+    if (!isPlainObject(body.ranking)) issues.push('ranking must be an object');
     else {
-      for (const [k, v] of Object.entries(s)) {
-        if (isPlainObject(v)) {
-          for (const [k2, v2] of Object.entries(v)) {
-            if (typeof v2 !== 'number' || !Number.isFinite(v2))
-              issues.push(`signal.${k}.${k2} must be a finite number`);
-          }
-        } else if (typeof v !== 'number' && typeof v !== 'boolean') {
-          issues.push(`signal.${k} must be a number or a boolean`);
-        } else if (typeof v === 'number' && !Number.isFinite(v)) {
-          issues.push(`signal.${k} must be a finite number`);
-        }
+      walkScalars(body.ranking, 'ranking', issues);
+      const r = body.ranking;
+      if ('convictionWeight' in r) {
+        const n = Number(r.convictionWeight);
+        if (!Number.isFinite(n) || n < 0 || n > 1) issues.push('ranking.convictionWeight must be 0 ≤ w ≤ 1');
       }
     }
   }

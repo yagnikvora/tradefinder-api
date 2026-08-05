@@ -50,6 +50,22 @@ export interface StrikeInputs {
   targetPrice: number;
   /** From the futures contract — NSE lists the same lot for options on that underlying. */
   lotSize: number | null;
+  /**
+   * A delta band to prefer, when the hold has a known length.
+   *
+   * WHY A BAND AND NOT A FLOOR. The net-payoff ranking below is correct for an ignition trade
+   * — a fifteen-minute hold where leverage is the whole point and decay is a rounding error.
+   * It is wrong for a trend-day re-entry, which is a 30–90 minute hold taken three or four
+   * times a session: there the ranking walks out to the cheapest strike every time, and the
+   * position ends up paying four spreads on a contract whose delta stopped tracking the stock
+   * the plan was built on. A ceiling as well as a floor keeps the contract in the range where
+   * it both moves with the underlying and is worth the premium.
+   *
+   * Null (the default) leaves the original payoff-ranked behaviour untouched.
+   */
+  preferDelta?: { min: number; max: number } | null;
+  /** An override for the hourly-decay warning, for holds longer than a scalp. */
+  maxThetaPctPerHour?: number | null;
   config: MomentumConfig;
 }
 
@@ -102,11 +118,12 @@ function evaluate(
     warnings.push(`only ${leg.oi.toLocaleString('en-IN')} open interest — getting out may be slow`);
   if (leg.volume <= 0) warnings.push('nothing has traded in this strike today');
 
+  const thetaCeiling = i.maxThetaPctPerHour ?? t.maxThetaPctPerHour;
   const thetaPctPerHour =
     leg.ltp > 0 && Number.isFinite(leg.theta)
       ? round((Math.abs(leg.theta) / SESSION_HOURS / leg.ltp) * 100, 2)
       : null;
-  if (thetaPctPerHour !== null && thetaPctPerHour > t.maxThetaPctPerHour)
+  if (thetaPctPerHour !== null && thetaPctPerHour > thetaCeiling)
     warnings.push(`decay is ${thetaPctPerHour.toFixed(1)}% of the premium an hour — this is not a position to sit in`);
 
   const moneyness: StrikeChoice['moneyness'] =
@@ -177,8 +194,9 @@ export function selectStrike(i: StrikeInputs): StrikeChoice | null {
   }
   if (!candidates.length) return null;
 
+  const floor = Math.max(t.minDelta, i.preferDelta?.min ?? 0);
   const tradable = candidates.filter(
-    (c) => Math.abs(c.choice.delta) >= t.minDelta && c.choice.oi >= t.minOi && c.netGainPct > 0,
+    (c) => Math.abs(c.choice.delta) >= floor && c.choice.oi >= t.minOi && c.netGainPct > 0,
   );
 
   if (!tradable.length) {
@@ -197,18 +215,39 @@ export function selectStrike(i: StrikeInputs): StrikeChoice | null {
     };
   }
 
-  const best = tradable.reduce((a, b) => {
+  // The band, when one was asked for. Applied as a PREFERENCE rather than a filter: if no
+  // strike on this chain sits inside it the trade is still a trade, it just cannot be
+  // expressed in the ideal contract, and returning nothing would be a worse answer than
+  // returning the payoff-ranked pick with the band stated on it.
+  const band = i.preferDelta;
+  const inBand = band
+    ? tradable.filter((c) => Math.abs(c.choice.delta) >= band.min && Math.abs(c.choice.delta) <= band.max)
+    : [];
+  const pool = inBand.length ? inBand : tradable;
+
+  const best = pool.reduce((a, b) => {
     if (b.netGainPct !== a.netGainPct) return b.netGainPct > a.netGainPct ? b : a;
     // Same payoff, take the tighter book.
     return (b.choice.spreadPct ?? 99) < (a.choice.spreadPct ?? 99) ? b : a;
   });
 
-  const alternatives = tradable.filter((c) => c !== best).length;
+  const alternatives = pool.filter((c) => c !== best).length;
+  const banded = band && inBand.length > 0;
   return {
     ...best.choice,
+    warnings:
+      band && !inBand.length
+        ? [
+            ...best.choice.warnings,
+            `no strike on this chain sits in the ${band.min.toFixed(2)}–${band.max.toFixed(2)} delta band this hold wants — ` +
+            `picked on payoff instead, so watch the decay`,
+          ]
+        : best.choice.warnings,
     reason:
       `${best.choice.moneyness}${best.choice.stepsFromAtm !== 0 ? ` by ${Math.abs(best.choice.stepsFromAtm)} strike${Math.abs(best.choice.stepsFromAtm) > 1 ? 's' : ''}` : ''}` +
-      ` — best net payoff at the target of ${alternatives + 1} tradable strikes` +
+      (banded
+        ? ` — best net payoff of ${alternatives + 1} strikes inside the ${band!.min.toFixed(2)}–${band!.max.toFixed(2)} delta band a multi-hour hold wants`
+        : ` — best net payoff at the target of ${alternatives + 1} tradable strikes`) +
       ` (delta ${Math.abs(best.choice.delta).toFixed(2)}` +
       `${best.choice.spreadPct !== null ? `, ${best.choice.spreadPct.toFixed(1)}% spread` : ''})`,
   };

@@ -34,7 +34,9 @@ export interface MarketPulse {
 export interface SectorStock { Symbol: string; ltp: number; open: number; prevClose: number; pChange: number; rFactor: number; weight: number; }
 export type SectorScope = Record<string, SectorStock[]>;
 
-// ---- Index Mover ----
+// ---- Index point contribution ----
+// The /index-mover page is gone; this is not. Option Apex embeds a point-contribution panel
+// that reads the same endpoint, so the type, the service and the route all stay.
 export interface MoverStock { Symbol: string; per_change: number; per_to_index: number; point_to_index: number; }
 export interface IndexMover {
   index: string; level: number; points: number | null; pct: number | null;
@@ -53,12 +55,3 @@ export type RunningExpiry = [number, 'wk' | 'mo'];
 // One reading of the PCR trend: [epoch(s), PCR, total put OI, total call OI]
 export type PcrPoint = [number, number, number, number];
 
-// ---- Scanners (Swing / Insider) ----
-export interface ScanRow { Symbol: string; pChange: number; price: number; signal?: Signal; when: string; score?: number; }
-export type ScannerGroups = Record<string, ScanRow[]>;
-
-// ---- FII / DII ----
-export interface FiiDiiRow {
-  date: string; fiiBuy: number; fiiSell: number; fiiNet: number;
-  inMarket: number; diiNet: number; diiBuy: number; diiSell: number;
-}

@@ -5,9 +5,7 @@ import { avgDailyRanges } from './volume.js';
 import { SECTOR_BASKETS } from './sectors.js';
 import { remember, recall, ageLabel } from './snapshot.js';
 import * as mock from './mock.js';
-import type {
-  MarketPulse, SectorScope, IndexMover, ScannerGroups, FiiDiiRow, Source,
-} from './types.js';
+import type { MarketPulse, SectorScope, IndexMover, Source } from './types.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -273,16 +271,4 @@ export async function indexMover(index = 'NIFTY 50'): Promise<Result<IndexMover>
       data: { index, level, points, pct: idx.pChange, gainers: up, losers: down, stocks },
     };
   } catch (e) { return { source: 'mock', error: String((e as Error).message), data: mock.mockIndexMover(index) }; }
-}
-
-
-// These need a licensed tick/daily feed to compute for real — served as structured mock.
-export async function swing(): Promise<Result<ScannerGroups>> {
-  return { source: 'mock', data: mock.mockScanners(['10_day_breakout','50_day_breakout','channel_bo','nr7','reversal_radar','weekly_index']) };
-}
-export async function insider(): Promise<Result<ScannerGroups>> {
-  return { source: 'mock', data: mock.mockScanners(['contraction_bo','two_day_bo','lom_short_term','lom_long_term','reversal','spike_five','spike_ten','index_alpha','swing_weekly_reversal']) };
-}
-export async function fiiDii(): Promise<Result<FiiDiiRow[]>> {
-  return { source: 'mock', data: mock.mockFiiDii() };
 }

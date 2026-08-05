@@ -118,7 +118,73 @@ export function sanitise(cfg: MomentumConfig): MomentumConfig {
   cfg.universe.exclude = (cfg.universe.exclude ?? []).map((s) => String(s).toUpperCase());
 
   sanitiseTiming(cfg);
+  sanitiseConviction(cfg);
   return cfg;
+}
+
+/**
+ * The conviction layer's repair pass.
+ *
+ * The phase thresholds are ORDERED, not merely bounded, and the ordering is what makes the
+ * machine hysteretic. `fadeScore` above `formingScore` would let a stock be promoted and
+ * demoted by the same reading; `confirmScore` below `formingScore` would make Confirmed
+ * easier to reach than Forming, and every trend day would skip the probationary state that
+ * exists to filter opening drives out. Both are silent failures — the board still renders,
+ * it just flickers — so they are enforced here rather than trusted to an admin form.
+ */
+function sanitiseConviction(cfg: MomentumConfig): void {
+  const c = cfg.thresholds.conviction;
+  c.vwapSideBufferAtr = clampNumber(c.vwapSideBufferAtr, 0, 1, 0.05);
+  c.spineIntervalMin = clampNumber(c.spineIntervalMin, 1, 60, 5);
+
+  const mixTotal = Object.values(c.mix).reduce((a, v) => a + (Number.isFinite(v) ? v : 0), 0);
+  if (!(mixTotal > 0))
+    c.mix = {
+      displacement: 0.18, adherence: 0.17, crossings: 0.14, efficiency: 0.14,
+      rangePosition: 0.11, pullback: 0.11, slope: 0.08, structure: 0.07,
+    };
+
+  const p = c.phase;
+  p.minMinutesForming = clampNumber(p.minMinutesForming, 5, 375, 30);
+  p.minMinutesConfirmed = clampNumber(p.minMinutesConfirmed, p.minMinutesForming, 375, 75);
+  p.formingScore = clampNumber(p.formingScore, 1, 99, 55);
+  // Confirmation must be at least as hard as forming, or the probationary state is skipped.
+  p.confirmScore = clampNumber(p.confirmScore, p.formingScore, 100, 70);
+  // And the fade line must sit below the forming line, or a row is promoted and demoted by
+  // the same conviction reading and the phase oscillates every cycle.
+  p.fadeScore = clampNumber(p.fadeScore, 0, p.formingScore - 1, 50);
+  p.confirmHoldMin = clampNumber(p.confirmHoldMin, 0, 375, 20);
+  p.fadeHoldMin = clampNumber(p.fadeHoldMin, 0, 375, 10);
+  p.recoverMargin = clampNumber(p.recoverMargin, 0, 50, 8);
+  p.minObservedMin = clampNumber(p.minObservedMin, 0, 375, 25);
+  // Floored above zero deliberately. Setting it to zero restores the failure this gate exists
+  // for — a board of flat stocks classified as confirmed trend days on shape alone — and that
+  // is not a configuration anyone wants, it is the bug.
+  p.minDisplacementAtr = clampNumber(p.minDisplacementAtr, 0.05, 5, 0.5);
+
+  const t = cfg.signal.trend;
+  // Never below 1: a multiplier under one would make a confirmed trend day HARDER to enter
+  // than an ordinary session, which inverts the entire point of the layer.
+  t.budgetMultiplier.forming = clampNumber(t.budgetMultiplier.forming, 1, 10, 1.6);
+  t.budgetMultiplier.confirmed = clampNumber(t.budgetMultiplier.confirmed, t.budgetMultiplier.forming, 10, 2.6);
+  t.minPulseScore.forming = clampNumber(t.minPulseScore.forming, 0, 100, 45);
+  t.minPulseScore.confirmed = clampNumber(t.minPulseScore.confirmed, 0, 100, 32);
+  t.minBurstRvol = clampNumber(t.minBurstRvol, 0, 50, 0.9);
+  t.minMinutesLeft = clampNumber(t.minMinutesLeft, 0, 375, 40);
+  t.maxMinutesSinceExtreme = clampNumber(t.maxMinutesSinceExtreme, 1, 375, 45);
+  t.pullbackAtr.min = clampNumber(t.pullbackAtr.min, 0, 5, 0.15);
+  t.pullbackAtr.max = clampNumber(t.pullbackAtr.max, t.pullbackAtr.min, 5, 0.55);
+  t.vwapTouchAtr = clampNumber(t.vwapTouchAtr, 0, 5, 0.25);
+  t.reentryCooldownMin = clampNumber(t.reentryCooldownMin, 1, 375, 25);
+  t.targetAtr = clampNumber(t.targetAtr, 0.05, 5, 0.55);
+  t.stopAtr = clampNumber(t.stopAtr, 0.02, 5, 0.32);
+  t.strike.minDelta = clampNumber(t.strike.minDelta, 0.05, 0.95, 0.3);
+  t.strike.maxDelta = clampNumber(t.strike.maxDelta, t.strike.minDelta, 1, 0.5);
+  t.strike.maxThetaPctPerHour = clampNumber(t.strike.maxThetaPctPerHour, 0.1, 100, 4);
+
+  const r = cfg.ranking;
+  r.smoothingHalfLifeMin = clampNumber(r.smoothingHalfLifeMin, 0, 120, 3);
+  r.convictionWeight = clampNumber(r.convictionWeight, 0, 1, 0.25);
 }
 
 /**

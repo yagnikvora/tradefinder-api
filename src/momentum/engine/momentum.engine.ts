@@ -47,7 +47,7 @@ import { quoteSnapshot, type MomentumQuote, type QuoteSnapshot } from '../data/q
 import { stockChain, type StockChain } from '../data/option-chain.js';
 import { inBatches } from '../data/candles.js';
 import {
-  flushSessionState, observe, observeEnrichment, sessionState,
+  flushSessionState, holdDirection, observe, observeEnrichment, sessionState, smoothScore,
   type SessionState, type SymbolSessionState,
 } from '../data/session-state.js';
 import { historyRepository } from '../data/history.repository.js';
@@ -64,6 +64,10 @@ import { computeOptionFlow, optionFlowFactor, type OptionFlowReading } from '../
 import { computeGreeks, greeksFactor, type GreeksReading } from '../services/greeks.service.js';
 import { computeIv, ivFactor, type IvReading } from '../services/iv.service.js';
 import { computePulse, pulseFactor, type PulseReading } from '../services/pulse.service.js';
+import {
+  computeConviction, convictionFactor, convictionSummary,
+} from '../services/conviction.service.js';
+import type { ConvictionReading } from '../types.js';
 import { buildSignal, gateTradeType } from './signal.service.js';
 import { institutionalActivity, scoreRow } from './score.service.js';
 import { cache } from '../cache.js';
@@ -94,6 +98,9 @@ interface StageOne {
   optionFlow: OptionFlowReading;
   provisionalScore: number;
   pulse: PulseReading;
+  /** The session-shape read. Computed once in stage 1 and reused, because the phase machine
+   *  it advances is stateful — computing it twice a cycle would age every trend day twice. */
+  conviction: ConvictionReading;
   /**
    * The timing read, built before enrichment so it can decide who GETS enriched.
    *
@@ -162,9 +169,16 @@ function stageOne(
   // available on every stock in the universe rather than on the enrichment shortlist —
   // which is the point, since the stock about to move is not yet a highly-ranked one.
   const pulseReading = computePulse(quote, symState, baseline, cfg, nowMs);
+  // The session-shape read, from the same accumulators the quote poll has been filling. Like
+  // the pulse it costs no upstream call, which is what makes it affordable on the whole
+  // universe — and being universe-wide matters more here than anywhere else in the module,
+  // because a stock that has quietly walked one direction since 09:30 is by construction NOT
+  // near the top of a momentum ranking and would never survive a shortlist to be measured.
+  const convictionReading = computeConviction(quote, symState, baseline, cfg, nowMs);
 
   const factors: FactorOutcome[] = [
     pulseFactor(pulseReading, cfg),
+    convictionFactor(convictionReading, cfg),
     rvolFactor(rvolReading, cfg),
     liquidityFactor(liquidityReading, cfg),
     relativeStrengthFactor(relStrength, cfg),
@@ -193,6 +207,7 @@ function stageOne(
     chain: null,
     lotSize: member.future?.lotSize ?? null,
     direction: provisional.direction,
+    conviction: convictionReading,
     liquidityScore: liquidityReading.score,
     config: cfg,
     nowMs,
@@ -210,6 +225,7 @@ function stageOne(
     optionFlow,
     provisionalScore: provisional.score,
     pulse: pulseReading,
+    conviction: convictionReading,
     signal,
     metricsCarry: {
       vwap: vwapReading,
@@ -377,11 +393,25 @@ function buildRow(
         chain,
         lotSize: s.member.future?.lotSize ?? null,
         direction: result.direction,
+        conviction: s.conviction,
         liquidityScore,
         config: cfg,
         nowMs,
       })
     : null;
+
+  // The ordering key. Smoothed, because the board was previously sorted on a number recomputed
+  // every fifteen seconds with a 16-weight three-minute factor inside it — so a row moved
+  // dozens of places on one wobble and the list could not be read, let alone acted on. A
+  // fraction of conviction is blended in so a stock that has been walking one direction for
+  // four hours does not sit below one that spiked ninety seconds ago.
+  const smoothed = s.symState
+    ? smoothScore(s.symState, result.score, cfg.ranking.smoothingHalfLifeMin, nowMs)
+    : result.score;
+  const convictionPull = s.conviction.ready ? s.conviction.score : smoothed;
+  const rankScore =
+    smoothed * (1 - cfg.ranking.convictionWeight) + convictionPull * cfg.ranking.convictionWeight;
+  const heldMin = s.symState ? holdDirection(s.symState, result.direction, nowMs) : null;
 
   const activity = institutionalActivity(
     {
@@ -416,6 +446,12 @@ function buildRow(
     tradeType: gateTradeType(result.tradeType, signal, cfg),
     institutionalActivity: activity.level,
     signal,
+    conviction: cfg.thresholds.conviction.enabled ? convictionSummary(s.conviction) : null,
+    stability: {
+      rankScore: +rankScore.toFixed(2),
+      drift: +(result.score - smoothed).toFixed(2),
+      heldMin,
+    },
 
     liquidity: { score: liquidityScore, grade: carry.liquidity.grade },
     rvol: { value: s.rvol, grade: carry.rvolReading.grade },
@@ -500,10 +536,19 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   // would end a leg on every wobble in a heavy name and never end one in a volatile midcap.
   const openingMinutes = cfg.thresholds.trendStructure.openingRangeMinutes;
   const p = cfg.thresholds.pulse;
+  const conv = cfg.thresholds.conviction;
   for (const q of snap.equity.values()) {
     const atr = baseline?.symbols[q.symbol]?.atr ?? 0;
     const reversal = atr > 0 ? atr * p.legReversalAtr : q.ltp * (p.legReversalPctFloor / 100);
-    observe(state, q, openingMinutes, nowMs, reversal);
+    // ATR goes in so the session-shape accumulators can scale their VWAP-side buffer per
+    // symbol: what counts as "on a side of VWAP" has to be a fraction of that stock's own
+    // range, or a ₹39,000 stock registers a crossing on every rounding tick and the single
+    // best one-sidedness reading in the model becomes noise.
+    observe(state, q, openingMinutes, nowMs, reversal, {
+      atr,
+      vwapSideBufferAtr: conv.vwapSideBufferAtr,
+      spineIntervalMin: conv.spineIntervalMin,
+    });
   }
 
   const breadth = computeBreadth(snap);
@@ -530,10 +575,14 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
     ivReadings.set(s.member.symbol, computeIv(e?.chain ?? null, s.baseline, history, cfg));
   }
 
+  // Sorted on the SMOOTHED key, not the raw score. `score` is still the number the row
+  // reports and the number every threshold is measured against — this changes only the order
+  // rows are presented in, which is the difference between a board that can be read and one
+  // that reshuffles under the cursor.
   const rows = staged
     .map((s) => buildRow(s, enrichments.get(s.member.symbol), ivReadings.get(s.member.symbol) ?? null, breadth, cfg, nowMs))
     .filter((r) => r.coverage >= cfg.scoring.minCoverage)
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.stability.rankScore - a.stability.rankScore || b.score - a.score);
 
   rows.forEach((r, i) => { r.rank = i + 1; });
 
@@ -569,6 +618,9 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
     shortlisted: shortlist.length,
     igniting: rows.filter((r) => r.signal?.state === 'Igniting').length,
     entrable: rows.filter((r) => r.signal?.action === 'Buy Call' || r.signal?.action === 'Buy Put').length,
+    trendConfirmed: rows.filter((r) => r.conviction?.phase === 'Confirmed').length,
+    trendForming: rows.filter((r) => r.conviction?.phase === 'Forming').length,
+    trendFaded: rows.filter((r) => r.conviction?.phase === 'Faded').length,
     market: marketContext(snap, breadth, open, sessionFraction(nowMs), minuteOfSession(nowMs)),
     rows,
     warnings,

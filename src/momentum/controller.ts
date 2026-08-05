@@ -144,9 +144,18 @@ export function momentumRouter(): express.Router {
       const { board, source, note } = await currentBoard();
 
       // Default to what is actionable; `?state=` or `?action=` overrides for a wider look.
+      // `Trending` belongs in that default: a confirmed one-sided day waiting for its next dip
+      // is the most actionable row this module produces, and leaving it out was how the whole
+      // class of stock this scanner was rebuilt to find stayed invisible on the entry feed.
       const base = q.state || q.action
         ? board.rows
-        : board.rows.filter((r) => r.signal && (r.signal.state === 'Igniting' || r.signal.state === 'Extending'));
+        : board.rows.filter(
+            (r) =>
+              r.signal &&
+              (r.signal.state === 'Igniting' ||
+                r.signal.state === 'Trending' ||
+                r.signal.state === 'Extending'),
+          );
 
       let rows = applySignalFilters(base, q, cfg);
       if (q.direction) rows = rows.filter((r) => r.direction === q.direction);
@@ -166,6 +175,77 @@ export function momentumRouter(): express.Router {
           maxTriggerAgeMin: cfg.signal.maxTriggerAgeMin,
           targetOptionMovePct: cfg.signal.targetOptionMovePct,
           rows: rows.slice(0, q.limit).map(slim),
+          warnings: board.warnings,
+        },
+        source,
+        note,
+      );
+    } catch (e) {
+      if (isValidationError(e)) return fail(res, 400, e.message, { issues: e.issues });
+      fail(res, 502, String((e as Error).message));
+    }
+  });
+
+  // ---------------------------------------------------------- GET /momentum/trend ----
+  //
+  // The one-sided-day feed. A third endpoint rather than a query parameter, for the same
+  // reason `/signals` is one: it answers a different question at a different cadence.
+  //
+  //   /            "what is strong today"          browsed, ranked by smoothed score
+  //   /signals     "what can I take right now"     polled, ranked by entry quality
+  //   /trend       "what is going one way all day" left open, ranked by conviction
+  //
+  // The third list is the stable one BY CONSTRUCTION, and that is the point of it. Its
+  // ordering key is a measurement over hours behind a phase machine with hysteresis, so rows
+  // do not move between polls — which is what makes it something you can leave on a second
+  // monitor, and what the score-ranked board could never be.
+  //
+  // Faded days are carried separately rather than filtered away. A trend day that has stopped
+  // being one is not a non-event: somebody is holding it on a thesis that just expired, and
+  // that is the single most useful thing this endpoint can say.
+  router.get('/trend', async (req: Request, res: Response) => {
+    if (!tokenSet())
+      return fail(res, 503, 'UPSTOX_ACCESS_TOKEN is not set — put your Upstox Analytics Token in api/.env');
+
+    try {
+      const cfg = await configRepository.get();
+      const q = parseBoardQuery(req.query as Record<string, unknown>, cfg);
+      const { board, source, note } = await currentBoard();
+
+      if (!cfg.thresholds.conviction.enabled)
+        return fail(res, 409, 'the conviction layer is switched off — set thresholds.conviction.enabled to true');
+
+      // Sorted by conviction unless the caller asked otherwise, and filtered to real trend
+      // days unless a specific phase was requested.
+      const wanted = { ...q, sort: q.sort === 'rank' ? ('conviction' as const) : q.sort };
+      const base = q.phase ? board.rows : board.rows.filter((r) => r.conviction?.phase !== 'None');
+      let rows = applySignalFilters(base, wanted, cfg);
+      if (q.direction) rows = rows.filter((r) => r.direction === q.direction);
+      if (q.sector) rows = rows.filter((r) => (r.sector ?? '').toUpperCase() === q.sector);
+
+      const faded = board.rows
+        .filter((r) => r.conviction?.phase === 'Faded')
+        .sort((a, b) => (b.conviction?.peak ?? 0) - (a.conviction?.peak ?? 0));
+
+      send(
+        res,
+        {
+          asOf: board.asOf,
+          configVersion: board.configVersion,
+          market: board.market,
+          trendConfirmed: board.trendConfirmed,
+          trendForming: board.trendForming,
+          trendFaded: board.trendFaded,
+          matched: rows.length,
+          returned: Math.min(rows.length, q.limit),
+          phase: {
+            confirmedFrom: cfg.thresholds.conviction.phase.minMinutesConfirmed,
+            formingFrom: cfg.thresholds.conviction.phase.minMinutesForming,
+          },
+          rows: rows.slice(0, q.limit).map((r) => (q.includeFactors ? r : slim(r))),
+          // Not part of `rows`, so a client rendering the list cannot accidentally present a
+          // faded day as a candidate.
+          fading: faded.slice(0, 10).map(slim),
           warnings: board.warnings,
         },
         source,

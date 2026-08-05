@@ -31,6 +31,49 @@
 //                          direction alone is wrong long before the score notices. When the
 //                          micro direction opposes the day's, the state is `Reversing`.
 //
+// THE ANSWER THOSE THREE QUESTIONS GET WRONG, AND WHAT FIXES IT
+//
+// All three are calibrated for a MEAN-REVERTING session, and on a one-sided day every one of
+// them fails in the same direction:
+//
+//   "Is there room left?"   measures the day against one ATR. A genuine trend day expands its
+//                           true range to 1.5–2.5 ATR, so `atrUsed` passes 0.8 by mid-morning,
+//                           the state locks to `Extended`, `roomAtr` returns zero, `buildPlan`
+//                           refuses to produce a plan, and the stock cannot be entered again
+//                           for the rest of the session. The harder a stock trends, the sooner
+//                           it is disqualified.
+//
+//   "Has it just started?"  requires a pulse of 55 before ANY trigger may fire. A steady grind
+//                           has burst RVOL near 1.0 and velocity near zero — that is what makes
+//                           it a grind — and scores around 35. So on precisely the stocks worth
+//                           holding all day, this module is not wrong, it is silent.
+//
+//   "Still going the       reads every healthy pullback as a reversal, because a retracement
+//    same way?"            inside a live trend is, by construction, a few minutes going the
+//                          other way.
+//
+// `conviction.service.ts` measures the session's SHAPE and this module now takes it as an
+// input. When a day is Forming the extension ceilings are widened; when it is CONFIRMED the
+// range and leg ceilings are withdrawn altogether. That escalation is not squeamishness about
+// a big number — it is what the data forced. Widening alone was the first attempt and it does
+// not survive real trend days: on 2026-08-05 BOSCHLTD ran 2.65 ATR of intraday range and NHPC
+// 2.90, and the leg ceiling binds sooner still, because on a one-sided day the leg IS the day.
+// No multiplier anyone would ship as a default rescues those, and chasing one would be fitting
+// a constant to a premise that is wrong: range mean-reverts on an ordinary session, which is
+// what the ceiling was built for, and on a trend day it does not.
+//
+// What replaces it is not nothing. Distance from VWAP still gates at every phase — "is this
+// entry a chase" stays answerable however far the day has come — plus the trend-intact test,
+// and `trend.minMinutesLeft`, because the real limit on a continuation trade is how long is
+// left to hold it rather than how far the day has already come.
+//
+// Alongside that, the pulse floor drops to something a grind can clear, a pullback inside the
+// healthy band is no longer called a reversal, and a new trigger, `trendPullback`, fires on
+// each retracement that turns back with the trend. That last one is deliberately the only
+// repeating trigger here: on a trend day the ignition was at 09:40 and is gone, and the
+// tradable events for the remaining five hours are the dips. A model that fires once on these
+// stocks describes them; one that fires on each pullback trades them.
+//
 // AND THEN THE ARITHMETIC NOBODY ELSE DOES. `plan` converts the price target into an
 // estimated OPTION move using the delta, gamma and premium actually quoted on the chain, and
 // reports how far the stock must travel for the option to gain `signal.targetOptionMovePct`.
@@ -41,20 +84,22 @@
 // measurement.
 
 import type {
-  Direction, Extension, FactorReason, MomentumConfig, MomentumSignal, PulseSummary,
-  SignalAction, SignalPlan, SignalState, SignalTrigger, StrikeChoice, TradeType, TriggerKind,
+  ConvictionReading, Direction, Extension, FactorReason, MomentumConfig, MomentumSignal,
+  PulseSummary, SignalAction, SignalPlan, SignalState, SignalTrigger, StrikeChoice, TradeType,
+  TriggerKind,
 } from '../types.js';
 import type { SymbolBaseline } from '../data/baseline.js';
 import type { MomentumQuote } from '../data/quotes.js';
 import type { StockChain } from '../data/option-chain.js';
 import { selectStrike } from '../services/strike.service.js';
 import {
-  lastTrigger, readingAt, recordTrigger,
+  lastTrigger, readingAt, recordTrigger, triggerCount,
   type FiredTrigger, type SymbolSessionState,
 } from '../data/session-state.js';
 import type { PulseReading } from '../services/pulse.service.js';
 import type { GreeksReading } from '../services/greeks.service.js';
 import type { OpeningRange } from '../data/session-state.js';
+import { minuteOfSession, SESSION_MINUTES } from '../session.js';
 import { clamp, fmtPct } from '../services/scoring.js';
 
 const round = (v: number, d = 2): number => +v.toFixed(d);
@@ -68,6 +113,7 @@ export const TRIGGER_LABEL: Record<TriggerKind, string> = {
   dayExtreme: 'New session extreme',
   priorRange: 'Prior-range break',
   thrust: 'Volume thrust',
+  trendPullback: 'Trend-day pullback',
 };
 
 export interface SignalInputs {
@@ -85,9 +131,140 @@ export interface SignalInputs {
   lotSize?: number | null;
   /** The day's direction, from the full factor vote. */
   direction: Direction;
+  /**
+   * The session-shape read. Null when the conviction layer is off — every trend-day
+   * behaviour below then reduces to exactly the original gates, so this is a pure extension
+   * rather than a change of the existing path.
+   */
+  conviction?: ConvictionReading | null;
   liquidityScore: number | null;
   config: MomentumConfig;
   nowMs: number;
+}
+
+/**
+ * What the trend layer thinks, resolved once and passed around.
+ *
+ * Assembling this in one place matters more than it looks: the multiplier, the pulse floor and
+ * the pullback band all have to agree about WHICH phase the stock is in, and computing each
+ * one where it is used is how a row ends up entered on a confirmed-day budget against a
+ * forming-day pulse floor.
+ */
+interface TrendContext {
+  /** True when the day is Forming or Confirmed and the conviction layer is enabled. */
+  active: boolean;
+  confirmed: boolean;
+  direction: 1 | -1 | null;
+  /** What the extension ceilings are multiplied by. 1 when no trend is active. */
+  budgetMultiplier: number;
+  /** The pulse floor to apply — relaxed on a trend day, ordinary otherwise. */
+  pulseFloor: number;
+  burstFloor: number;
+  /**
+   * True once cumulative range and leg length stop being gated on at all — see
+   * `signal.trend.retireRangeCeilings`. Only reached on a CONFIRMED day that is STILL MAKING
+   * PROGRESS: the relaxed budget is earned continuously rather than granted once, so a trend
+   * day that stops extending immediately reverts to ordinary extension rules and is marked
+   * spent, which on a stock that has travelled 2.6 ATR it comprehensively is.
+   */
+  rangeCeilingsRetired: boolean;
+  /** The day was one-sided and has stopped making new extremes. */
+  stale: boolean;
+}
+
+function trendContext(i: SignalInputs): TrendContext {
+  const s = i.config.signal;
+  const t = s.trend;
+  const c = i.conviction;
+
+  const active =
+    t.enabled && !!c?.ready && (c.phase === 'Forming' || c.phase === 'Confirmed') && c.direction !== 'Neutral';
+
+  if (!active || !c)
+    return {
+      active: false, confirmed: false, direction: null, budgetMultiplier: 1,
+      pulseFloor: s.minPulseScore, burstFloor: s.minBurstRvol,
+      rangeCeilingsRetired: false, stale: false,
+    };
+
+  const confirmed = c.phase === 'Confirmed';
+  const stale = trendStale(i);
+  return {
+    active: true,
+    confirmed,
+    direction: c.direction === 'Bullish' ? 1 : -1,
+    // A stale day keeps its phase — it IS still one-sided — but loses the concessions. The
+    // phase is a description and the concessions are a bet on continuation, and only one of
+    // those survives a stock that stopped going anywhere ninety minutes ago.
+    budgetMultiplier: stale ? 1 : confirmed ? t.budgetMultiplier.confirmed : t.budgetMultiplier.forming,
+    pulseFloor: stale ? s.minPulseScore : confirmed ? t.minPulseScore.confirmed : t.minPulseScore.forming,
+    burstFloor: stale ? s.minBurstRvol : t.minBurstRvol,
+    rangeCeilingsRetired: confirmed && t.retireRangeCeilings && !stale,
+    stale,
+  };
+}
+
+/**
+ * Has the one-sided day stopped making new extremes?
+ *
+ * The gate that `Trending` would otherwise swallow. A confirmed trend day outranks `Stalling`
+ * in the state machine, and it should — a trend day pausing is not a trend day ending. What it
+ * must not do is keep offering dips to buy in something that has not made a new high in two
+ * hours, because every reading this layer has stays excellent through exactly that: BOSCHLTD
+ * on 2026-08-05 topped at 11:00 and then held 100% VWAP adherence and zero crossings until the
+ * close while quietly distributing, and each re-entry taken after noon bought a lower high.
+ */
+function trendStale(i: SignalInputs): boolean {
+  const since = i.conviction?.minutesSinceExtreme;
+  if (since === null || since === undefined) return false;
+  return since > i.config.signal.trend.maxMinutesSinceExtreme;
+}
+
+/**
+ * How far price has come back off the day's extreme, in ATR, and whether it is turning back.
+ *
+ * Measured from `quote.high`/`quote.low` — the session's own extremes — rather than from the
+ * zigzag leg. A trend-day dip worth entering is usually deep enough to flip the zigzag, at
+ * which point `pulse.pullback` starts measuring the retracement's own leg and reads near zero
+ * exactly when the pullback is most complete. Distance from the day's high has no such
+ * discontinuity, and it is the number a trader is actually looking at.
+ */
+interface PullbackRead {
+  offExtremeAtr: number | null;
+  /** The same distance one fast window ago. Shrinking means price is coming back. */
+  wasOffExtremeAtr: number | null;
+  /** |price − VWAP| in ATR. */
+  vwapDistAtr: number | null;
+  /** False once price has broken through VWAP against the trend by more than the tolerance. */
+  vwapSideIntact: boolean;
+}
+
+function readPullback(i: SignalInputs, dir: 1 | -1): PullbackRead {
+  const { quote, pulse, config } = i;
+  const atr = pulse.atr;
+  const t = config.signal.trend;
+  const then = readingAt(i.symState, config.thresholds.pulse.fastWindowMin * 60_000, i.nowMs);
+
+  if (!atr || atr <= 0)
+    return { offExtremeAtr: null, wasOffExtremeAtr: null, vwapDistAtr: null, vwapSideIntact: true };
+
+  const extreme = dir === 1 ? quote.high : quote.low;
+  const off = dir === 1 ? extreme - quote.ltp : quote.ltp - extreme;
+  const wasOff = then ? (dir === 1 ? extreme - then.ltp : then.ltp - extreme) : null;
+
+  const vwapDistAtr = quote.vwap > 0 ? Math.abs(quote.ltp - quote.vwap) / atr : null;
+  // A dip THROUGH VWAP is tolerated up to the same distance a touch is measured over — a
+  // trend-day pullback often wicks the other side before it turns. Beyond that the day has
+  // stopped being one-sided and this is no longer a pullback, whatever its depth says.
+  const vwapSideIntact =
+    quote.vwap <= 0 || (quote.ltp - quote.vwap) * dir >= -atr * t.vwapTouchAtr;
+
+  return {
+    offExtremeAtr: round(Math.max(0, off) / atr, 3),
+    wasOffExtremeAtr: wasOff === null ? null : round(Math.max(0, wasOff) / atr, 3),
+    vwapDistAtr: vwapDistAtr === null ? null : round(vwapDistAtr, 3),
+    vwapSideIntact,
+  };
 }
 
 /* ------------------------------------------------------------------- the triggers --- */
@@ -105,13 +282,38 @@ interface Candidate {
  * Testing the condition alone ("price is above the opening range") would re-fire on every
  * cycle for the rest of the session and make the age meaningless.
  */
-function detectTrigger(i: SignalInputs, dir: 1 | -1): Candidate | null {
+function detectTrigger(i: SignalInputs, dir: 1 | -1, trend: TrendContext): Candidate | null {
   const { quote, pulse, baseline, openingRange, symState, config, nowMs } = i;
   const then = readingAt(symState, config.thresholds.pulse.fastWindowMin * 60_000, nowMs);
   if (!then) return null;
 
   const price = quote.ltp;
   const up = dir === 1;
+
+  // 0. THE TREND-DAY RE-ENTRY, tested first because on a one-sided day it is the only trigger
+  //    that describes a trade still available. Everything below fires on a level being taken
+  //    out for the first time, and on a stock that has been walking one direction since 09:40
+  //    those all fired hours ago.
+  //
+  //    Three conditions, and the third is what makes it a trigger rather than a description:
+  //    price has come back off the day's extreme into the healthy band (or reached VWAP), it
+  //    has NOT broken the trend's side of VWAP, and it is now closer to the extreme than it
+  //    was one fast window ago — that is, the dip has finished dipping.
+  if (trend.active && trend.direction === dir && !trend.stale) {
+    const t = config.signal.trend;
+    const pb = readPullback(i, dir);
+
+    if (pb.offExtremeAtr !== null && pb.wasOffExtremeAtr !== null && pb.vwapSideIntact) {
+      const inBand = pb.offExtremeAtr >= t.pullbackAtr.min && pb.offExtremeAtr <= t.pullbackAtr.max;
+      const atVwap = pb.vwapDistAtr !== null && pb.vwapDistAtr <= t.vwapTouchAtr;
+      // Turning back, by enough to be a turn rather than a tick. The same buffer the base
+      // break uses, so "it moved" means the same thing in both places.
+      const buffer = config.thresholds.pulse.breakBufferAtr;
+      const resuming = pb.wasOffExtremeAtr - pb.offExtremeAtr >= buffer;
+
+      if ((inBand || atVwap) && resuming) return { kind: 'trendPullback', direction: dir, price };
+    }
+  }
 
   // 1. A compressed base being left. The earliest honest trigger: by definition the move is
   //    only as old as the break, because until now price was inside the range.
@@ -176,31 +378,92 @@ function detectTrigger(i: SignalInputs, dir: 1 | -1): Candidate | null {
 
 /* --------------------------------------------------------------------- the states --- */
 
-function extensionOf(pulse: PulseReading, cfg: MomentumConfig): Extension {
+/**
+ * How spent the day is — against a budget that depends on what KIND of day it is.
+ *
+ * The multiplier is the single most consequential number in this module. `atrUsedMax` of 0.8
+ * is right for an ordinary session: past it a mean-reverting day needs an abnormal afternoon
+ * to pay another leg, and buying that is a bet on the tail. It is badly wrong for a confirmed
+ * one-sided day, which routinely runs 1.5–2.5 ATR — there the same ceiling marks the stock
+ * spent by mid-morning and refuses every entry for the remaining four hours, so the stocks
+ * that trended hardest were the ones this layer disqualified soonest.
+ *
+ * Scaling the ceiling rather than removing it keeps the protection that made the ceiling worth
+ * having: a confirmed trend day that has genuinely run 2.6 ATR still reads `Extended`.
+ */
+function extensionOf(pulse: PulseReading, cfg: MomentumConfig, trend: TrendContext): Extension {
   const e = cfg.signal.extension;
-  const atrUsed = pulse.atrUsed;
+  const multiplier = trend.budgetMultiplier;
+  // Intraday range, not true range. A gap is movement nobody could have traded, and charging
+  // it against the budget marked every gapper spent before the session opened — NHPC on
+  // 2026-08-05 read 1.13 ATR used at 09:15 and was refused for the whole of a day it then
+  // trended one direction through. Falls back to true range only when there is no intraday
+  // reading at all, which is a warming-up state rather than a normal one.
+  const atrUsed = pulse.intradayAtrUsed ?? pulse.atrUsed;
   const vwapAtr = pulse.vwapAtr === null ? null : Math.abs(pulse.vwapAtr);
   const legMoveAtr = pulse.legMoveAtr;
 
-  const extended =
-    (atrUsed !== null && atrUsed >= e.atrUsedMax) ||
-    (vwapAtr !== null && vwapAtr >= e.vwapAtrMax) ||
-    (legMoveAtr !== null && legMoveAtr >= e.legMoveAtrMax);
+  const atrUsedMax = e.atrUsedMax * multiplier;
+  const vwapAtrMax = e.vwapAtrMax * multiplier;
+  const legMoveAtrMax = e.legMoveAtrMax * multiplier;
 
-  return { atrUsed, vwapAtr, legMoveAtr, extended };
+  // On a confirmed one-sided day the range and leg ceilings are not merely widened, they are
+  // withdrawn: a wide range and a long leg are what a trend day IS, so testing against them
+  // asks whether the setup is present and then rejects it for being present. Distance from
+  // VWAP still applies at every phase, because "is this entry a chase" stays a real question
+  // however far the day has come — and on a trend day the pullback requirement is what keeps
+  // the answer no.
+  const gateRange = !trend.rangeCeilingsRetired;
+
+  const extended =
+    (gateRange && atrUsed !== null && atrUsed >= atrUsedMax) ||
+    (vwapAtr !== null && vwapAtr >= vwapAtrMax) ||
+    (gateRange && legMoveAtr !== null && legMoveAtr >= legMoveAtrMax);
+
+  return {
+    atrUsed,
+    trueRangeAtrUsed: pulse.atrUsed,
+    gapAtr: pulse.gapAtr,
+    vwapAtr,
+    legMoveAtr,
+    budgetMultiplier: round(multiplier, 2),
+    // Infinity would serialise to null through JSON and read as "unknown" rather than
+    // "withdrawn", so a retired ceiling is reported as 0 and `budgetMultiplier` plus the
+    // state's own sentence carry the meaning.
+    atrUsedMax: gateRange ? round(atrUsedMax, 3) : 0,
+    extended,
+  };
 }
 
 /**
  * Remaining room, in ATR.
  *
- * The day's true range grows roughly one-for-one with a continued move in the same
- * direction, so what is left before the extension ceiling is `atrUsedMax − atrUsed`. When
- * there is no ATR baseline there is no budget to measure and this returns null rather than
- * assuming the room is there.
+ * ORDINARILY this is the day's range budget: intraday range grows roughly one-for-one with a
+ * continued move in the same direction, so what is left before the ceiling is
+ * `atrUsedMax − atrUsed`.
+ *
+ * ON A CONFIRMED TREND DAY there is no such budget, and this returns null — "not measurable"
+ * rather than a number, which is the same convention the rest of this module uses for a
+ * reading it cannot honestly produce.
+ *
+ * VWAP headroom was tried here first and is wrong for the same reason the range ceiling was
+ * wrong, one level up: on a sustained trend VWAP lags a long way behind price and STAYS
+ * behind, so "distance from VWAP" saturates and becomes another permanent bar. NHPC on
+ * 2026-08-05 sat 3.4 ATR below its VWAP for most of the afternoon while continuing to fall.
+ *
+ * The question VWAP distance was standing in for — "is this entry a chase" — is already
+ * answered, and answered better, by the pullback band: a trend entry may only be taken
+ * 0.15–0.55 ATR back off the day's extreme, which is a direct measurement of not chasing.
+ * Adding a second, weaker proxy for the same thing only produced a gate that fired on the
+ * strongest trends. What still limits the trade is stated elsewhere and is not a distance:
+ * the trend-intact test, `maxMinutesSinceExtreme`, and `minMinutesLeft`.
  */
-function roomAtr(pulse: PulseReading, cfg: MomentumConfig): number | null {
-  if (pulse.atrUsed === null) return null;
-  return round(Math.max(0, cfg.signal.extension.atrUsedMax - pulse.atrUsed), 3);
+function roomAtr(pulse: PulseReading, cfg: MomentumConfig, trend: TrendContext): number | null {
+  if (trend.rangeCeilingsRetired) return null;
+
+  const used = pulse.intradayAtrUsed ?? pulse.atrUsed;
+  if (used === null) return null;
+  return round(Math.max(0, cfg.signal.extension.atrUsedMax * trend.budgetMultiplier - used), 3);
 }
 
 const directionOfBias = (bias: number, deadband: number): Direction =>
@@ -216,31 +479,49 @@ const directionOfBias = (bias: number, deadband: number): Direction =>
  * pays for information already in hand. It is floored at a fraction of ATR so a very tight
  * base cannot produce a stop inside the bid-ask noise.
  */
-function buildPlan(i: SignalInputs, dir: 1 | -1): { plan: SignalPlan; strike: StrikeChoice | null } | null {
+function buildPlan(
+  i: SignalInputs,
+  dir: 1 | -1,
+  trend: TrendContext,
+  trendMode: boolean,
+): { plan: SignalPlan; strike: StrikeChoice | null } | null {
   const { quote, pulse, greeks, config } = i;
   const s = config.signal;
   const atr = pulse.atr;
   if (!atr || atr <= 0 || quote.ltp <= 0) return null;
 
   const entry = quote.ltp;
-  const room = roomAtr(pulse, config);
+  const room = roomAtr(pulse, config, trend);
+
+  // A trend-day continuation leg is worth more than an ignition scalp and can carry a wider
+  // stop, because what invalidates it is the day's structure failing rather than a tick.
+  const wantAtr = trendMode ? s.trend.targetAtr : s.targetAtr;
+  const wantStopAtr = trendMode ? s.trend.stopAtr : s.stopAtr;
 
   // Target: the configured distance, but never past the room the model thinks is left.
-  const targetAtr = room === null ? s.targetAtr : Math.min(s.targetAtr, room);
+  const targetAtr = room === null ? wantAtr : Math.min(wantAtr, room);
   const targetDist = targetAtr * atr;
   if (targetDist <= 0) return null;
 
-  const atrStop = s.stopAtr * atr;
+  const atrStop = wantStopAtr * atr;
+
+  // Structure beats arithmetic when structure is tighter. Two candidates: the base a break
+  // came out of, and — on a trend day — VWAP, which is the level a one-sided day is actually
+  // defended at and the one whose loss ends the thesis. Taking the tighter of whatever is
+  // available stops the plan paying a full ATR to learn something the chart already said.
   const structural = pulse.base?.compressed
     ? dir === 1
       ? entry - pulse.base.low
       : pulse.base.high - entry
     : null;
+  const vwapStop =
+    trendMode && quote.vwap > 0 && (entry - quote.vwap) * dir > 0
+      ? Math.abs(entry - quote.vwap) + 0.08 * atr
+      : null;
+
+  const tighter = [structural, vwapStop].filter((v): v is number => v !== null && v > 0 && v < atrStop);
   const floor = 0.12 * atr;
-  const stopDist = Math.max(
-    floor,
-    structural !== null && structural > 0 && structural < atrStop ? structural : atrStop,
-  );
+  const stopDist = Math.max(floor, tighter.length ? Math.min(...tighter) : atrStop);
 
   const target = dir === 1 ? entry + targetDist : entry - targetDist;
   const stop = dir === 1 ? entry - stopDist : entry + stopDist;
@@ -252,12 +533,20 @@ function buildPlan(i: SignalInputs, dir: 1 | -1): { plan: SignalPlan; strike: St
   // describe the contract a reader would actually buy rather than a notional ATM one. When
   // there is no chain — most of the board, since the enrichment shortlist is finite — this
   // falls back to the ATM greeks, and `basis` says which happened.
+  //
+  // On a trend-day re-entry the contract is picked inside a DELTA BAND rather than on payoff
+  // alone. The payoff ranking is right for a fifteen-minute ignition scalp and wrong for a
+  // 30–90 minute hold taken three or four times a session: it walks out to the cheapest strike
+  // every time, and four entries in a day is four spreads paid on a contract whose delta
+  // stopped tracking the stock the plan was built on.
   const strike = selectStrike({
     chain: i.chain ?? null,
     direction: dir,
     spot: entry,
     targetPrice: target,
     lotSize: i.lotSize ?? null,
+    preferDelta: trendMode ? { min: s.trend.strike.minDelta, max: s.trend.strike.maxDelta } : null,
+    maxThetaPctPerHour: trendMode ? s.trend.strike.maxThetaPctPerHour : null,
     config,
   });
 
@@ -338,7 +627,8 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
     note: pulse.note,
   };
 
-  const extension = extensionOf(pulse, config);
+  const trend = trendContext(i);
+  const extension = extensionOf(pulse, config, trend);
   const blockers: string[] = [];
   const reasons: FactorReason[] = [];
 
@@ -368,6 +658,8 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
       extension,
       plan: null,
       strike: null,
+      entryKind: null,
+      trendEntriesToday: triggerCount(symState, 'trendPullback'),
       reasons: [{ ok: false, text: pulse.note ?? 'Timing layer warming up — not enough readings yet' }],
       blockers: ['the last few minutes are not measurable yet'],
     };
@@ -381,13 +673,34 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
   // Only a pulse that clears the bar is allowed to fire one. Without that gate every stock
   // crosses its VWAP a dozen times a session on no volume and the board fills with events
   // that are arithmetic rather than signals.
-  const pulseStrong = (pulseScore ?? 0) >= s.minPulseScore;
-  const burstOk = pulse.burstRvol === null || pulse.burstRvol >= s.minBurstRvol;
+  //
+  // The FLOOR ITSELF MOVES on a trend day. A steady one-directional grind has a burst RVOL
+  // near 1.0 and a velocity near zero — that is what makes it a grind — and scores the pulse
+  // around 35 against the ordinary 55. Holding it to that floor is not a conservative choice,
+  // it is a guarantee that the stocks worth holding all day never produce a single trigger.
+  const pulseStrong = (pulseScore ?? 0) >= trend.pulseFloor;
+  const burstOk = pulse.burstRvol === null || pulse.burstRvol >= trend.burstFloor;
+
+  // A trend-day re-entry is MEANT to fire several times a session, so it keeps its own,
+  // shorter cooldown. Sharing the 15-minute one would allow at most one entry per pullback
+  // pair and quietly halve the number of trades the layer exists to find.
+  // On a slow grind the micro bias sits inside the deadband for minutes at a time, so `dir` is
+  // null and no trigger could be tested at all — which would silence the trend-day re-entry on
+  // exactly the stocks whose whole character is that they move slowly. When a trend is active
+  // its direction stands in: the `resuming` test inside the trigger is a stricter statement
+  // about which way price is going than the deadband is, so nothing is being waved through.
+  const triggerDir: 1 | -1 | null = dir ?? (trend.active ? trend.direction : null);
 
   let fired: FiredTrigger | null = null;
-  if (dir !== null && pulseStrong && burstOk && symState) {
-    const candidate = detectTrigger(i, dir);
-    if (candidate) fired = recordTrigger(symState, candidate.kind, dir, candidate.price, nowMs, s.cooldownMin * 60_000);
+  if (triggerDir !== null && pulseStrong && burstOk && symState) {
+    const candidate = detectTrigger(i, triggerDir, trend);
+    if (candidate) {
+      const cooldownMin =
+        candidate.kind === 'trendPullback' ? s.trend.reentryCooldownMin : s.cooldownMin;
+      fired = recordTrigger(
+        symState, candidate.kind, candidate.direction, candidate.price, nowMs, cooldownMin * 60_000,
+      );
+    }
   }
 
   // A trigger is an EVENT and keeps its own lifetime. The crossing that fired it scrolls out
@@ -440,24 +753,51 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
   const deepRetrace = pulse.pullback !== null && pulse.pullback > s.pullback.maxDepth;
   const legAgainstDay = legDir !== null && dayDir !== null && legDir !== dayDir;
   const legWithDay = legDir !== null && (dayDir === null || legDir === dayDir);
-  const audible = (pulseScore ?? 0) >= s.minPulseScore * 0.7;
+  const audible = (pulseScore ?? 0) >= trend.pulseFloor * 0.7;
+
+  // The trend-day read of the same moment. A retracement inside a one-sided day looks
+  // identical to the start of a reversal from three minutes away — same leg against the day,
+  // same micro direction opposing — and the ONLY things that separate them are how deep it
+  // went and whether the trend's side of VWAP survived. Both are measurements.
+  const tpb = trend.active && trend.direction !== null ? readPullback(i, trend.direction) : null;
+  const trendDipHealthy =
+    trend.active &&
+    tpb !== null &&
+    tpb.vwapSideIntact &&
+    (tpb.offExtremeAtr === null || tpb.offExtremeAtr <= s.trend.pullbackAtr.max);
+  // A one-sided day that has decisively lost the side it was one-sided on has not pulled
+  // back, it has broken. This outranks everything: whoever is holding it is holding it on a
+  // thesis that just expired.
+  const trendBroken = trend.active && tpb !== null && !tpb.vwapSideIntact;
 
   let state: SignalState;
-  if (audible && aligned === false && (legAgainstDay || deepRetrace)) {
+  if (trendBroken) {
+    state = 'Reversing';
+  } else if (audible && aligned === false && (legAgainstDay || deepRetrace) && !trendDipHealthy) {
     // The day says one thing and the last minutes say the other, and the turn is big enough
     // to be a turn. This is the state that costs money on a held option, so it outranks
-    // every other reading.
+    // every other reading — except a trend-day dip that has stayed inside its band, which is
+    // this exact shape and is the entry rather than the exit.
     state = 'Reversing';
   } else if (extension.extended) {
     state = 'Extended';
+  } else if (fresh && trigger !== null && trigger.kind === 'trendPullback' && trend.active) {
+    // A trend-day re-entry is not an ignition and must not be labelled one — the leg it is
+    // joining started hours ago, and calling it `Igniting` would misreport both how much room
+    // is in front of it and how long the hold is expected to be.
+    state = 'Trending';
   } else if (fresh && pulseStrong && trigger !== null && dir !== null && trigger.direction === dir) {
     // An ignition has a direction, and it is the trigger's. A recalled trigger pointing the
     // other way to the current minutes is not one — it is a break that has already rolled
     // over, which is the `Reversing`/`Stalling` case below.
     state = 'Igniting';
+  } else if (trend.active && trend.direction !== null) {
+    // One-sided and intact, but nothing to enter on this minute. A real and useful state:
+    // this is the row to have open when the next dip comes.
+    state = 'Trending';
   } else if (sinceExtreme !== null && sinceExtreme >= s.stallMinutes && legDir !== null) {
     state = 'Stalling';
-  } else if (legWithDay && (legAge ?? 0) > 0 && ((pulseScore ?? 0) >= s.minPulseScore * 0.6 || retracing)) {
+  } else if (legWithDay && (legAge ?? 0) > 0 && ((pulseScore ?? 0) >= trend.pulseFloor * 0.6 || retracing)) {
     state = 'Extending';
   } else {
     state = 'Quiet';
@@ -470,36 +810,79 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
    * trading WITH the leg while the last few minutes point against it. Conflating the two is
    * what would make the alignment gate reject every pullback entry it was meant to allow.
    */
-  const tradeDir: 1 | -1 | null = state === 'Extending' ? legDir : dir;
+  //
+  // On a trend day it is the TREND's direction, not the leg's and not the last three minutes'.
+  // During the dip that this layer wants to enter, both of those point the wrong way — that is
+  // what a dip is — and taking either would put the entry on the wrong side of the trade the
+  // row is recommending.
+  const tradeDir: 1 | -1 | null =
+    state === 'Trending' ? trend.direction : state === 'Extending' ? legDir : dir;
 
   /* ---- the gates ---- */
-  const room = roomAtr(pulse, config);
-  const built = tradeDir === null ? null : buildPlan(i, tradeDir);
+  const room = roomAtr(pulse, config, trend);
+  const trendMode = state === 'Trending' && trend.active;
+  const minutesLeft = Math.max(0, SESSION_MINUTES - minuteOfSession(nowMs));
+  const built = tradeDir === null ? null : buildPlan(i, tradeDir, trend, trendMode);
   const plan = built?.plan ?? null;
   const strike = built?.strike ?? null;
 
   if (state === 'Extended') {
     const parts: string[] = [];
-    if (extension.atrUsed !== null && extension.atrUsed >= s.extension.atrUsedMax)
-      parts.push(`${(extension.atrUsed * 100).toFixed(0)}% of a normal day's range already travelled`);
-    if (extension.vwapAtr !== null && extension.vwapAtr >= s.extension.vwapAtrMax)
+    if (extension.atrUsed !== null && extension.atrUsed >= extension.atrUsedMax)
+      parts.push(
+        `${(extension.atrUsed * 100).toFixed(0)}% of a normal day's range already travelled` +
+        (trend.budgetMultiplier > 1
+          ? ` — and that is against the ${extension.atrUsedMax.toFixed(2)} ATR budget a ${trend.confirmed ? 'confirmed' : 'forming'} trend day earns, not the ordinary ${s.extension.atrUsedMax}`
+          : ''),
+      );
+    if (extension.vwapAtr !== null && extension.vwapAtr >= s.extension.vwapAtrMax * trend.budgetMultiplier)
       parts.push(`price ${extension.vwapAtr.toFixed(2)} ATR from VWAP`);
-    if (extension.legMoveAtr !== null && extension.legMoveAtr >= s.extension.legMoveAtrMax)
+    if (extension.legMoveAtr !== null && extension.legMoveAtr >= s.extension.legMoveAtrMax * trend.budgetMultiplier)
       parts.push(`this leg has already run ${extension.legMoveAtr.toFixed(2)} ATR`);
     blockers.push(`the move is spent — ${parts.join('; ')}`);
   }
   if (state === 'Reversing')
-    blockers.push(`the last ${pulse.windowMin.toFixed(0)} minutes are going the other way (${microDirection.toLowerCase()} against a ${direction.toLowerCase()} day)`);
+    blockers.push(
+      trendBroken
+        ? `the one-sided day has broken — price is through VWAP against a ${i.conviction?.direction.toLowerCase() ?? 'trending'} day that held it all session`
+        : `the last ${pulse.windowMin.toFixed(0)} minutes are going the other way (${microDirection.toLowerCase()} against a ${direction.toLowerCase()} day)`,
+    );
   if (state === 'Stalling')
     blockers.push(`no new extreme for ${sinceExtreme?.toFixed(0)} minutes — the leg has stopped working`);
   if (!pulseStrong && state !== 'Extended')
-    blockers.push(`momentum pulse ${Math.round(pulseScore ?? 0)} is below the ${s.minPulseScore} this model acts on`);
+    blockers.push(
+      `momentum pulse ${Math.round(pulseScore ?? 0)} is below the ${Math.round(trend.pulseFloor)} this model acts on` +
+      (trend.active ? ` (already relaxed from ${s.minPulseScore} because the day is one-sided)` : ''),
+    );
   if (trigger && !fresh)
     blockers.push(`the ${TRIGGER_LABEL[trigger.kind].toLowerCase()} fired ${trigger.ageMin.toFixed(0)} minutes ago — that entry has gone`);
-  if (!trigger && state !== 'Extending')
+  if (!trigger && state !== 'Extending' && state !== 'Trending')
     blockers.push('nothing has triggered — no level broken and no volume thrust in the window');
+  // A `Trending` row with nothing fresh is not failing a gate — it is a live trend with no dip
+  // to buy this minute, which is a different and much more useful thing to say.
+  if (state === 'Trending' && trend.stale)
+    blockers.push(
+      `the one-sided day has not made a new ${trend.direction === 1 ? 'high' : 'low'} for ` +
+      `${(i.conviction?.minutesSinceExtreme ?? 0).toFixed(0)} minutes — it is holding its ground, not still trending`,
+    );
+  else if (state === 'Trending' && !(fresh && trigger?.kind === 'trendPullback'))
+    blockers.push(
+      tpb?.offExtremeAtr !== null && tpb?.offExtremeAtr !== undefined
+        ? `trend intact but only ${tpb.offExtremeAtr.toFixed(2)} ATR off the day's ${trend.direction === 1 ? 'high' : 'low'} — waiting for a dip of ${s.trend.pullbackAtr.min}–${s.trend.pullbackAtr.max} ATR to enter on`
+        : 'trend intact but no pullback to enter on yet',
+    );
   if (room !== null && room < s.minRoomAtr)
-    blockers.push(`only ${room.toFixed(2)} ATR of room left before the model calls the day spent`);
+    blockers.push(
+      trend.rangeCeilingsRetired
+        ? `only ${room.toFixed(2)} ATR of headroom from VWAP — this entry is a chase even on a trend day`
+        : `only ${room.toFixed(2)} ATR of room left before the model calls the day spent`,
+    );
+  // Time, not distance, is what actually limits a continuation trade — and it is the gate that
+  // replaces the range ceiling on a confirmed day rather than simply being added to it.
+  if (trendMode && minutesLeft < s.trend.minMinutesLeft)
+    blockers.push(
+      `only ${minutesLeft.toFixed(0)} minutes of session left — a trend leg is a 30–90 minute hold and this one has nowhere to run`,
+    );
   if (s.requireAlignment && tradeDir !== null && dayDir !== null && tradeDir !== dayDir)
     blockers.push('the direction this entry would take disagrees with the day');
   if ((liquidityScore ?? 0) < config.thresholds.liquidity.grade.average)
@@ -529,16 +912,33 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
     pulse.pullback >= s.pullback.minDepth &&
     pulse.pullback <= s.pullback.maxDepth;
 
+  /* ---- trend-day re-entry ---- */
+  const trendEntry =
+    trendMode &&
+    tradeDir !== null &&
+    fresh &&
+    trigger !== null &&
+    trigger.kind === 'trendPullback' &&
+    trigger.direction === tradeDir;
+
   const entrable =
     tradeDir !== null &&
-    (state === 'Igniting' || (state === 'Extending' && pullbackEntry)) &&
+    (state === 'Igniting' || (state === 'Extending' && pullbackEntry) || trendEntry) &&
     blockers.length === 0;
+
+  const entryKind: MomentumSignal['entryKind'] = !entrable
+    ? null
+    : trendEntry
+      ? 'trend'
+      : state === 'Extending'
+        ? 'pullback'
+        : 'ignition';
 
   const action: SignalAction = entrable
     ? tradeDir === 1
       ? 'Buy Call'
       : 'Buy Put'
-    : state === 'Extended' || state === 'Reversing' || (pulseScore ?? 0) < s.minPulseScore * 0.5
+    : state === 'Extended' || state === 'Reversing' || (pulseScore ?? 0) < trend.pulseFloor * 0.5
       ? 'Stand Aside'
       : 'Watch';
 
@@ -546,13 +946,27 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
   //
   // Nothing cumulative goes into this. It is deliberately not the score, and a row can be a
   // 90 with an entry quality of 12 — that pairing is the whole reason this layer exists.
-  const roomScore = room === null ? 50 : clamp((room / Math.max(0.01, s.targetAtr)) * 100, 0, 100);
-  const parts: Array<{ v: number; w: number }> = [
-    { v: freshness ?? 0, w: 0.3 },
-    { v: pulseScore ?? 0, w: 0.3 },
-    { v: roomScore, w: 0.25 },
-    { v: clamp(liquidityScore ?? 0, 0, 100), w: 0.15 },
-  ];
+  const wantTarget = trendMode ? s.trend.targetAtr : s.targetAtr;
+  const roomScore = room === null ? 50 : clamp((room / Math.max(0.01, wantTarget)) * 100, 0, 100);
+
+  // On a trend day the weighting changes, because what makes the entry good changes. Freshness
+  // and pulse are ignition virtues: they say the move just started and is moving fast. Neither
+  // describes what is good about buying the third dip in BOSCHLTD at 13:40 — there, the quality
+  // of the entry IS the quality of the day, so conviction takes the weight the pulse gives up.
+  const convictionScore = i.conviction?.ready ? i.conviction.score : 0;
+  const parts: Array<{ v: number; w: number }> = trendMode
+    ? [
+        { v: convictionScore, w: 0.4 },
+        { v: freshness ?? 0, w: 0.2 },
+        { v: roomScore, w: 0.25 },
+        { v: clamp(liquidityScore ?? 0, 0, 100), w: 0.15 },
+      ]
+    : [
+        { v: freshness ?? 0, w: 0.3 },
+        { v: pulseScore ?? 0, w: 0.3 },
+        { v: roomScore, w: 0.25 },
+        { v: clamp(liquidityScore ?? 0, 0, 100), w: 0.15 },
+      ];
   let entryQuality = parts.reduce((a, p) => a + p.v * p.w, 0);
   if (state === 'Reversing') entryQuality *= 0.4;
   if (state === 'Extended') entryQuality *= 0.35;
@@ -562,6 +976,11 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
   // than being refused — see the blocker above for why.
   if (plan?.meetsOptionTarget === false) entryQuality *= 0.75;
   if (pullbackEntry) entryQuality = Math.max(entryQuality, 55); // a clean retracement is a real entry
+  // A confirmed one-sided day that has just finished a dip is the highest-probability entry
+  // this module produces, and the arithmetic above under-rates it because half its inputs are
+  // ignition virtues it does not have. Floored rather than boosted, so the number stays
+  // comparable with everything else on the board.
+  if (trendEntry) entryQuality = Math.max(entryQuality, trend.confirmed ? 70 : 58);
 
   /* ---- the sentences ---- */
   if (trigger)
@@ -571,12 +990,20 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
         (trigger.movedSincePct !== 0 ? ` — ${fmtPct(trigger.movedSincePct)} since` : ''),
     });
   reasons.push({
-    ok: state === 'Igniting' || state === 'Extending',
+    ok: state === 'Igniting' || state === 'Extending' || state === 'Trending',
     text: STATE_SENTENCE[state],
   });
+  if (i.conviction?.ready && trend.active)
+    reasons.push({
+      ok: trend.confirmed,
+      text:
+        `${trend.confirmed ? 'Confirmed' : 'Forming'} one-sided day, conviction ${i.conviction.score.toFixed(0)}` +
+        (i.conviction.heldMin !== null ? `, held ${i.conviction.heldMin.toFixed(0)}m` : '') +
+        ` — extension budget widened to ${extension.atrUsedMax.toFixed(2)} ATR`,
+    });
   if (extension.atrUsed !== null)
     reasons.push({
-      ok: extension.atrUsed < s.extension.atrUsedMax,
+      ok: extension.atrUsed < extension.atrUsedMax,
       text: `${(extension.atrUsed * 100).toFixed(0)}% of a normal day's range used${
         room === null ? '' : ` — ${room.toFixed(2)} ATR of room left`
       }`,
@@ -609,6 +1036,8 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
     extension,
     plan,
     strike,
+    entryKind,
+    trendEntriesToday: triggerCount(symState, 'trendPullback'),
     reasons,
     blockers,
   };
@@ -616,6 +1045,7 @@ export function buildSignal(i: SignalInputs): MomentumSignal {
 
 const STATE_SENTENCE: Record<SignalState, string> = {
   Igniting: 'Move is starting — the leg is in front, not behind',
+  Trending: 'One-sided day, still intact — the trade is each dip, not the break',
   Extending: 'Leg is established and still working — entry is a pullback, not a chase',
   Extended: 'Move is largely spent — a strong score here is describing what already happened',
   Stalling: 'Leg has stopped making progress',

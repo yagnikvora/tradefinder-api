@@ -445,17 +445,26 @@ describe('default config', () => {
     for (const k of FACTOR_KEYS) assert.equal(typeof cfg.weights[k], 'number', `missing weight for ${k}`);
   });
 
-  it('ships weights totalling 100, with the timing factor carrying the most', () => {
+  it('ships weights totalling 100, with the two timing-aware factors leading the model', () => {
     const cfg = defaultConfig();
     assert.equal(FACTOR_KEYS.reduce((a, k) => a + cfg.weights[k], 0), 100);
-    // The brief's original weights were all cumulative-since-open readings, which is why the
-    // board's best scores arrived after the move. The pulse is the only factor measured over
-    // minutes, so it must outweigh any single one of them or the ranking stays a description
-    // of the last four hours.
+
+    // The brief's original weights were ALL cumulative-since-open readings, which is why the
+    // board's best scores arrived after the move was over. Two factors correct that, from
+    // opposite ends of the clock: `momentumPulse` measures the last few minutes, and
+    // `trendQuality` measures the shape of the whole session. Between them they cover the only
+    // two timescales an intraday option buyer trades on, and each must outweigh any single
+    // cumulative factor or the ranking reverts to a description of the last four hours.
+    //
+    // They are deliberately EQUAL rather than ranked. Which of the two matters more is a
+    // property of the day, not of the model: on a fast news open the pulse is the whole story,
+    // and on a grinding trend day it reads ~35 while conviction reads ~85.
+    const timing: FactorKey[] = ['momentumPulse', 'trendQuality'];
     const heaviestCumulative = Math.max(
-      ...FACTOR_KEYS.filter((k) => k !== 'momentumPulse').map((k) => cfg.weights[k]),
+      ...FACTOR_KEYS.filter((k) => !timing.includes(k)).map((k) => cfg.weights[k]),
     );
-    assert.ok(cfg.weights.momentumPulse > heaviestCumulative, 'the timing factor must lead the model');
+    for (const k of timing)
+      assert.ok(cfg.weights[k] > heaviestCumulative, `${k} must outweigh every cumulative factor`);
   });
 
   it('hands out an independent copy, so a caller cannot edit the shipped defaults', () => {

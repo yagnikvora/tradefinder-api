@@ -6,9 +6,10 @@
 // weighting, where an invented one silently moves the ranking. `available: false` plus a
 // `note` saying why is the shape that carries that through the whole pipeline.
 
-/** The twelve factors the score is built from. Order is the order the UI lists them. */
+/** The thirteen factors the score is built from. Order is the order the UI lists them. */
 export type FactorKey =
   | 'momentumPulse'
+  | 'trendQuality'
   | 'rvol'
   | 'liquidity'
   | 'relativeStrength'
@@ -22,12 +23,13 @@ export type FactorKey =
   | 'trendStructure';
 
 export const FACTOR_KEYS: FactorKey[] = [
-  'momentumPulse', 'rvol', 'liquidity', 'relativeStrength', 'vwap', 'optionFlow', 'greeks',
-  'impliedVolatility', 'atrExpansion', 'sectorStrength', 'marketBreadth', 'trendStructure',
+  'momentumPulse', 'trendQuality', 'rvol', 'liquidity', 'relativeStrength', 'vwap', 'optionFlow',
+  'greeks', 'impliedVolatility', 'atrExpansion', 'sectorStrength', 'marketBreadth', 'trendStructure',
 ];
 
 export const FACTOR_LABEL: Record<FactorKey, string> = {
   momentumPulse: 'Momentum Pulse (last minutes)',
+  trendQuality: 'Trend Quality (one-sidedness)',
   rvol: 'Relative Volume',
   liquidity: 'Liquidity',
   relativeStrength: 'Relative Strength',
@@ -51,6 +53,7 @@ export const FACTOR_LABEL: Record<FactorKey, string> = {
  */
 export const DIRECTIONAL: Record<FactorKey, boolean> = {
   momentumPulse: true,
+  trendQuality: true,
   rvol: false,
   liquidity: false,
   relativeStrength: true,
@@ -125,6 +128,128 @@ export type RvolGrade = 'Excellent' | 'Good' | 'Average' | 'Poor';
  */
 export type EnrichmentLevel = 'quote' | 'partial' | 'full';
 
+/* -------------------------------------------------------------- conviction layer --- */
+
+/**
+ * How far the trend-day classification has got.
+ *
+ *   None       not enough session has elapsed, or the shape is not one-sided at all.
+ *   Forming    the shape looks one-sided but has not been one-sided for long enough to be
+ *              trusted. Roughly the first hour. Tradable by someone who wants the whole move
+ *              and accepts that a fair share of these decay into chop by noon.
+ *   Confirmed  adherence, crossing count, path efficiency and pullback depth have all held
+ *              for `confirmHoldMin`. This is the state BOSCHLTD-on-a-trend-day lives in from
+ *              mid-morning to the close, and the one the re-entry trigger works inside.
+ *   Faded      it WAS one-sided and has stopped being. Kept as a distinct state rather than
+ *              dropped to None because a faded trend day is the single most dangerous row on
+ *              the board — everyone holding it is holding it on a thesis that expired.
+ */
+export type TrendPhase = 'None' | 'Forming' | 'Confirmed' | 'Faded';
+
+/**
+ * The session-scale read: IS THIS STOCK GOING ONE WAY ALL DAY.
+ *
+ * WHY THIS EXISTS, and why the pulse could not do it.
+ *
+ * `momentumPulse` measures the last three minutes and `score.service.ts` measures the day's
+ * cumulative magnitude. Neither measures the day's SHAPE, and shape is the whole difference
+ * between the two stocks that matter here:
+ *
+ *   A  opens flat, grinds up 4% across five hours, never closes a 5-minute bar below VWAP,
+ *      deepest pullback 0.3 ATR. Every retracement is an entry and the option pays all day.
+ *   B  gaps up 4% at 09:20, then chops in a 1.5% band for five hours, crossing VWAP eleven
+ *      times. Same change%, same RVOL, same ATR expansion, same relative strength.
+ *
+ * The twelve-factor score cannot tell them apart — and it ranks B HIGHER, because chop
+ * generates the volume bursts and velocity spikes the pulse rewards. Worse, A trips the
+ * extension ceiling by mid-morning (a genuine trend day expands true range well past one
+ * ATR) and is refused an entry for the rest of the session, which is exactly the failure
+ * that produced this module.
+ *
+ * Every reading below comes from accumulators folded into the existing 15-second quote poll,
+ * so this costs no upstream request and is available on the whole universe.
+ */
+export interface ConvictionReading {
+  /** False when the session is too young, or too little of it was observed, to judge. */
+  ready: boolean;
+  /** 0–100. How one-sided the session has been. The tab's ranking key. */
+  score: number;
+  phase: TrendPhase;
+  direction: Direction;
+  /** Minutes the current phase has held. The persistence that stops the board churning. */
+  heldMin: number | null;
+  /** Highest conviction reached today, so a faded row still says how good it once was. */
+  peak: number;
+
+  /**
+   * Net displacement from the first observed price, in ATR, signed with the trend.
+   *
+   * THE NECESSARY CONDITION, and its absence made every other reading here worthless. Shape
+   * without magnitude is not a trend day: a stock drifting 0.1% above its VWAP all session has
+   * perfect adherence, zero crossings, high path efficiency, a range position near its high
+   * and — worst of all — a tiny deepest-pullback, because it never moved far enough to pull
+   * back. The pullback component actively REWARDS being dead.
+   *
+   * Measured on 2026-08-05 before this existed: INFY finished +0.02% on the day and scored a
+   * peak conviction of 98, Confirmed. So did ITC at −0.23% and MARUTI at −0.26%. Eight of
+   * twelve sampled stocks reached Confirmed, which is not a trend-day detector, it is a
+   * detector of stocks that exist.
+   */
+  displacementAtr: number | null;
+  /** Share of observed session on the dominant side of VWAP, 0.5…1. */
+  vwapAdherence: number | null;
+  /** How many times price has crossed VWAP today. A trend day does it 0–2 times. */
+  vwapCrossings: number | null;
+  /** |net move| ÷ total path travelled, over the whole session rather than three minutes. */
+  sessionEfficiency: number | null;
+  /** Where price sits in the day's range, oriented to the trend. 1 = at the running extreme. */
+  rangePosition: number | null;
+  /** The deepest counter-trend excursion of the day, in ATR. Trend days keep this under ~0.4. */
+  deepestPullbackAtr: number | null;
+  /** Session-scale VWAP slope, %/min, signed with the trend. */
+  vwapSlopePctPerMin: number | null;
+  /** Consecutive higher lows (up) or lower highs (down) on the 5-minute spine. */
+  structureCount: number | null;
+  /**
+   * Minutes since the day's extreme was last extended IN THE TREND'S DIRECTION.
+   *
+   * Measured from the session accumulator rather than from the price ring, which only reaches
+   * back 25 minutes and therefore cannot distinguish "no new high for half an hour" from "no
+   * new high since 11:00". The distinction is the whole point: a one-sided day that has
+   * stopped making new extremes has stopped being a continuation trade and started being
+   * distribution, and it goes on looking identical on every other reading here — BOSCHLTD held
+   * 100% VWAP adherence and zero crossings for three hours after it had finished going up.
+   */
+  minutesSinceExtreme: number | null;
+
+  /** Minutes of session actually observed. Short after a mid-day restart. */
+  observedMin: number;
+  /** Minute of session the accumulation started — 0 on a clean open. */
+  fromMinute: number;
+  /** True when the accumulators missed the open, so every share below is a partial read. */
+  partial: boolean;
+  note?: string;
+}
+
+/** The slice of the reading that rides on a board row. */
+export interface ConvictionSummary {
+  ready: boolean;
+  score: number;
+  phase: TrendPhase;
+  direction: Direction;
+  heldMin: number | null;
+  peak: number;
+  vwapAdherence: number | null;
+  vwapCrossings: number | null;
+  sessionEfficiency: number | null;
+  rangePosition: number | null;
+  deepestPullbackAtr: number | null;
+  partial: boolean;
+  /** The one-line human read: "above VWAP all session, 1 crossing, deepest dip 0.24 ATR". */
+  summary: string;
+  note?: string;
+}
+
 /* ------------------------------------------------------------------ timing layer --- */
 
 /**
@@ -134,15 +259,20 @@ export type EnrichmentLevel = 'quote' | 'partial' | 'full';
  *              bursting against its own per-minute norm, and the range travelled so far is
  *              still small against ATR. This is the only state where a fresh option entry
  *              has the whole leg in front of it.
+ *   Trending   a Forming or Confirmed one-sided day, with the leg going the trend's way. The
+ *              state the extension ceiling used to swallow: a stock that has travelled 1.6
+ *              ATR is spent on a mean-reverting day and is merely HALFWAY on a trend day, and
+ *              the difference between those two readings is what the conviction layer buys.
  *   Extending  the leg is real but no longer new. Entry is a pullback, not a chase.
- *   Extended   the move is largely spent — most of a day's ATR travelled, price far from
+ *   Extended   the move is largely spent — most of the day's budget travelled, price far from
  *              VWAP. The score will be at its highest here and the trade is at its worst.
  *   Stalling   the leg is intact but has stopped making new extremes and volume has faded.
  *   Reversing  the last minutes point against the day's direction. A held position is wrong
  *              before the score notices.
  *   Quiet      nothing is happening on this timescale.
  */
-export type SignalState = 'Igniting' | 'Extending' | 'Extended' | 'Stalling' | 'Reversing' | 'Quiet';
+export type SignalState =
+  | 'Igniting' | 'Trending' | 'Extending' | 'Extended' | 'Stalling' | 'Reversing' | 'Quiet';
 
 /** What the timing layer says to do about it. Not advice — a label for the state above. */
 export type SignalAction = 'Buy Call' | 'Buy Put' | 'Watch' | 'Stand Aside';
@@ -159,9 +289,16 @@ export type SignalAction = 'Buy Call' | 'Buy Put' | 'Watch' | 'Stand Aside';
  *   priorRange   through the previous session's high/low or the 20-day extreme.
  *   thrust       no level involved — velocity and volume alone, which is what a news-driven
  *                move looks like before it has a structure to break.
+ *   trendPullback  a retracement inside an established one-sided day that has finished
+ *                retracing and turned back with the trend. The only trigger here that is
+ *                MEANT to fire several times a session: on a trend day the tradable event is
+ *                not the ignition — that was at 09:40 and is gone — it is each successive
+ *                pullback, and a model that fires once a day on these stocks describes them
+ *                instead of trading them.
  */
 export type TriggerKind =
-  | 'baseBreak' | 'vwapReclaim' | 'vwapLoss' | 'orbBreak' | 'dayExtreme' | 'priorRange' | 'thrust';
+  | 'baseBreak' | 'vwapReclaim' | 'vwapLoss' | 'orbBreak' | 'dayExtreme' | 'priorRange'
+  | 'thrust' | 'trendPullback';
 
 export interface SignalTrigger {
   kind: TriggerKind;
@@ -211,14 +348,38 @@ export interface PulseSummary {
   note?: string;
 }
 
-/** How much of the day's normal movement is already used up. */
+/**
+ * How much of the day's movement budget is already used up.
+ *
+ * The BUDGET IS NOT FIXED, and assuming it was is what hid every trend day. `atrUsedMax` of
+ * 0.8 is the right ceiling for an ordinary session — past it a mean-reverting day needs an
+ * abnormal afternoon to pay another leg. A confirmed one-sided day routinely runs 1.5–2.5
+ * ATR, so the same ceiling marks it spent by mid-morning and refuses every entry for the rest
+ * of the session, which is precisely backwards: the stocks that trend hardest were the ones
+ * disqualified soonest. `budgetMultiplier` is what the conviction layer earns.
+ */
 export interface Extension {
-  /** Today's true range ÷ ATR. Above ~0.8 the day has already done its work. */
+  /**
+   * The reading the ceiling is applied to: today's INTRADAY range ÷ ATR, gap excluded.
+   *
+   * True range would include `|high − prevClose|`, which charges the opening gap against the
+   * budget — so a stock that opened a full ATR from yesterday's close was marked spent before
+   * a share traded, and refused for the whole session. The gap is real, and it is reported in
+   * `gapAtr` rather than counted as travel a new position has to compete with.
+   */
   atrUsed: number | null;
+  /** Today's true range ÷ ATR, gap included. Carried for context, not gated on. */
+  trueRangeAtrUsed: number | null;
+  /** The opening gap in ATR, signed. */
+  gapAtr: number | null;
   /** |price − VWAP| ÷ ATR. How stretched from the day's mean the entry would be. */
   vwapAtr: number | null;
   /** The current leg's size ÷ ATR. */
   legMoveAtr: number | null;
+  /** What the configured ceilings were scaled by, from the trend phase. 1 on an ordinary day. */
+  budgetMultiplier: number;
+  /** The ceiling actually applied to `atrUsed`, after that scaling. */
+  atrUsedMax: number;
   extended: boolean;
 }
 
@@ -329,6 +490,17 @@ export interface MomentumSignal {
    * is finite, so most of the board carries a price plan and no strike.
    */
   strike: StrikeChoice | null;
+  /**
+   * Which kind of entry this row is offering, so the contract on it can be read correctly.
+   *   'ignition'  a fresh break. Short hold, leverage is worth paying for.
+   *   'pullback'  a retracement inside an ordinary established leg.
+   *   'trend'     a retracement inside a confirmed one-sided day — the re-entry this module
+   *               was rebuilt around. Expected hold 30–90 minutes, so the strike is picked in
+   *               a delta band rather than on raw payoff.
+   */
+  entryKind: 'ignition' | 'pullback' | 'trend' | null;
+  /** How many times a trend-day re-entry has fired on this stock today. */
+  trendEntriesToday: number;
   reasons: FactorReason[];
   /** Every gate that failed, in words. Empty means the entry is clean. */
   blockers: string[];
@@ -367,6 +539,33 @@ export interface MomentumRow {
    * that used to look like the best trade on the board and was the worst.
    */
   signal: MomentumSignal | null;
+
+  /**
+   * The session-scale one-sidedness read. Null only when the layer is switched off.
+   *
+   * Answers the question neither `score` nor `signal` could: "has this stock spent the whole
+   * day going one way". A row can score 84, be `Extended`, and have a conviction of 11 — that
+   * is a stock which gapped and chopped. And a row can score 61 with a conviction of 88, which
+   * is the BOSCHLTD-grinding-all-day shape the old board could not see at all.
+   */
+  conviction: ConvictionSummary | null;
+
+  /**
+   * Why this row is where it is in the list, and how settled that position is.
+   *
+   * The board used to sort on a score recomputed every fifteen seconds with an 18-weight
+   * three-minute factor inside it, so rows jumped dozens of places on a wobble and the list
+   * was unreadable. `rankScore` is an exponentially smoothed score and is what the board is
+   * actually ordered by; `heldMin` says how long the row has held its current direction.
+   */
+  stability: {
+    /** The smoothed score the board is sorted by. */
+    rankScore: number;
+    /** Raw score minus smoothed — positive means it is moving up faster than the list shows. */
+    drift: number;
+    /** Minutes this row has held its current direction without flipping. */
+    heldMin: number | null;
+  };
 
   liquidity: { score: number | null; grade: LiquidityGrade | null };
   rvol: { value: number | null; grade: RvolGrade | null };
@@ -438,6 +637,11 @@ export interface MomentumBoard {
   igniting: number;
   /** Rows the timing layer would take an entry in right now. */
   entrable: number;
+  /** Confirmed one-sided days, and the ones still proving themselves. */
+  trendConfirmed: number;
+  trendForming: number;
+  /** Trend days that have stopped being one-sided — the rows most dangerous to still hold. */
+  trendFaded: number;
   market: MarketContext;
   rows: MomentumRow[];
   /** Anything degraded — a missing baseline, a refused endpoint, a warming IV history. */
@@ -572,6 +776,92 @@ export interface MomentumConfig {
       /** Full-scale for the pulse's directional bias, in ATR-per-minute. */
       fullScaleVelocityAtr: number;
     };
+
+    /**
+     * Factor 13 — the session-scale one-sidedness measurement.
+     *
+     * Where `pulse` asks "is it moving right now", this asks "has it been going ONE WAY all
+     * day". Six readings, mixed, plus the phase machine that gives the answer persistence.
+     */
+    conviction: {
+      enabled: boolean;
+      /** How the six sub-readings are combined. Need not sum to 1 — `mix()` normalises. */
+      mix: {
+        displacement: number;
+        adherence: number;
+        crossings: number;
+        efficiency: number;
+        rangePosition: number;
+        pullback: number;
+        slope: number;
+        structure: number;
+      };
+      /** Net move from the open in ATR, signed with the trend. The necessary condition. */
+      displacementAtr: Knot[];
+      /** Share of the observed session on the dominant side of VWAP, 0.5…1. */
+      adherence: Knot[];
+      /** VWAP crossings today. Descending — a trend day barely crosses at all. */
+      crossings: Knot[];
+      /**
+       * |net| ÷ path over the WHOLE session. Much lower than the three-minute figure by
+       * construction — a full day of 15-second sampling accumulates a lot of path — so the
+       * curve tops out around 0.5 rather than near 1.
+       */
+      efficiency: Knot[];
+      /** Where price sits in the day's range, oriented to the trend. */
+      rangePosition: Knot[];
+      /** Deepest counter-trend excursion of the day, in ATR. Descending. */
+      deepestPullbackAtr: Knot[];
+      /** Session-scale VWAP slope in %/min, signed with the trend. */
+      slopePctPerMin: Knot[];
+      /** Consecutive higher lows / lower highs on the spine. */
+      structure: Knot[];
+      /**
+       * How far price must sit from VWAP before it counts as being on a side, in ATR.
+       * Without it a stock pinned to its own VWAP registers dozens of crossings a session
+       * from rounding, and the single best one-sidedness discriminator turns into noise.
+       */
+      vwapSideBufferAtr: number;
+      /** How often the whole-session spine is sampled, in minutes. */
+      spineIntervalMin: number;
+
+      /** The phase machine. Every threshold here is about PERSISTENCE, not strength. */
+      phase: {
+        /** Minutes of session before a shape may be called Forming at all. */
+        minMinutesForming: number;
+        /** And before it may be Confirmed. */
+        minMinutesConfirmed: number;
+        /** Conviction needed to enter Forming. */
+        formingScore: number;
+        /** Conviction needed to enter Confirmed… */
+        confirmScore: number;
+        /** …and how long Forming must have held, with one direction, before it may. */
+        confirmHoldMin: number;
+        /** Below this a phase starts decaying toward Faded. */
+        fadeScore: number;
+        /**
+         * How long conviction must stay under `fadeScore` before the demotion actually
+         * happens. This is the anti-churn valve: without it a confirmed trend day demotes on
+         * one deep breath and re-promotes ninety seconds later, and the board flickers.
+         */
+        fadeHoldMin: number;
+        /** Extra conviction needed to climb back out of Faded, so it cannot oscillate. */
+        recoverMargin: number;
+        /** Minimum observed session, in minutes, before any phase is offered after a restart. */
+        minObservedMin: number;
+        /**
+         * A hard floor on displacement, in ATR, below which NO phase is offered at any score.
+         *
+         * A floor rather than only a mix component, because the two failure modes are
+         * different. Weighting displacement into the mix makes a dead stock score lower;
+         * it does not stop a dead stock with otherwise flawless shape from out-scoring the
+         * threshold anyway, which is exactly what INFY did at +0.02% on the day. Some
+         * conditions are necessary rather than merely desirable, and a weighted average
+         * cannot express that — only a gate can.
+         */
+        minDisplacementAtr: number;
+      };
+    };
   };
 
   /**
@@ -636,6 +926,113 @@ export interface MomentumConfig {
      * already moved — the shortlist is chosen by the same lagging number as the ranking.
      */
     enrichReservedSlots: number;
+
+    /**
+     * The trend-day override — how a confirmed one-sided day is allowed to differ.
+     *
+     * Every number here exists because a gate calibrated for an ordinary session gives the
+     * WRONG answer on a trend day, in the same direction each time: it calls the move spent,
+     * calls the volume unremarkable and calls each healthy pullback a reversal. Those are all
+     * correct readings of a mean-reverting session and all three are wrong about BOSCHLTD
+     * going one way for five hours.
+     */
+    trend: {
+      enabled: boolean;
+      /**
+       * What the extension ceilings are multiplied by, per phase. The load-bearing setting in
+       * this whole module: at 1.0 (the old behaviour) a confirmed trend day is `Extended` by
+       * mid-morning and cannot be entered again all session.
+       */
+      budgetMultiplier: { forming: number; confirmed: number };
+      /**
+       * On a CONFIRMED one-sided day, stop gating on cumulative range and leg length at all.
+       *
+       * Scaling those ceilings was the first attempt and it does not survive contact with real
+       * trend days: BOSCHLTD travelled 2.65 ATR and NHPC 2.90 ATR intraday on 2026-08-05, and
+       * `legMoveAtrMax` binds even harder because on a one-sided day the leg IS the day. No
+       * multiplier fixes that, because the premise is wrong — a long leg and a wide range are
+       * the signature of the setup being looked for, not evidence that it is exhausted. Range
+       * mean-reverts on an ordinary session, which is what the ceiling was built for, and on a
+       * trend day it does not. That is the definition of a trend day.
+       *
+       * What still applies is DISTANCE FROM VWAP, which measures whether this particular entry
+       * is a chase — a question that stays meaningful however far the day has travelled — plus
+       * the trend-intact test and `minMinutesLeft` below. Turning this off restores pure
+       * multiplier behaviour.
+       */
+      retireRangeCeilings: boolean;
+      /**
+       * Don't open a trend re-entry without this many minutes of session left.
+       *
+       * The real constraint on a continuation trade is not how far the day has come, it is how
+       * long is left to hold it: a 30–90 minute leg entered at 15:05 has twenty-five minutes,
+       * and the option's decay over that window is charged whether or not the move arrives.
+       */
+      minMinutesLeft: number;
+      /**
+       * Stop offering re-entries once the day's extreme is this old.
+       *
+       * The gate that `Trending` would otherwise swallow. `Stalling` exists to say "the leg has
+       * stopped making progress", but a confirmed trend day outranks it in the state machine —
+       * correctly, because a trend day pausing is not a trend day ending. What is NOT correct
+       * is continuing to buy dips in something that has not made a new high for two hours: on
+       * 2026-08-05 BOSCHLTD topped at 11:00 and then held 100% VWAP adherence and zero
+       * crossings for the rest of the session, so every reading here stayed excellent while
+       * the stock quietly distributed, and each re-entry bought a lower high.
+       */
+      maxMinutesSinceExtreme: number;
+      /**
+       * The pulse floor to apply on a trend day. A grind has no burst and little velocity —
+       * that is what makes it a grind — so the ordinary 55 silences exactly the stocks this
+       * layer exists to surface.
+       */
+      minPulseScore: { forming: number; confirmed: number };
+      /** And the interval-volume floor, for the same reason. */
+      minBurstRvol: number;
+      /**
+       * The retracement band a trend-day re-entry is taken in, measured in ATR FROM THE
+       * SESSION EXTREME — not as a fraction of the zigzag leg.
+       *
+       * The leg is the wrong ruler here and using it was the first version's bug. A trend-day
+       * dip deep enough to be worth entering is usually also deep enough to flip the zigzag,
+       * at which point `pulse.pullback` starts describing the retracement's own leg and reads
+       * near zero exactly when the pullback is at its most complete. Distance from the day's
+       * high (or low) has no such discontinuity.
+       */
+      pullbackAtr: { min: number; max: number };
+      /** A pullback reaching within this many ATR of VWAP also qualifies, whatever its depth. */
+      vwapTouchAtr: number;
+      /** How long before the same re-entry may fire again. Sized to allow 3–5 entries a day. */
+      reentryCooldownMin: number;
+      /** Target and stop for a trend-day continuation leg, in ATR. */
+      targetAtr: number;
+      stopAtr: number;
+      /**
+       * The delta band a trend-day contract is picked in.
+       *
+       * A pullback leg is a 30–90 minute hold, which is long enough that the cheapest strike's
+       * decay matters and short enough that deep in-the-money is wasted capital. Ranking on
+       * raw payoff — what `selectStrike` does otherwise — always walks out to the cheapest
+       * contract on the sheet, and on a four-entry day that is four spreads paid for a leg
+       * whose delta stopped tracking.
+       */
+      strike: { minDelta: number; maxDelta: number; maxThetaPctPerHour: number };
+      /**
+       * Whether a faded trend day is announced loudly. On by default: somebody is holding it.
+       */
+      warnOnFade: boolean;
+    };
+  };
+
+  /** How the board's own ordering is stabilised. See `MomentumRow.stability`. */
+  ranking: {
+    /**
+     * Half-life of the score smoothing, in minutes. The board is sorted on the smoothed
+     * figure, not the raw one. At 0 the smoothing is off and the old churn returns.
+     */
+    smoothingHalfLifeMin: number;
+    /** Weight given to conviction in the main board's ordering, 0…1. */
+    convictionWeight: number;
   };
 
   universe: {

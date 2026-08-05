@@ -62,13 +62,14 @@ app.get('/api_be/servertime', (_req, res) => res.json({ payload: { data: String(
 app.get('/api_be/data/overview', async (_q, res) => send(res, await cached('ov', 15e3, overview)));
 app.get('/api_be/data/market_pulse', async (_q, res) => send(res, await cached('mp', 15e3, svc.marketPulse)));
 app.get('/api_be/data/sector_scope', async (_q, res) => send(res, await cached('ss', 60e3, svc.sectorScope)));
-app.get('/api_be/data/swing_spectrum', async (_q, res) => send(res, await cached('sw', 60e3, svc.swing)));
-app.get('/api_be/data/insider_stratergy', async (_q, res) => send(res, await cached('in', 60e3, svc.insider)));
+// Kept after the /index-mover PAGE was removed, because it is not only that page's endpoint:
+// Option Apex embeds a point-contribution panel that reads it (see web/lib/apex.ts). Deleting
+// it would not have thrown anything — that panel catches its own failure and renders as
+// absent — so the symptom would have been Option Apex quietly losing a section.
 app.get('/api_be/data/order/indice_point_movement', async (req, res) => {
   const idx = String(req.query.index || 'NIFTY 50');
   send(res, await cached('im:' + idx, 60e3, () => svc.indexMover(idx)));
 });
-app.get('/api_be/fii_dii_delivery/fetch_fii_dii_data', async (_q, res) => send(res, await cached('fd', 300e3, svc.fiiDii)));
 
 // ---- Option Clock ----
 // The real endpoints take their parameters as base64-encoded JSON in ?data=, e.g.

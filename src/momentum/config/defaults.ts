@@ -25,6 +25,20 @@ import type { MomentumConfig } from '../types.js';
  * the only factor that measures the last few MINUTES. The cumulative factors were trimmed to
  * pay for it — relative volume most of all, since the pulse's interval burst does the same
  * job on the timescale that matters for an entry.
+ *
+ * `trendQuality` is the SECOND correction, and it addresses the opposite blind spot. The pulse
+ * fixed "the board ranks finished moves highest"; it did nothing for "the board cannot see a
+ * stock that has been walking one direction for five hours", because a grind produces no burst
+ * and no velocity and therefore scores the pulse around 35. Between them the two cover the
+ * only timescales an intraday option buyer trades on: the next few minutes, and the rest of
+ * the day. It is weighted level with the pulse because on the stocks this scanner exists to
+ * find, it is the more reliable of the two — a one-sidedness measured over four hours is a
+ * far stronger statement than a velocity measured over three minutes, and it does not decay
+ * between polls.
+ *
+ * The weight came out of `rvol` and `liquidity`. Relative volume was already double-counted
+ * against the pulse's interval burst, and liquidity at 12 was doing more ranking work than a
+ * gate deserves — it is a floor in `tradeTypeFrom` regardless of what it scores.
  */
 export const DEFAULT_CONFIG: MomentumConfig = {
   version: 1,
@@ -32,18 +46,19 @@ export const DEFAULT_CONFIG: MomentumConfig = {
   updatedBy: 'system:default',
 
   weights: {
-    momentumPulse: 18,
-    rvol: 14,
-    liquidity: 12,
-    relativeStrength: 8,
-    vwap: 10,
-    optionFlow: 9,
-    greeks: 9,
+    momentumPulse: 16,
+    trendQuality: 16,
+    rvol: 11,
+    liquidity: 9,
+    relativeStrength: 7,
+    vwap: 9,
+    optionFlow: 8,
+    greeks: 8,
     impliedVolatility: 4,
-    atrExpansion: 4,
+    atrExpansion: 3,
     sectorStrength: 3,
     marketBreadth: 3,
-    trendStructure: 6,
+    trendStructure: 3,
   },
 
   scoring: {
@@ -364,6 +379,146 @@ export const DEFAULT_CONFIG: MomentumConfig = {
       breakBufferAtr: 0.08,
       fullScaleVelocityAtr: 0.02,
     },
+
+    // --- 13. Trend quality / one-sidedness ---------------------------------------------
+    // The session-scale read. See conviction.service.ts for why none of the other twelve
+    // factors could answer "has this gone one way all day".
+    conviction: {
+      enabled: true,
+      // Displacement carries the joint-largest share with adherence, because it is the only
+      // one of the eight that is NECESSARY. The other seven describe how a stock got where it
+      // went; without this one they happily describe a stock that went nowhere, and did — INFY
+      // finished 2026-08-05 at +0.02% and scored 98 before this existed.
+      mix: {
+        displacement: 0.18,
+        adherence: 0.17,
+        crossings: 0.14,
+        efficiency: 0.14,
+        rangePosition: 0.11,
+        pullback: 0.11,
+        slope: 0.08,
+        structure: 0.07,
+      },
+
+      // Net move from the open in ATR, signed with the trend. Zero-scored below 0.25 ATR: a
+      // stock that has not moved a quarter of its own daily range is not trending, it is
+      // open. Full scale at 1.6, which on a 2% ATR name is a 3.2% session.
+      displacementAtr: [
+        { at: 0.15, score: 0 },
+        { at: 0.35, score: 25 },
+        { at: 0.70, score: 60 },
+        { at: 1.10, score: 85 },
+        { at: 1.60, score: 100 },
+      ],
+
+      // Share of the session on one side of VWAP. Starts at 0.5 because that is the floor of
+      // the measurement — a perfectly balanced day cannot read below it — so a curve starting
+      // at 0 would give every stock on the board a free 40 points.
+      adherence: [
+        { at: 0.50, score: 0 },
+        { at: 0.70, score: 25 },
+        { at: 0.85, score: 60 },
+        { at: 0.93, score: 85 },
+        { at: 1.00, score: 100 },
+      ],
+
+      // Crossings, descending. The most discriminating curve in the file: two crossings in a
+      // session is a trend that took one real breath, eight is a stock being fought over.
+      crossings: [
+        { at: 0, score: 100 },
+        { at: 2, score: 82 },
+        { at: 4, score: 55 },
+        { at: 8, score: 22 },
+        { at: 15, score: 0 },
+      ],
+
+      // Session efficiency. NOT the same scale as the pulse's three-minute efficiency: six
+      // hours of 15-second sampling accumulates far more path, so 0.45 here is an exceptional
+      // trend day where 0.45 over three minutes is unremarkable. Calibrating this against the
+      // pulse curve is the most likely way to get this factor wrong.
+      efficiency: [
+        { at: 0.05, score: 0 },
+        { at: 0.15, score: 30 },
+        { at: 0.30, score: 65 },
+        { at: 0.45, score: 88 },
+        { at: 0.65, score: 100 },
+      ],
+
+      // Position in the day's range, oriented to the trend. A trend day closes near its
+      // extreme; 0.5 is the middle of the range and says nothing either way.
+      rangePosition: [
+        { at: 0.30, score: 0 },
+        { at: 0.50, score: 20 },
+        { at: 0.70, score: 50 },
+        { at: 0.85, score: 82 },
+        { at: 0.95, score: 100 },
+      ],
+
+      // Deepest counter-trend excursion of the day, in ATR. Descending. Past ~0.8 ATR the
+      // "trend" contained a move large enough that nobody was still holding through it.
+      deepestPullbackAtr: [
+        { at: 0.10, score: 100 },
+        { at: 0.25, score: 85 },
+        { at: 0.45, score: 58 },
+        { at: 0.75, score: 28 },
+        { at: 1.20, score: 0 },
+      ],
+
+      // Session VWAP slope, %/min, signed with the trend. VWAP is a cumulative average over
+      // the whole session, so it moves an order of magnitude slower than price — 0.01%/min
+      // sustained for four hours is a 2.4% drift in the average price paid, which is a lot.
+      slopePctPerMin: [
+        { at: -0.005, score: 0 },
+        { at: 0, score: 20 },
+        { at: 0.004, score: 50 },
+        { at: 0.012, score: 82 },
+        { at: 0.030, score: 100 },
+      ],
+
+      // Consecutive higher lows / lower highs across segments of the session.
+      structure: [
+        { at: 0, score: 0 },
+        { at: 1, score: 35 },
+        { at: 2, score: 60 },
+        { at: 4, score: 88 },
+        { at: 6, score: 100 },
+      ],
+
+      // 5% of an ATR. Below this price is AT its VWAP rather than on a side of it, and
+      // counting those ticks as a side is what turns the crossing count into noise.
+      vwapSideBufferAtr: 0.05,
+      spineIntervalMin: 5,
+
+      // The persistence machine. These are the numbers that decide whether the board is
+      // stable, and they are about TIME, not strength.
+      phase: {
+        // 09:45. Half an hour is the least that can distinguish a trend from an opening drive,
+        // and an opening drive that reverses at 09:50 is the most common shape on the tape.
+        minMinutesForming: 30,
+        // 10:30. By the second hour a genuine trend day has survived the first real test.
+        minMinutesConfirmed: 75,
+        formingScore: 55,
+        confirmScore: 70,
+        // Twenty minutes of sustained Forming before promotion. Without a hold requirement,
+        // "confirmed" would mean nothing more than "crossed 70 once", which any stock does on
+        // the way through.
+        confirmHoldMin: 20,
+        fadeScore: 50,
+        // Ten minutes below the fade line before demotion. This is the anti-churn valve: a
+        // confirmed trend day taking one deep breath is the most ordinary thing that happens
+        // on a trend day, and demoting on it would fire the fade warning at the exact moment
+        // the pullback entry is setting up.
+        fadeHoldMin: 10,
+        recoverMargin: 8,
+        // A restart must observe this much of the session itself before making any claim.
+        minObservedMin: 25,
+        // Half an ATR of net displacement before any phase is offered, at any score. On the
+        // 2026-08-05 sample this is what separates BOSCHLTD (+3.68%, 2.0 ATR), NHPC (−4.50%)
+        // and SONACOMS (+3.53%) from INFY (+0.02%), ITC (−0.23%) and MARUTI (−0.26%), all
+        // three of which were reaching Confirmed on shape alone.
+        minDisplacementAtr: 0.5,
+      },
+    },
   },
 
   // The timing layer. See types.ts for what each state means.
@@ -409,6 +564,74 @@ export const DEFAULT_CONFIG: MomentumConfig = {
       maxThetaPctPerHour: 3,
     },
     enrichReservedSlots: 12,
+
+    // The trend-day override. Every number here exists because a gate calibrated for an
+    // ordinary session gives the wrong answer on a one-sided one, always in the same
+    // direction: it calls the move spent, calls the volume unremarkable, and calls each
+    // healthy pullback a reversal.
+    trend: {
+      enabled: true,
+      // THE LOAD-BEARING SETTING. At 1.0 — the old, implicit behaviour — a confirmed trend day
+      // trips `atrUsedMax` around mid-morning and can never be entered again. 2.6 is roughly
+      // the 90th percentile of true-range expansion on NSE F&O trend days: enough that a
+      // stock walking one way all afternoon is still tradable, not so much that a genuinely
+      // exhausted move is waved through. Forming days get less because they have earned less.
+      budgetMultiplier: { forming: 1.6, confirmed: 2.6 },
+      // On a confirmed day the range and leg ceilings are retired outright rather than merely
+      // widened — see types.ts. Measured against 2026-08-05: BOSCHLTD ran 2.65 ATR intraday
+      // and NHPC 2.90, so no multiplier anyone would set as a default rescues them, and the
+      // leg ceiling binds sooner still because on a one-sided day the leg is the whole day.
+      retireRangeCeilings: true,
+      // Forty minutes. A trend-day leg is a 30–90 minute hold, so an entry with less than this
+      // left is buying decay and hoping — and the last half hour is where a one-sided day is
+      // most likely to be unwound by people flattening rather than extended.
+      minMinutesLeft: 40,
+      // Forty-five minutes without a new session extreme and the trend day has stopped paying.
+      // Measured on 2026-08-05: BOSCHLTD topped at 11:00 and every re-entry after ~12:00 was
+      // bought into distribution while adherence and crossings still read perfect.
+      maxMinutesSinceExtreme: 45,
+      // A grind has no burst and little velocity — that is what makes it a grind. The ordinary
+      // 55 silences exactly the stocks this layer exists to surface, so a confirmed day is
+      // held to a floor that a steady one-directional drift can actually clear.
+      minPulseScore: { forming: 45, confirmed: 32 },
+      minBurstRvol: 0.9,
+      // Measured in ATR back from the day's high (or low), not as a fraction of the zigzag
+      // leg — see types.ts for why the leg is the wrong ruler. A dip of 0.15–0.55 ATR off the
+      // session extreme is the shape of a trend-day breather; past 0.55 the trend is ending
+      // rather than resting.
+      pullbackAtr: { min: 0.15, max: 0.55 },
+      // Price coming within a quarter ATR of VWAP qualifies whatever the leg depth says —
+      // on a trend day VWAP is the level that actually gets bought, and the zigzag's idea of
+      // a leg is often much shorter than the move a trader is sitting in.
+      vwapTouchAtr: 0.25,
+      // Twenty-five minutes. Sized so three to five re-entries a session are possible — which
+      // is what a trend day actually offers — without the same pullback firing twice.
+      reentryCooldownMin: 25,
+      // A continuation leg is worth more than an ignition scalp, and the stop can be wider
+      // because the trend structure, not a tick, is what invalidates it.
+      targetAtr: 0.55,
+      stopAtr: 0.32,
+      // The delta band for a 30–90 minute hold. Ranking on raw payoff — what the strike
+      // picker does otherwise — always walks out to the cheapest contract on the sheet, and
+      // over four entries in a day that is four spreads paid for a leg whose delta stopped
+      // tracking the stock the plan was built on.
+      strike: { minDelta: 0.30, maxDelta: 0.50, maxThetaPctPerHour: 4 },
+      warnOnFade: true,
+    },
+  },
+
+  // How the board's own ordering is stabilised.
+  ranking: {
+    // Three minutes. The board was sorted on a score recomputed every fifteen seconds with an
+    // 18-weight three-minute factor inside it, so rows moved dozens of places on a wobble and
+    // the list could not be read at all — which is the "stocks keep changing position"
+    // complaint. Smoothing the sort key costs a little responsiveness at the very top and buys
+    // a list that stays still long enough to act on.
+    smoothingHalfLifeMin: 3,
+    // How much conviction pulls on the MAIN board's ordering. Deliberately modest: the main
+    // board is still the ignition board, and the dedicated trend view ranks on conviction
+    // outright. Set to 0 to keep the main list purely score-ordered.
+    convictionWeight: 0.25,
   },
 
   universe: {
