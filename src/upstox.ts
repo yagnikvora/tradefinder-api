@@ -22,7 +22,25 @@
 import type { Result } from './services.js';
 
 const BASE = 'https://api.upstox.com';
-const TIMEOUT_MS = Number(process.env.UPSTOX_TIMEOUT_MS) || 8000;
+
+const envNum = (v: string | undefined, fallback: number) => {
+  const n = Number(v);
+  return v !== undefined && Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+const TIMEOUT_MS = envNum(process.env.UPSTOX_TIMEOUT_MS, 8000);
+
+/**
+ * Extra attempts after the first, for failures that never reached Upstox's rate counter.
+ *
+ * Every call here is a GET, so repeating one is safe. Worth doing because the heaviest of
+ * them — the ~300-instrument quote batch behind the whole board — is exactly the one that
+ * occasionally overruns the timeout, and losing it loses the home page.
+ */
+const RETRIES = envNum(process.env.UPSTOX_RETRIES, 1);
+const RETRY_BACKOFF_MS = 400;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Our index keys -> Upstox instrument keys.
@@ -48,6 +66,48 @@ class UpstoxError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
 }
 
+/**
+ * One attempt, plus RETRIES more for a transient failure.
+ *
+ * "Transient" is deliberately narrow: a timeout or a dropped socket means the request never
+ * got an answer, and a 5xx means Upstox is unwell rather than that we asked wrongly. A 4xx —
+ * including 429 — is repeatable and is returned as-is, because retrying a rate-limit refusal
+ * only spends more of the budget that caused it.
+ *
+ * A retry gets a longer deadline than the attempt before it. A batch that just overran 8s is
+ * more likely slow than broken, and repeating it against the same ceiling would only fail the
+ * same way.
+ */
+async function attempt(url: string, endpoint: string, bearer: string): Promise<Response> {
+  for (let i = 0; ; i++) {
+    const last = i >= RETRIES;
+    const budget = Math.round(TIMEOUT_MS * (1 + i * 0.5));
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(budget),
+      });
+      if (res.status < 500 || last) return res;
+      // Free the socket before sleeping — an unread body holds the connection open.
+      await res.body?.cancel().catch(() => {});
+    } catch (e) {
+      // Left as an UpstoxError rather than the bare DOMException fetch throws: that one
+      // says only "The operation was aborted due to timeout", naming neither the endpoint
+      // nor the deadline it overran, and it escapes the status-code handling below.
+      if (last) {
+        const timedOut = (e as Error)?.name === 'TimeoutError';
+        throw new UpstoxError(
+          timedOut
+            ? `Upstox ${endpoint} timed out after ${i + 1} attempt(s), last allowed ${budget}ms`
+            : `Upstox ${endpoint} unreachable after ${i + 1} attempt(s): ${(e as Error)?.message ?? e}`,
+          0,
+        );
+      }
+    }
+    await sleep(RETRY_BACKOFF_MS * (i + 1));
+  }
+}
+
 /** The one authenticated GET. Exported so equity.ts shares the token and error handling. */
 export async function call<T>(path: string): Promise<T> {
   const bearer = token();
@@ -56,11 +116,13 @@ export async function call<T>(path: string): Promise<T> {
       'UPSTOX_ACCESS_TOKEN is not set — put your Upstox Analytics Token in api/.env', 0,
     );
 
-  const res = await fetch(BASE + path, {
-    headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json' },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  const body = (await res.json().catch(() => null)) as
+  const endpoint = path.split('?')[0];
+  const res = await attempt(BASE + path, endpoint, bearer);
+
+  // The deadline covers reading the body too, so a large response can abort mid-parse. Kept
+  // separate from "no data" — one is a stalled download, the other is Upstox answering empty.
+  let parseFailed = '';
+  const body = (await res.json().catch((e: Error) => { parseFailed = e?.message ?? String(e); return null; })) as
     | { status?: string; data?: T; errors?: Array<{ errorCode?: string; message?: string }> }
     | null;
 
@@ -75,9 +137,15 @@ export async function call<T>(path: string): Promise<T> {
         'so check api/.env holds the current one',
         401,
       );
-    throw new UpstoxError(`Upstox ${path.split('?')[0]} -> ${res.status}${detail}`, res.status);
+    throw new UpstoxError(`Upstox ${endpoint} -> ${res.status}${detail}`, res.status);
   }
-  if (body?.data == null) throw new UpstoxError(`Upstox ${path.split('?')[0]} returned no data`, res.status);
+  if (body?.data == null)
+    throw new UpstoxError(
+      parseFailed
+        ? `Upstox ${endpoint} answered ${res.status} but the body could not be read: ${parseFailed}`
+        : `Upstox ${endpoint} returned no data`,
+      res.status,
+    );
   return body.data;
 }
 

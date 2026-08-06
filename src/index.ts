@@ -9,6 +9,7 @@ import * as clock from './clock.js';
 import * as apex from './apex.js';
 import { isTimeframe } from './candles.js';
 import { mountMomentum } from './momentum/index.js';
+import { mountPullback } from './pullback/index.js';
 import type { Result } from './services.js';
 
 const app = express();
@@ -22,6 +23,16 @@ app.use(cors());
 // The scheduler is off without a token: its jobs would otherwise fail every 30 seconds on a
 // clone that has not been configured, filling the log with the same error.
 mountMomentum(app, { path: '/momentum', scheduler: process.env.MOMENTUM_SCHEDULER !== 'off' });
+
+// EMA Pullback Scanner. Same arrangement, under src/pullback — its own controller, services,
+// indicators, repositories, config, backtest engine and cron.
+//
+// It shares this app's infrastructure (the Upstox client, the instrument master, the session
+// arithmetic, the disk store, the candle fetcher with its circuit breaker) and none of the
+// momentum module's domain logic, so the two can be reasoned about and deployed apart. Their
+// combined quote polling is ~540 requests per 30 minutes against a 2000 ceiling; the arithmetic
+// is in each engine's header.
+mountPullback(app, { path: '/pullback', scheduler: process.env.PULLBACK_SCHEDULER !== 'off' });
 
 // In-memory cache so we don't hammer NSE. Every avoidable upstream hit is another
 // chance to be tarpitted and drop to a fallback, so the window widens once the market
@@ -58,17 +69,38 @@ async function cached<T>(key: string, ttl: number, fn: () => Promise<Result<T>>)
 const send = <T>(res: express.Response, r: Result<T>) =>
   res.json({ payload: { data: r.data }, status: 'SUCCESS', source: r.source, ...(r.error ? { note: r.error } : {}) });
 
+/**
+ * Every async route goes through here, and that is not tidiness.
+ *
+ * Express 4 does not catch a rejected async handler — the rejection is simply unhandled, and
+ * Node has exited the process on that since v15. So one Upstox timeout eight layers down
+ * (overview -> allQuotes -> call -> fetch) took the whole API off the air, killing the
+ * scanners and every other page with it. Answering 502 for the one endpoint that failed is
+ * the entire difference.
+ *
+ * Option data additionally has no mock: a fabricated OI ladder is indistinguishable from a
+ * real one at a glance and would be read as a trading signal. Better to say it's unavailable.
+ */
+const serve = async <T>(req: express.Request, res: express.Response, run: () => Promise<Result<T>>) => {
+  try { send(res, await run()); }
+  catch (e) {
+    const message = String((e as Error)?.message ?? e);
+    console.error(`[api] ${req.method} ${req.originalUrl} -> ${message}`);
+    if (!res.headersSent) res.status(502).json({ status: 'ERROR', error: message });
+  }
+};
+
 app.get('/api_be/servertime', (_req, res) => res.json({ payload: { data: String(Date.now()) }, status: 'SUCCESS' }));
-app.get('/api_be/data/overview', async (_q, res) => send(res, await cached('ov', 15e3, overview)));
-app.get('/api_be/data/market_pulse', async (_q, res) => send(res, await cached('mp', 15e3, svc.marketPulse)));
-app.get('/api_be/data/sector_scope', async (_q, res) => send(res, await cached('ss', 60e3, svc.sectorScope)));
+app.get('/api_be/data/overview', async (q, res) => serve(q, res, () => cached('ov', 15e3, overview)));
+app.get('/api_be/data/market_pulse', async (q, res) => serve(q, res, () => cached('mp', 15e3, svc.marketPulse)));
+app.get('/api_be/data/sector_scope', async (q, res) => serve(q, res, () => cached('ss', 60e3, svc.sectorScope)));
 // Kept after the /index-mover PAGE was removed, because it is not only that page's endpoint:
 // Option Apex embeds a point-contribution panel that reads it (see web/lib/apex.ts). Deleting
 // it would not have thrown anything — that panel catches its own failure and renders as
 // absent — so the symptom would have been Option Apex quietly losing a section.
 app.get('/api_be/data/order/indice_point_movement', async (req, res) => {
   const idx = String(req.query.index || 'NIFTY 50');
-  send(res, await cached('im:' + idx, 60e3, () => svc.indexMover(idx)));
+  await serve(req, res, () => cached('im:' + idx, 60e3, () => svc.indexMover(idx)));
 });
 
 // ---- Option Clock ----
@@ -81,37 +113,30 @@ function params(q: unknown): Record<string, string> {
   } catch { return {}; }
 }
 
-// Option data has no mock: a fabricated OI ladder is indistinguishable from a real one
-// at a glance and would be read as a trading signal. Better to say it's unavailable.
-const sendOi = async <T>(res: express.Response, run: () => Promise<Result<T>>) => {
-  try { send(res, await run()); }
-  catch (e) { res.status(502).json({ status: 'ERROR', error: String((e as Error).message) }); }
-};
-
 // Served by clock.ts, which reads the OI ladder — including its history through the
 // session — straight from Upstox. The payload shapes are unchanged from when this was
 // backed by NSE plus a local recording.
 app.get('/api_be/index_analysis/get_running_expiry', async (req, res) => {
   const { script = clock.DEFAULT_SCRIPT } = params(req.query.data);
-  await sendOi(res, () => cached('exp:' + script, 300e3, () => clock.runningExpiry(script)));
+  await serve(req, res, () => cached('exp:' + script, 300e3, () => clock.runningExpiry(script)));
 });
 
 // Trading days the picker offers, newest first.
 app.get('/api_be/index_analysis/trading_days', async (req, res) => {
   const { script = clock.DEFAULT_SCRIPT, exp } = params(req.query.data);
-  await sendOi(res, () => cached(`days:${script}:${exp}`, 60e3, () => clock.availableDays(script, exp)));
+  await serve(req, res, () => cached(`days:${script}:${exp}`, 60e3, () => clock.availableDays(script, exp)));
 });
 
 app.get('/api_be/index_analysis/live_oi', async (req, res) => {
   const { script = clock.DEFAULT_SCRIPT, exp, day } = params(req.query.data);
-  await sendOi(res, () => cached(`oi:${script}:${exp}:${day ?? ''}`, 30e3, () => clock.liveOi(script, exp, day)));
+  await serve(req, res, () => cached(`oi:${script}:${exp}:${day ?? ''}`, 30e3, () => clock.liveOi(script, exp, day)));
 });
 
 // PCR through the session at a fixed step (default 10 minutes) — the trend table.
 app.get('/api_be/index_analysis/pcr_series', async (req, res) => {
   const { script = clock.DEFAULT_SCRIPT, exp, step, day } = params(req.query.data);
   const every = Number(step) || 600;
-  await sendOi(res, () =>
+  await serve(req, res, () =>
     cached(`pcr:${script}:${exp}:${every}:${day ?? ''}`, 30e3, () => clock.pcrSeries(script, exp, every, day)));
 });
 
@@ -122,7 +147,7 @@ app.get('/api_be/index_analysis/index_analysis', async (req, res) => {
   // resolves to isn't today's date.
   const from = Number(ts1) || 0;
   const to = Number(ts2) || Number.MAX_SAFE_INTEGER;
-  await sendOi(res, () =>
+  await serve(req, res, () =>
     cached(`ia:${script}:${exp}:${from}:${to}:${day ?? ''}`, 30e3, () => clock.indexAnalysis(script, exp, from, to, day)));
 });
 
@@ -132,7 +157,7 @@ app.get('/api_be/index_analysis/index_analysis', async (req, res) => {
 // it under both namespaces and the page shouldn't have to know that.
 app.get('/api_be/money_flux/get_running_expiry', async (req, res) => {
   const { script = clock.DEFAULT_SCRIPT } = params(req.query.data);
-  await sendOi(res, () => cached('exp:' + script, 300e3, () => clock.runningExpiry(script)));
+  await serve(req, res, () => cached('exp:' + script, 300e3, () => clock.runningExpiry(script)));
 });
 
 // Timeframe in minutes, off the page's Time selector. Anything unrecognised falls back
@@ -145,19 +170,19 @@ const tf = (v: unknown): apex.Timeframe => {
 app.get('/api_be/money_flux/chart', async (req, res) => {
   const { script = clock.DEFAULT_SCRIPT, exp, tf: t } = params(req.query.data);
   const iv = tf(t);
-  await sendOi(res, () => cached(`ch:${script}:${iv}`, 30e3, () => apex.chart(script, iv, exp)));
+  await serve(req, res, () => cached(`ch:${script}:${iv}`, 30e3, () => apex.chart(script, iv, exp)));
 });
 
 app.get('/api_be/money_flux/op_histogram', async (req, res) => {
   const { script = clock.DEFAULT_SCRIPT, exp, tf: t, day } = params(req.query.data);
   const iv = tf(t);
-  await sendOi(res, () => cached(`fx:${script}:${exp ?? ''}:${iv}:${day ?? ''}`, 30e3, () => apex.flux(script, exp, iv, day)));
+  await serve(req, res, () => cached(`fx:${script}:${exp ?? ''}:${iv}:${day ?? ''}`, 30e3, () => apex.flux(script, exp, iv, day)));
 });
 
 app.get('/api_be/money_flux/op_dial', async (req, res) => {
   const { script = clock.DEFAULT_SCRIPT, exp, tf: t, day } = params(req.query.data);
   const iv = tf(t);
-  await sendOi(res, () =>
+  await serve(req, res, () =>
     cached(`dl:${script}:${exp ?? ''}:${iv}:${day ?? ''}`, 30e3, () => apex.dial(script, exp, day, iv)));
 });
 
@@ -170,5 +195,11 @@ app.get('/health/volume', async (_q, res) => {
   res.json({ ok: true, historyDays: await historyDepth(), symbolsWithAvg: Object.keys(avg).length });
 });
 
+
+// A backstop, not a strategy: every route above already turns a failure into a 502. This
+// catches what no route can — a rejection from a background job (the two schedulers, a
+// fire-and-forget snapshot write) — because Node's default for an unhandled rejection is to
+// exit, and a market-data server going dark is a far worse outcome than a logged error.
+process.on('unhandledRejection', (e) => console.error('[api] unhandled rejection:', e));
 
 app.listen(PORT, () => console.log(`\n  TradeFinder API  →  http://localhost:${PORT}\n`));

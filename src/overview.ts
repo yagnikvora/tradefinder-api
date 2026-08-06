@@ -15,6 +15,7 @@ import { allQuotes, fnoSymbols, type EquityQuote } from './equity.js';
 import { HEADLINE_INDICES, MARQUEE } from './indices.js';
 import { INSTRUMENT_KEY, sessionCandles } from './upstox.js';
 import { marketOpen, type Result } from './services.js';
+import { remember, recall, ageLabel } from './snapshot.js';
 
 const IST_OFFSET_S = 330 * 60;
 const dayOf = (epochS: number) => new Date((epochS + IST_OFFSET_S) * 1000).toISOString().slice(0, 10);
@@ -103,47 +104,47 @@ async function lastSession(today: string): Promise<{ day: string; bars: number[]
 
 export async function overview(): Promise<Result<Overview>> {
   const open = marketOpen();
-  const quotes = await allQuotes(open);
 
-  const ticker: TickerRow[] = [];
-  let vix: TickerRow | null = null;
-  for (const m of MARQUEE) {
-    const q = quotes.get(m.name);
-    if (!q) continue;
-    const r = row(m.name, m.label, q);
-    if (m.name === 'INDIA VIX') vix = r; else ticker.push(r);
-  }
-  if (!ticker.length) throw new Error('no index quotes available');
+  try {
+    const quotes = await allQuotes(open);
 
-  // The session the numbers belong to, taken from the index's own candles rather than the
-  // calendar — on a weekend or a holiday those disagree.
-  const today = dayOf(Math.floor(Date.now() / 1000));
-  const { day, bars: nifty } = await lastSession(today);
+    const ticker: TickerRow[] = [];
+    let vix: TickerRow | null = null;
+    for (const m of MARQUEE) {
+      const q = quotes.get(m.name);
+      if (!q) continue;
+      const r = row(m.name, m.label, q);
+      if (m.name === 'INDIA VIX') vix = r; else ticker.push(r);
+    }
+    if (!ticker.length) throw new Error('no index quotes available');
 
-  const headline: HeadlineIndex[] = [];
-  for (const name of HEADLINE_INDICES) {
-    const q = quotes.get(name);
-    const m = MARQUEE.find((x) => x.name === name);
-    if (!q || !m) continue;
-    headline.push({
-      ...row(name, m.label, q),
-      open: q.open, dayHigh: q.dayHigh, dayLow: q.dayLow, prevClose: q.prevClose,
-      spark: name === 'NIFTY 50' && nifty.length ? nifty : await spark(name, day, today),
-    });
-  }
+    // The session the numbers belong to, taken from the index's own candles rather than the
+    // calendar — on a weekend or a holiday those disagree.
+    const today = dayOf(Math.floor(Date.now() / 1000));
+    const { day, bars: nifty } = await lastSession(today);
 
-  // Breadth and movers over the F&O universe — the same set Market Pulse scans, so the
-  // home page and that page can never disagree about who is up.
-  const universe = new Set(await fnoSymbols());
-  const stocks = [...quotes.values()].filter((q) => universe.has(q.Symbol));
-  const advances = stocks.filter((q) => q.pChange > 0).length;
-  const declines = stocks.filter((q) => q.pChange < 0).length;
+    const headline: HeadlineIndex[] = [];
+    for (const name of HEADLINE_INDICES) {
+      const q = quotes.get(name);
+      const m = MARQUEE.find((x) => x.name === name);
+      if (!q || !m) continue;
+      headline.push({
+        ...row(name, m.label, q),
+        open: q.open, dayHigh: q.dayHigh, dayLow: q.dayLow, prevClose: q.prevClose,
+        spark: name === 'NIFTY 50' && nifty.length ? nifty : await spark(name, day, today),
+      });
+    }
 
-  const byPct = [...stocks].sort((a, b) => b.pChange - a.pChange);
+    // Breadth and movers over the F&O universe — the same set Market Pulse scans, so the
+    // home page and that page can never disagree about who is up.
+    const universe = new Set(await fnoSymbols());
+    const stocks = [...quotes.values()].filter((q) => universe.has(q.Symbol));
+    const advances = stocks.filter((q) => q.pChange > 0).length;
+    const declines = stocks.filter((q) => q.pChange < 0).length;
 
-  return {
-    source: 'upstox',
-    data: {
+    const byPct = [...stocks].sort((a, b) => b.pChange - a.pChange);
+
+    const data: Overview = {
       day,
       live: open,
       ticker,
@@ -153,6 +154,21 @@ export async function overview(): Promise<Result<Overview>> {
       gainers: byPct.slice(0, 6).map(mover),
       losers: byPct.slice(-6).reverse().map(mover),
       active: [...stocks].sort((a, b) => b.turnover - a.turnover).slice(0, 6).map(mover),
-    },
-  };
+    };
+    return { source: 'upstox', data: await remember('overview', data) };
+  } catch (e) {
+    // Same bargain Market Pulse and Sector Scope already make: one Upstox timeout must not
+    // blank the home page. Re-serve the last real board, flagged as stale — but never invent
+    // one, because there is no mock overview and a fabricated ticker reads as live prices.
+    const prev = await recall<Overview>('overview');
+    if (!prev) throw e;
+    return {
+      source: 'stale',
+      error: `Upstox unreachable, showing last live data (${ageLabel(prev.ageMs)} old)`,
+      // `live` is the page's own badge, so it takes the current session rather than the one
+      // the snapshot was captured in — otherwise a board saved at 14:00 still claims LIVE
+      // the next morning.
+      data: { ...prev.data, live: open },
+    };
+  }
 }
