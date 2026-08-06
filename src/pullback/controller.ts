@@ -23,6 +23,7 @@ import { breakerState } from '../momentum/data/throttle.js';
 import { alertStatus, alerts } from './alerts/alert.engine.js';
 import { sendTelegram, telegramConfigured, telegramStatus } from './alerts/telegram.js';
 import { sendDiscord, discordConfigured, discordStatus } from './alerts/discord.js';
+import { schedulerStatus } from './scheduler.js';
 import { backtest } from './backtest/backtest.engine.js';
 import { configRepository } from './config/config.repository.js';
 import { barsOf, ensureSeed, frameStore, framesFor, readFrames } from './data/frames.js';
@@ -235,6 +236,13 @@ export function pullbackRouter(): express.Router {
     const symbols = [...store.symbols.values()];
     send(res, {
       marketOpen: marketOpen(),
+      // Whether the background jobs are actually ticking, and when they last did.
+      //
+      // `schedulerStatus()` has always existed and was never reported, which left the one question
+      // that matters unanswerable from outside: a scanner whose timers never started looks exactly
+      // like a market with no setups — both are an empty board and a silent phone. `lastScanAt`
+      // going stale during a session is the symptom to watch for.
+      scheduler: schedulerStatus(),
       configVersion: cfg.version,
       configUpdatedAt: cfg.updatedAt,
       seed: {
@@ -253,7 +261,6 @@ export function pullbackRouter(): express.Router {
     }, 'upstox');
   });
 
-  // ------------------------------------------------- POST /pullback/seed/rebuild ----
   // ------------------------------------------------ POST /pullback/alerts/test ----
   //
   // Sends one message to the phone, so the channel can be proved end to end without waiting for a
