@@ -972,6 +972,26 @@ export interface PullbackConfig {
     dedupeMin: number;
     /** POSTed a JSON body per alert. Empty disables the webhook. */
     webhookUrl: string;
+    /**
+     * The PHONE channel, and deliberately a narrower gate than the feed above.
+     *
+     * The in-app strip wants everything — it is a log you choose to look at. A push notification
+     * is an interruption you did not choose, and the two cannot share a threshold: a channel that
+     * buzzes for every `Weak` near-miss gets muted within a day, and muting it costs the one
+     * alert that mattered. So the feed keeps `kinds`, and only what passes BOTH filters here
+     * reaches the phone.
+     *
+     * The credentials are NOT here. They live in the environment, because this whole object is
+     * served by `GET /pullback/config` — a bot token in it would be readable by anything that can
+     * reach the API.
+     */
+    push: {
+      enabled: boolean;
+      /** Which events are worth an interruption. Default is confirmed entries only. */
+      kinds: AlertKind[];
+      /** Confidence floor, read against `score.bands`. An event with no score never passes. */
+      minBand: ConfidenceBand;
+    };
   };
 
   refresh: {

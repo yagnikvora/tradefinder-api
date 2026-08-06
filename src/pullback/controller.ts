@@ -21,6 +21,8 @@ import { cache, single } from '../momentum/cache.js';
 import { CANDLE_ENDPOINT } from '../momentum/data/candles.js';
 import { breakerState } from '../momentum/data/throttle.js';
 import { alertStatus, alerts } from './alerts/alert.engine.js';
+import { sendTelegram, telegramConfigured, telegramStatus } from './alerts/telegram.js';
+import { sendDiscord, discordConfigured, discordStatus } from './alerts/discord.js';
 import { backtest } from './backtest/backtest.engine.js';
 import { configRepository } from './config/config.repository.js';
 import { barsOf, ensureSeed, frameStore, framesFor, readFrames } from './data/frames.js';
@@ -252,6 +254,43 @@ export function pullbackRouter(): express.Router {
   });
 
   // ------------------------------------------------- POST /pullback/seed/rebuild ----
+  // ------------------------------------------------ POST /pullback/alerts/test ----
+  //
+  // Sends one message to the phone, so the channel can be proved end to end without waiting for a
+  // live signal — which, outside market hours, would mean waiting until tomorrow. It bypasses the
+  // market-hours gate on purpose: this is a plumbing check, not an alert.
+  router.post('/alerts/test', async (_req, res) => {
+    if (!telegramConfigured() && !discordConfigured())
+      return fail(res, 503, 'No phone channel is configured', {
+        hint: 'set PULLBACK_TELEGRAM_BOT_TOKEN + PULLBACK_TELEGRAM_CHAT_ID and/or PULLBACK_DISCORD_WEBHOOK_URL in api/.env, then restart the API',
+      });
+
+    const cfg = await configRepository.get();
+    const lines = (b: (s: string) => string) => [
+      `✅ ${b('TradeFinder alerts are wired up.')}`,
+      '',
+      `You will be messaged on: ${b(cfg.alerts.push.kinds.join(', '))}`,
+      `Confidence floor: ${b(`${cfg.alerts.push.minBand} or better`)}`,
+      'Only during market hours, 09:15 AM – 03:30 PM IST.',
+    ].join('\n');
+
+    // Both are attempted even if the first fails — the point of two channels is that they are
+    // independent, and a test that stopped at the first failure could not show you that.
+    const [tg, dc] = await Promise.all([
+      telegramConfigured() ? sendTelegram(lines((s) => `<b>${s}</b>`)) : Promise.resolve(null),
+      discordConfigured() ? sendDiscord(lines((s) => `**${s}**`)) : Promise.resolve(null),
+    ]);
+
+    const result = {
+      telegram: tg === null ? { skipped: 'not configured' } : { sent: tg, ...telegramStatus() },
+      discord: dc === null ? { skipped: 'not configured' } : { sent: dc, ...discordStatus() },
+    };
+    // Any configured channel failing is a failure: a half-delivered test is exactly the state
+    // this endpoint exists to reveal.
+    if (tg === false || dc === false) return fail(res, 502, 'A configured channel refused the message', result);
+    send(res, result, 'upstox');
+  });
+
   // ~215 upstream requests, so it answers immediately and builds behind the response rather than
   // holding a connection open for the minute or so it takes.
   router.post('/seed/rebuild', async (_req, res) => {

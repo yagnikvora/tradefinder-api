@@ -9,8 +9,11 @@
 // The store is shared with the momentum module — `momentum/store.ts` is a driver, not that
 // module's private state — under its own key, so the two modules' configs cannot collide.
 
-import type { PullbackConfig, Knot, Timeframe } from '../types.js';
+import type { AlertKind, ConfidenceBand, PullbackConfig, Knot, Timeframe } from '../types.js';
 import { TIMEFRAMES } from '../types.js';
+
+const ALERT_KINDS: AlertKind[] = ['freshPullback', 'trendResume', 'emaRejection', 'targetHit', 'stopHit'];
+const BANDS: ConfidenceBand[] = ['Weak', 'Medium', 'Strong', 'Excellent'];
 import { defaultConfig } from './defaults.js';
 import { store, type KeyValueStore } from '../../momentum/store.js';
 
@@ -214,6 +217,17 @@ export function sanitise(cfg: PullbackConfig): PullbackConfig {
   cfg.alerts.keep = Math.round(clampNumber(cfg.alerts.keep, 10, 5000, 300));
   cfg.alerts.dedupeMin = clampNumber(cfg.alerts.dedupeMin, 0, 375, 10);
   cfg.alerts.webhookUrl = String(cfg.alerts.webhookUrl ?? '').trim();
+
+  // The push block, defensively: a config stored before this existed merges the defaults in, but a
+  // hand-edited one can still arrive with `kinds: []` — which reads as "push is on" while being
+  // incapable of ever sending, the most confusing of the possible wrong states.
+  const push = cfg.alerts.push ?? { enabled: true, kinds: ['trendResume'], minBand: 'Strong' };
+  const kinds = Array.isArray(push.kinds) ? push.kinds.filter((k) => ALERT_KINDS.includes(k)) : [];
+  cfg.alerts.push = {
+    enabled: !!push.enabled,
+    kinds: kinds.length ? [...new Set(kinds)] : ['trendResume'],
+    minBand: BANDS.includes(push.minBand) ? push.minBand : 'Strong',
+  };
 
   // A scan faster than 10s would spend the quote budget confirming that a 3-minute bar has not
   // closed yet; slower than 5 minutes and a 3-minute signal is stale before it is published.

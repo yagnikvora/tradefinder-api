@@ -29,9 +29,13 @@
 // counted and reported on `/pullback/status` rather than thrown.
 
 import type {
-  AlertEvent, AlertKind, PullbackConfig, PullbackRow, PullbackSignal, SignalRecord, Timeframe,
+  AlertEvent, AlertKind, ConfidenceBand, PullbackConfig, PullbackRow, PullbackSignal, SignalRecord,
+  Timeframe,
 } from '../types.js';
 import { ALERT_LABEL, TIMEFRAME_LABEL } from '../types.js';
+import { marketOpen } from '../../momentum/session.js';
+import * as telegram from './telegram.js';
+import * as discord from './discord.js';
 
 /** The ring, newest last. Bounded by `alerts.keep`. */
 let ring: AlertEvent[] = [];
@@ -49,12 +53,51 @@ const key = (symbol: string, tf: Timeframe, kind: AlertKind, dir: 1 | -1): strin
 
 const phaseKey = (symbol: string, tf: Timeframe): string => `${symbol}|${tf}`;
 
+/**
+ * Confidence bands, weakest first — so "Strong or better" is an index comparison rather than four
+ * hand-written cases that have to be kept in step with the band names.
+ */
+const BAND_ORDER: ConfidenceBand[] = ['Weak', 'Medium', 'Strong', 'Excellent'];
+
+/** The band a score falls in, read against the SAME cutoffs the scorer used. */
+const bandOf = (score: number, b: PullbackConfig['score']['bands']): ConfidenceBand =>
+  score >= b.excellent ? 'Excellent' : score >= b.strong ? 'Strong' : score >= b.medium ? 'Medium' : 'Weak';
+
+/** Whether this event has earned an interruption. Deliberately stricter than the in-app feed. */
+function passesPush(cfg: PullbackConfig, e: AlertEvent): boolean {
+  const p = cfg.alerts.push;
+  if (!p?.enabled || !p.kinds.includes(e.kind)) return false;
+  // No score means nothing to judge, and "unknown confidence" is not "high confidence".
+  if (e.score == null) return false;
+  return BAND_ORDER.indexOf(bandOf(e.score, cfg.score.bands)) >= BAND_ORDER.indexOf(p.minBand);
+}
+
 function emit(
   cfg: PullbackConfig,
   e: Omit<AlertEvent, 'id'>,
   dir: 1 | -1,
+  /**
+   * The signal behind this event, when there is one. Carried rather than a pre-rendered string
+   * because each channel renders it in its own markup — and because the phone message needs the
+   * option contract and the per-lot figures, which the `AlertEvent` does not hold.
+   */
+  signal?: PullbackSignal,
 ): AlertEvent | null {
   if (!cfg.alerts.enabled || !cfg.alerts.kinds.includes(e.kind)) return null;
+
+  // NOTHING IS ALERTED OUTSIDE MARKET HOURS, and this is the single point that guarantees it.
+  //
+  // The scheduler already gates its scans on `marketOpen`, but it is not the only thing that
+  // scans: `currentBoard()` runs a full scan on demand for any HTTP request whose cached board has
+  // expired, at any hour. So opening the scanner page at 10pm ran a scan, and because phase memory
+  // is per-process, a scan after a restart sees `previous === undefined` for every row and treats
+  // the entire board's resting state as a fresh transition. That fired one alert per row at once,
+  // six hours after the close — harmless in a strip you can scroll past, and the fastest possible
+  // way to get a phone channel muted.
+  //
+  // Gating on the event's own timestamp rather than on the caller means no future call path can
+  // reintroduce it.
+  if (!marketOpen(e.at)) return null;
 
   const k = key(e.symbol, e.timeframe, e.kind, dir);
   const prev = lastSent.get(k);
@@ -66,7 +109,26 @@ function emit(
   if (ring.length > cfg.alerts.keep) ring.splice(0, ring.length - cfg.alerts.keep);
 
   void post(cfg, event);
+  if (passesPush(cfg, event)) void pushAll(event, signal);
   return event;
+}
+
+/**
+ * Fan the event out to every configured phone channel.
+ *
+ * Each renders the SAME content in its own markup, and each is awaited only by its own catch — one
+ * channel being down or slow must not stop the other from delivering. That redundancy is the whole
+ * reason for having two: a single channel that fails silently is a missed trade you never hear
+ * about, and both have to fail together for that to happen now.
+ */
+function pushAll(event: AlertEvent, signal?: PullbackSignal): void {
+  if (telegram.telegramConfigured())
+    void telegram.sendTelegram(signal ? telegram.signalMessage(signal) : telegram.eventMessage(event));
+  if (discord.discordConfigured())
+    void discord.sendDiscord(
+      signal ? discord.signalMessage(signal) : discord.eventMessage(event),
+      event.direction,
+    );
 }
 
 /** POST the event, never throwing. A dead webhook must not be able to slow the scan. */
@@ -175,7 +237,9 @@ export function fromSignal(signal: PullbackSignal, cfg: PullbackConfig, nowMs: n
       '.',
     signalId: signal.id,
     score: signal.score.total,
-  }, signal.direction);
+    // The phone gets the full trade — contract, cost per lot, and what a lot makes or loses —
+    // because the whole point of the notification is to be actionable without opening the app.
+  }, signal.direction, signal);
 }
 
 /** A settled outcome, from the tracker. */
@@ -209,10 +273,14 @@ export function alerts(opts: { since?: number; kind?: AlertKind | null; limit?: 
   return out.slice(0, opts.limit ?? 100);
 }
 
-export const alertStatus = (): { held: number; webhookFailures: number; lastWebhookError: string | null } => ({
+export const alertStatus = () => ({
   held: ring.length,
   webhookFailures,
   lastWebhookError,
+  // A push channel that has quietly stopped working looks exactly like a quiet market, so its
+  // health is reported rather than left to be inferred from an absence of notifications.
+  telegram: telegram.telegramStatus(),
+  discord: discord.discordStatus(),
 });
 
 /** Test seam, and what the day roll calls so yesterday's phases cannot fire today's alerts. */

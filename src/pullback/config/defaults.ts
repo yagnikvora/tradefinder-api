@@ -215,6 +215,15 @@ export const DEFAULT_CONFIG: PullbackConfig = {
     keep: 300,
     dedupeMin: 10,
     webhookUrl: '',
+    // Confirmed entries only, Strong or better. `freshPullback` is the more USEFUL alert to watch
+    // on screen — it is earlier — but it fires before the confirmation candle and a fair share of
+    // them fail, which is the wrong trade for something that interrupts you. `trendResume` means
+    // the turn actually printed on volume.
+    push: {
+      enabled: true,
+      kinds: ['trendResume'],
+      minBand: 'Strong',
+    },
   },
 
   refresh: {
