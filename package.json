@@ -13,6 +13,7 @@
     "check-upstox": "tsx tools/upstox-validate.ts",
     "check-momentum": "tsx tools/momentum-validate.ts",
     "check-pullback": "tsx tools/pullback-validate.ts",
+    "demo-alert": "tsx tools/demo-alert.ts",
     "replay-trend": "tsx tools/trend-replay.ts",
     "test": "node --import tsx --test \"test/**/*.test.ts\""
   },
