@@ -238,20 +238,53 @@ export async function buildSeed(
   members: Member[],
   cfg: PullbackConfig,
   nowMs = Date.now(),
-): Promise<{ day: string; covered: number; failures: Record<string, string> }> {
+): Promise<{ day: string; covered: number; throttled: number; failures: Record<string, string> }> {
   const today = istDay(nowMs);
   const yesterday = isoDaysBefore(1, today);
   const from = isoDaysBefore(SEED_DAYS, today);
   const s = frameStore(nowMs);
   const failures: Record<string, string> = {};
   let covered = 0;
+  /**
+   * Symbols this pass could not reach because the budget was gone, as opposed to because Upstox
+   * will not serve them.
+   *
+   * The distinction is what lets the caller decide whether retrying is worth anything, and there is
+   * no way to recover it from `failures` without matching on message text. A throttled symbol will
+   * succeed in the next window; one with fourteen days and no candles will fail identically
+   * forever, and a scheduler that cannot tell them apart either gives up with the board three
+   * quarters lit or retries a permanent failure every five minutes for the rest of the session.
+   */
+  let throttled = 0;
 
   await inBatches(members, SEED_BATCH, async (m) => {
+    /**
+     * ALREADY DONE IS DONE, and without this the build cannot converge on a constrained budget.
+     *
+     * A seed is 212 requests against a 2000-per-30-minute ceiling shared with the resync tier and
+     * with anything else reading candles. When the budget is tight the build gets part way — 105 of
+     * 212 on the session this was written for — and stops. The retry five minutes later then
+     * started again from the FIRST symbol, re-fetched the 105 it already had, and ran out at
+     * roughly the same place. It repeated that indefinitely: a board permanently half dark, no
+     * error anywhere, and a `covered` figure that looked like steady progress and was the same 105
+     * symbols every time.
+     *
+     * Skipping what is already seeded through the target day turns that loop into a walk. The
+     * second pass spends its budget on the symbols the first could not reach, and coverage
+     * accumulates across as many windows as it needs.
+     */
+    const existing = s.symbols.get(m.symbol);
+    if (existing && existing.seriesKey === m.seriesKey && existing.seededThrough === yesterday) {
+      covered++;
+      return;
+    }
+
     // Once the breaker is open every remaining symbol would fail identically. Skipping them
     // keeps the build honest about why it stopped and stops it spending the next window's
     // budget too — the lesson `momentum/data/throttle.ts` was written for.
     if (throttledFor(CANDLE_ENDPOINT, Date.now()) > 0) {
       failures[m.symbol] = 'skipped — Upstox candle endpoint rate limited';
+      throttled++;
       return;
     }
     try {
@@ -267,18 +300,33 @@ export async function buildSeed(
       f.caughtUp = false;
       covered++;
     } catch (e) {
-      failures[m.symbol] = String((e as Error).message);
+      const message = String((e as Error).message);
+      failures[m.symbol] = message;
+      if (message.includes('429') || message.includes('rate limited')) throttled++;
     }
   });
 
   s.seedFailures = failures;
   s.seedBuiltAt = nowMs;
 
-  // Keeping an older seed beats overwriting it with a throttled fragment — the same rule
-  // `baseline.ts` applies. A seed covering eight symbols is not a seed.
-  if (covered >= members.length * 0.5) await writeSeed(yesterday, s);
+  /**
+   * PARTIAL PROGRESS IS PERSISTED, which is the opposite of what this did and the change follows
+   * directly from the skip above.
+   *
+   * The old rule was "keep an older seed rather than overwrite it with a throttled fragment", at a
+   * 50% bar. That was right when a rebuild started from scratch every time — a fragment really was
+   * worth less than yesterday's complete seed. It is wrong now that coverage ACCUMULATES: the store
+   * is a superset of whatever was loaded from disk for this day, so writing it back can only ever
+   * add symbols, and refusing to write until 50% means a build that reaches 49% loses all of it to
+   * the next restart and starts again from nothing. That is exactly the loop observed — 105 of 212,
+   * repeatedly, for hours.
+   *
+   * The floor stays, at a quarter rather than a half, purely to stop a build that failed on its
+   * first batch from replacing a good seed with a handful of symbols.
+   */
+  if (covered >= members.length * 0.25) await writeSeed(yesterday, s);
 
-  return { day: yesterday, covered, failures };
+  return { day: yesterday, covered, throttled, failures };
 }
 
 /** Kick a seed build, collapsing concurrent callers onto one run. */

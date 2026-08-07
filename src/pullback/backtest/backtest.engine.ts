@@ -44,7 +44,8 @@ import { readPullback } from '../engine/pullback.service.js';
 import { evaluateSignal } from '../engine/signal.service.js';
 import { readTrend } from '../engine/trend.service.js';
 import type {
-  BacktestRequest, BacktestResult, BacktestTrade, ConfidenceBand, PullbackConfig, Timeframe,
+  BacktestRequest, BacktestResult, BacktestTrade, ConfidenceBand, PullbackConfig, TargetPlan,
+  PullbackSignal, StopPlan, Timeframe, TimeframeRead, TradeDiagnostics,
 } from '../types.js';
 
 /** Upstox serves at most a 30-day range of 1-minute candles per request. */
@@ -65,6 +66,48 @@ interface OpenTrade {
   band: ConfidenceBand;
   mfe: number;
   mae: number;
+  diagnostics: TradeDiagnostics;
+}
+
+/** Flatten one fired signal's readings. See `BacktestTrade.diagnostics` for why. */
+function diagnose(
+  s: PullbackSignal,
+  read: TimeframeRead,
+  plan: { stop: StopPlan; target: TargetPlan },
+  bar: Bar,
+): TradeDiagnostics {
+  const atr = read.atr;
+  const zone = s.pullback.zone;
+  // How far the entry sits beyond the near edge of the zone, signed with the trade. Positive means
+  // price has already left the band the pullback was measured into — the entry is no longer AT the
+  // level, it is above it.
+  const extension = zone && atr && atr > 0
+    ? +(((s.direction === 1 ? s.entry - zone.top : zone.bottom - s.entry) / atr).toFixed(3))
+    : null;
+  const impulse = s.pullback.impulse;
+
+  return {
+    minute: bar.minute,
+    entryDriftR: s.entryDriftR,
+    confirmationAgeBars: s.pullback.confirmation?.barsAgo ?? 0,
+    pattern: s.pullback.confirmation?.pattern ?? 'none',
+    confirmationVolumeRatio: s.pullback.confirmation?.volumeRatio ?? null,
+    retracement: s.pullback.retracement,
+    impulseAtr: impulse && impulse.atr > 0
+      ? +(Math.abs(impulse.toPrice - impulse.fromPrice) / impulse.atr).toFixed(2)
+      : null,
+    vwapAtr: read.distance.vwapAtr === null ? null : +(read.distance.vwapAtr * s.direction).toFixed(2),
+    extensionAtr: extension,
+    adx: read.adx.adx,
+    adxRising: read.adx.rising,
+    trendStrength: s.trend.strength,
+    aligned: s.alignedWith.length,
+    stopKind: plan.stop.recommended.kind,
+    stopAtr: plan.stop.recommended.distanceAtr,
+    stopPct: plan.stop.recommended.distancePct,
+    atrPct: atr && atr > 0 && s.entry > 0 ? +((atr / s.entry) * 100).toFixed(3) : null,
+    roomR: plan.target.roomR,
+  };
 }
 
 /**
@@ -106,7 +149,38 @@ async function fetchSeries(
   }
 
   oneMinute.sort((a, b) => a.at - b.at);
-  return { bars: timeframe === 1 ? oneMinute : resample(oneMinute, timeframe), warnings };
+  return { bars: oneMinute, warnings };
+}
+
+/**
+ * The higher timeframes' bars, and a cursor that keeps them honest about the clock.
+ *
+ * The live scanner reads every computed timeframe on every scan, so a 5-minute signal is scored
+ * with the 15-minute frame beside it and collects the alignment bonus when the two agree. The
+ * replay used to hand `evaluateSignal` a `frames` map containing only the signal timeframe, which
+ * was described as a lower bound and is really a DIFFERENT STRATEGY: the bonus is worth up to two
+ * aligned timeframes × `alignmentBonus` inside a 30-point component, which is enough to move a row
+ * across `minToSignal` — so the replay refused setups the live scanner takes, and every threshold
+ * tuned against the replay was tuned against the wrong sample.
+ *
+ * The lookahead this invites is the whole reason it needs a type. A 15-minute bar opening at 09:45
+ * does not exist until 10:00, and letting a 09:50 signal read it would hand the replay the next ten
+ * minutes of the chart. `upTo` therefore admits a context bar only once its CLOSE is at or before
+ * the signal bar's close.
+ */
+interface ContextFrame {
+  timeframe: Timeframe;
+  bars: Bar[];
+  /** How many of `bars` have closed as of the cursor. Advances monotonically with the walk. */
+  count: number;
+}
+
+const closesAt = (b: Bar, tf: Timeframe): number => b.at + tf * 60_000;
+
+function advance(frames: ContextFrame[], signalBarCloseMs: number): void {
+  for (const f of frames) {
+    while (f.count < f.bars.length && closesAt(f.bars[f.count], f.timeframe) <= signalBarCloseMs) f.count++;
+  }
 }
 
 /**
@@ -123,12 +197,37 @@ export async function backtest(
   cfg: PullbackConfig,
 ): Promise<BacktestResult> {
   const { bars, warnings } = await fetchSeries(instrumentKey, req.from, req.to, req.timeframe);
+  return replay(bars, req, lotSize, cfg, warnings);
+}
+
+/**
+ * The replay itself, over bars already in hand.
+ *
+ * Split out from `backtest` so the fetch and the walk are separable: a sweep that evaluates ten
+ * configs over the same history must not pay for the candles ten times, and — more importantly —
+ * every config in that sweep has to see the IDENTICAL bar array, or the comparison is measuring
+ * two different samples as well as two different strategies.
+ */
+export function replay(
+  oneMinute: Bar[],
+  req: BacktestRequest,
+  lotSize: number | null,
+  cfg: PullbackConfig,
+  warnings: string[] = [],
+): BacktestResult {
+  const bars = req.timeframe === 1 ? oneMinute.filter((b) => b.minute >= 0) : resample(oneMinute, req.timeframe);
 
   if (bars.length < WARMUP_BARS / 2)
     return emptyResult(req, [
       ...warnings,
       `only ${bars.length} ${req.timeframe}-minute bars were served for this range — not enough to warm a 200-period average`,
     ]);
+
+  // Every context timeframe above the one being signalled on, so the alignment bonus is awarded
+  // here exactly as it is live.
+  const context: ContextFrame[] = cfg.timeframes.context
+    .filter((tf) => tf > req.timeframe)
+    .map((tf) => ({ timeframe: tf, bars: resample(oneMinute, tf), count: 0 }));
 
   const trades: BacktestTrade[] = [];
   const cooldownMs = cfg.pullback.cooldownMin * 60_000;
@@ -200,6 +299,16 @@ export async function backtest(
       bars: window, series, timeframe: req.timeframe, direction, avgVolume: read.avgVolume, cfg,
     });
 
+    // The context frames as of THIS bar's close and no later. `advance` is what enforces that; a
+    // 15-minute bar covering 09:45–10:00 is invisible to a 09:50 signal.
+    advance(context, closesAt(bar, req.timeframe));
+    const contextReads: Partial<Record<Timeframe, TimeframeRead>> = { [req.timeframe]: read };
+    for (const f of context) {
+      if (f.count < cfg.timeframes.minBars) continue;
+      const slice = f.bars.slice(Math.max(0, f.count - MAX_BARS), f.count);
+      contextReads[f.timeframe] = readFromBars(slice, f.timeframe, cfg);
+    }
+
     const result = evaluateSignal({
       symbol: req.symbol,
       timeframe: req.timeframe,
@@ -208,9 +317,7 @@ export async function backtest(
       trend,
       pullback,
       // Only this timeframe is replayed, so no higher one can be aligned. That makes every score
-      // here a LOWER bound on what the live scanner would have given the same setup — the
-      // alignment bonus is simply never awarded — which is the safe direction for the difference.
-      frames: { [req.timeframe]: read },
+      frames: contextReads,
       price: bar.close,
       chain: null,
       spotAdjust: 0,
@@ -235,15 +342,31 @@ export async function backtest(
       entryDay: bar.day,
       entry: s.entry,
       stop: plan.stop.recommended.price,
-      target: plan.target.primary.price,
+      target: exitPrice(plan.target, req.exitOn),
       score: s.score.total,
       band: s.score.band,
       mfe: s.entry,
       mae: s.entry,
+      diagnostics: diagnose(s, read, plan, bar),
     };
   }
 
   return summarise(req, trades, sessions.size, warnings);
+}
+
+/**
+ * Which level closes the trade.
+ *
+ * `exitOn` was part of the request shape from the start and was not read, so `POST
+ * /pullback/backtest` accepted `"1R"` and replayed the primary target anyway — a silent
+ * disagreement between what was asked and what was measured, and the worst kind, because the
+ * result looks like an answer to the question. Falling back to the primary when the named target
+ * is not on this row is deliberate: 1R always exists, but a row whose primary is a prior high has
+ * no 2R candidate to name.
+ */
+function exitPrice(target: TargetPlan, exitOn: BacktestRequest['exitOn']): number {
+  if (exitOn === 'primary') return target.primary.price;
+  return (target.candidates.find((c) => c.kind === exitOn) ?? target.primary).price;
 }
 
 function close(t: OpenTrade, bar: Bar, price: number, outcome: BacktestTrade['outcome']): BacktestTrade {
@@ -264,6 +387,7 @@ function close(t: OpenTrade, bar: Bar, price: number, outcome: BacktestTrade['ou
     band: t.band,
     mfeR: risk > 0 ? +((t.direction === 1 ? t.mfe - t.entry : t.entry - t.mfe) / risk).toFixed(2) : 0,
     maeR: risk > 0 ? +((t.direction === 1 ? t.mae - t.entry : t.entry - t.mae) / risk).toFixed(2) : 0,
+    diagnostics: t.diagnostics,
   };
 }
 

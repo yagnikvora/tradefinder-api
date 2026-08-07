@@ -49,9 +49,28 @@ export const DEFAULT_CONFIG: PullbackConfig = {
 
   timeframes: {
     computed: [1, 3, 5, 15],
-    // 1-minute is computed and not signalled on. The reasoning is in `types.ts`; the short
-    // version is that every gate in this module is measurable there and means very little.
-    signal: [3, 5, 15],
+    /**
+     * ONE SIGNAL TIMEFRAME, and this is the setting that changed the module's results most.
+     *
+     * 1-minute is computed and not signalled on for the reason `types.ts` gives: every gate here is
+     * measurable there and means very little. 3 and 15 were signalled on until a 45-symbol,
+     * 120-session replay measured them separately, and both lose money under every configuration
+     * tried — eight variants each, no sign flips:
+     *
+     *   3m    −0.03R a trade over 616 trades. The stops are a fifth of a percent wide, so
+     *         brokerage, STT and one tick of slippage are a large fraction of R. The replay does
+     *         not model those and it is STILL negative.
+     *   15m   −0.20R a trade over 86. Not a bad setup — a mismatched clock. A 15-minute pullback
+     *         takes about three hours to reach a 2R target, this module closes everything at the
+     *         session end, and fifty-five percent of these exited there rather than at a level:
+     *         six targets against sixty-seven timeouts.
+     *   5m    +0.12R a trade, and +0.21R once the entry-proximity band is applied.
+     *
+     * Both are still COMPUTED, so both still appear on the board, still veto, and still feed the
+     * alignment bonus as context. They are simply not entries. An operator who wants them back adds
+     * them here, and should read `minHoldBars` first if the one being added is 15.
+     */
+    signal: [5],
     context: [5, 15],
     // Enough for a 20 EMA to be warm and for two swings to have confirmed. The 50 and 200 have
     // their own warmth checks — this is the floor below which the timeframe is not read at all.
@@ -109,7 +128,23 @@ export const DEFAULT_CONFIG: PullbackConfig = {
     // 30 minutes, which on a 375-minute session means nothing signals after 15:00. A pullback entry
     // is a 30-to-90-minute hold; less than half an hour of session left is not that trade.
     minMinutesLeft: 30,
+    // Twelve bars of the signal timeframe: 36 minutes on a 3-minute chart, an hour on a 5, three
+    // hours on a 15. Measured holds were 53 / 81 / 158 minutes, and the 15-minute figure is itself
+    // truncated by the session ending on more than half of them.
+    minHoldBars: 12,
     rejectionAtr: 0.5,
+    // A third of the risk. Past that the published reward:risk is not the one on offer: entering
+    // 0.33R late against an unchanged stop turns a 2R plan into 1.67R and the real risk into
+    // 1.33R, which is the most a continuation entry can give away and still be the trade.
+    maxChaseR: 0.33,
+    // The entry-proximity band. Zero means "the confirmation must close clear of the zone"; one ATR
+    // is as far past it as an entry can be and still be an entry rather than a chase. Both edges
+    // were measured rather than chosen — see `PullbackConfig.pullback.minEntryExtensionAtr`.
+    minEntryExtensionAtr: 0,
+    maxEntryExtensionAtr: 0.8,
+    // Half the risk back toward the stop. The turn has un-turned; what is left is a coin flip
+    // with half a stop under it.
+    maxGiveBackR: 0.5,
   },
 
   score: {

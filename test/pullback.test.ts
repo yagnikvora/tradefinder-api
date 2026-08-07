@@ -369,9 +369,24 @@ function pullBackIntoZone(base: Bar[], c: PullbackConfig, maxBars = 12): Bar[] {
 }
 
 /** A bullish engulfing bar on expanded volume, appended to whatever came before. */
-function confirmBullish(base: Bar[], volumeRatio = 2.5): Bar[] {
+function confirmBullish(base: Bar[], volumeRatio = 2.5, extensionAtr = 0.45): Bar[] {
   const prev = base[base.length - 1];
-  const close = prev.open + Math.max(0.5, Math.abs(prev.open - prev.close) * 1.4);
+  const s = computeSeries(base);
+  const i = base.length - 1;
+  const atr = s.atr[i] ?? 0.5;
+
+  // THE CLOSE IS SIZED, not maximised, and the difference is the whole point of the
+  // entry-proximity band. The first version of this helper closed at `prev.open + max(0.5, …)`,
+  // which on this fixture's ATR put the confirmation 1.05 ATR clear of the zone — past the
+  // ceiling, and a chase rather than the textbook entry the fixture is supposed to represent. A
+  // real confirmation closes a few tenths of an ATR out of the band; that is what `extensionAtr`
+  // expresses, and a fixture that cannot be placed there is not a fixture worth testing against.
+  const values = [s.ema9[i], s.ema20[i], s.vwap[i]].filter((v): v is number => v !== null);
+  const zoneTop = Math.max(...values) + 0.2 * atr;
+  // Still strictly above the previous bar's open, so this remains an engulfing bar rather than
+  // sliding into a weaker classification and changing what the surrounding tests exercise.
+  const close = Math.max(prev.open + 0.02, zoneTop + extensionAtr * atr);
+
   const avg = base.slice(-21, -1).reduce((a, b) => a + b.volume, 0) / 20;
   const bar: Bar = {
     at: prev.at + 5 * 60_000,
@@ -688,7 +703,16 @@ describe('stops and targets', () => {
 
     // A ceiling under the swing but (where the fixture allows) over the EMA hands the trade to
     // whichever structural level still fits, rather than abandoning structure altogether.
-    const tighter = cfg((x) => { x.risk.maxStopAtr = Math.max(x.risk.atrStopMultiple, swingAtr - 0.01); });
+    //
+    // `atrStopMultiple` has to come down with the ceiling. `sanitise` floors `maxStopAtr` at the ATR
+    // multiple — the fallback stop must itself be inside the band it is the fallback for — so
+    // leaving it at 1.2 silently raises any ceiling below that, and the test then asserts a
+    // fall-through that was never actually configured.
+    const tighter = cfg((x) => {
+      x.risk.minStopAtr = 0.2;
+      x.risk.atrStopMultiple = 0.3;
+      x.risk.maxStopAtr = swingAtr - 0.01;
+    });
     const mid = buildPlan({ bars: b, read, pullback: p, direction: 1, entry, cfg: tighter })!;
     assert.notEqual(mid.stop.recommended.kind, 'swing');
     if (emaAtr <= tighter.risk.maxStopAtr) assert.equal(mid.stop.recommended.kind, 'ema');
@@ -696,7 +720,9 @@ describe('stops and targets', () => {
   });
 
   it('falls back to the ATR stop when the structural one is unaffordable, and says so', () => {
-    const c = cfg((x) => { x.risk.maxStopAtr = 0.3; });
+    // Same reason as above: the ATR multiple has to be inside the ceiling, or `sanitise` raises the
+    // ceiling to meet it and no structural stop is ever unaffordable.
+    const c = cfg((x) => { x.risk.minStopAtr = 0.2; x.risk.atrStopMultiple = 0.25; x.risk.maxStopAtr = 0.3; });
     const b = confirmBullish(pullBackIntoZone(trendingBars(), c));
     const read = readFromBars(b, 5, c);
     const p = readPullback({ bars: b, series: computeSeries(b), timeframe: 5, direction: 1, avgVolume: read.avgVolume, cfg: c });
@@ -1046,6 +1072,123 @@ describe('signal assembly', () => {
     const r = evaluate(b, c, { chain: dead })!;
     assert.equal(r.fired, true, r.signal.blockers.join(' | '));
     assert.ok((r.signal.option?.warnings.length ?? 0) > 0, 'the contract must still carry its warnings');
+  });
+
+  it('refuses a confirmation that closed back INSIDE the zone', () => {
+    // The floor of the entry-proximity band. A bar that turns green without leaving the EMA band has
+    // not ended the retracement — price is still at the level it is supposed to be leaving. Over a
+    // 120-session, 45-symbol replay this was the worst bucket of any reading in the module: 18.8%
+    // wins and −0.34R a trade.
+    const c = cfg();
+    const b = confirmBullish(pullBackIntoZone(trendingBars(), c));
+    const r = evaluate(b, c)!;
+    const zoneTop = r.signal.pullback.zone!.top;
+    const atr = readFromBars(b, 5, c).atr!;
+
+    // Move the confirmation close back under the zone's top edge, keeping the bar's shape.
+    const inside = [...b];
+    const last = inside[inside.length - 1];
+    const shift = last.close - (zoneTop - 0.3 * atr);
+    inside[inside.length - 1] = {
+      ...last, open: last.open - shift, close: last.close - shift, high: last.high - shift, low: last.low - shift,
+    };
+
+    const blocked = evaluate(inside, c)!;
+    assert.equal(blocked.fired, false);
+    assert.ok(
+      blocked.signal.blockers.some((x) => x.includes('INSIDE the zone') || x.includes('clear of it')),
+      blocked.signal.blockers.join(' | '),
+    );
+  });
+
+  it('refuses a confirmation that closed a long way clear of the zone', () => {
+    // The ceiling. The stop is still drawn from the pullback low whatever the entry does, so an
+    // entry two ATR above the band pays the whole bounce and keeps the whole risk. In the same
+    // replay, 0–0.5 ATR out returned +0.57R a trade and 1–1.75 ATR out returned −0.03R.
+    const c = cfg();
+    const b = confirmBullish(pullBackIntoZone(trendingBars(), c));
+    const atr = readFromBars(b, 5, c).atr!;
+
+    const far = [...b];
+    const last = far[far.length - 1];
+    const lift = 2.5 * atr;
+    far[far.length - 1] = {
+      ...last, open: last.open + lift, close: last.close + lift, high: last.high + lift, low: last.low + lift,
+    };
+
+    const r = evaluate(far, c, { price: far[far.length - 1].close })!;
+    assert.equal(r.fired, false);
+    assert.ok(r.signal.blockers.some((x) => x.includes('clear of the zone')), r.signal.blockers.join(' | '));
+  });
+
+  it('refuses an entry the live price has already run away from', () => {
+    // `entry` is the confirmation bar's close and the row's whole plan is measured from it. Once the
+    // live price is far enough past that, the reward:risk on the row is not the one on offer — so
+    // the drift is a gate rather than a note, and the note is `entryDriftR`.
+    const c = cfg();
+    const b = confirmBullish(pullBackIntoZone(trendingBars(), c));
+    const at = evaluate(b, c)!;
+    assert.equal(at.fired, true, at.signal.blockers.join(' | '));
+
+    const risk = at.signal.stop.recommended.distance;
+    const chased = evaluate(b, c, { price: at.signal.entry + risk * (c.pullback.maxChaseR + 0.4) })!;
+
+    assert.equal(chased.fired, false);
+    assert.ok(chased.signal.entryDriftR !== null && chased.signal.entryDriftR > c.pullback.maxChaseR);
+    assert.ok(chased.signal.blockers.some((x) => x.includes('past the')), chased.signal.blockers.join(' | '));
+  });
+
+  it('refuses an entry that has already given its risk back toward the stop', () => {
+    const c = cfg();
+    const b = confirmBullish(pullBackIntoZone(trendingBars(), c));
+    const at = evaluate(b, c)!;
+    const risk = at.signal.stop.recommended.distance;
+
+    const faded = evaluate(b, c, { price: at.signal.entry - risk * (c.pullback.maxGiveBackR + 0.2) })!;
+    assert.equal(faded.fired, false);
+    assert.ok(faded.signal.blockers.some((x) => x.includes('given back')), faded.signal.blockers.join(' | '));
+
+    // And past the stop it says so outright, rather than reporting a live setup on a dead trade.
+    const stopped = evaluate(b, c, { price: at.signal.stop.recommended.price - 0.01 })!;
+    assert.ok(stopped.signal.blockers.some((x) => x.includes('already been taken out')), stopped.signal.blockers.join(' | '));
+  });
+
+  it('measures the confirmation volume against the bars before IT, not before the last bar', () => {
+    // A confirmation that is not the newest bar was compared against a window CONTAINING it, so a
+    // big turn inflated its own benchmark and read weaker than it was — which suppresses the
+    // strongest confirmations specifically, because the bigger the bar the more it poisons the mean.
+    const c = cfg();
+    const b = confirmBullish(pullBackIntoZone(trendingBars(), c));
+
+    // Push the confirmation one bar into the past by appending a quiet inside bar behind it.
+    const conf = b[b.length - 1];
+    const trailing: Bar = {
+      ...conf,
+      at: conf.at + 5 * 60_000,
+      minute: conf.minute + 5,
+      open: conf.close,
+      close: conf.close + 0.02,
+      high: conf.close + 0.05,
+      low: conf.close - 0.05,
+      volume: 900,
+      turnover: conf.close * 900,
+    };
+    const withTrailing = [...b, trailing];
+
+    const read = readFromBars(withTrailing, 5, c);
+    const p = readPullback({
+      bars: withTrailing, series: computeSeries(withTrailing), timeframe: 5, direction: 1,
+      avgVolume: read.avgVolume, cfg: c,
+    });
+
+    assert.ok(p.confirmation, `the confirmation must survive one quiet bar: ${p.note}`);
+    assert.equal(p.confirmation!.barsAgo, 1);
+
+    // The honest denominator: the 20 bars immediately before the confirmation.
+    const k = withTrailing.length - 2;
+    const window = withTrailing.slice(k - c.timeframes.volumeLookback, k);
+    const expected = +(withTrailing[k].volume / (window.reduce((a, x) => a + x.volume, 0) / window.length)).toFixed(2);
+    assert.equal(p.confirmation!.volumeRatio, expected);
   });
 
   it('has no signal without a chain, and still has a complete price plan', () => {

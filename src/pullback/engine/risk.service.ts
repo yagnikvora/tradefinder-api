@@ -194,7 +194,9 @@ export function buildTargets(i: RiskInput, stop: StopCandidate): TargetPlan | nu
 
   // The prior swing in the trend's direction, when there is one beyond the entry. A target
   // BEHIND the entry is not a target; that is the state early in a leg, and it is left out.
-  const prior = dir === 1 ? i.pullback.impulse?.toPrice : i.pullback.impulse?.toPrice;
+  // `impulse.toPrice` is already the extreme in the trend's direction — the leg's high for a
+  // long and its low for a short — so there is nothing to branch on here.
+  const prior = i.pullback.impulse?.toPrice;
   if (prior !== undefined && (dir === 1 ? prior > entry : prior < entry))
     candidates.push(mk('priorHigh', dir === 1 ? 'Prior high' : 'Prior low', prior,
       `the ${dir === 1 ? 'high' : 'low'} of the impulse this is a pullback in — where the last sellers were`));

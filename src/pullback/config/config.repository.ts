@@ -140,7 +140,7 @@ export function sanitise(cfg: PullbackConfig): PullbackConfig {
   t.computed = validTimeframes(t.computed, [1, 3, 5, 15]);
   // A signal timeframe that is not computed would silently never fire — the frame it needs is
   // never built — so the two lists are reconciled rather than trusted.
-  t.signal = validTimeframes(t.signal, [3, 5, 15]).filter((tf) => t.computed.includes(tf));
+  t.signal = validTimeframes(t.signal, [5]).filter((tf) => t.computed.includes(tf));
   if (!t.signal.length) t.signal = [...t.computed];
   t.context = validTimeframes(t.context, [5, 15]).filter((tf) => t.computed.includes(tf));
   t.minBars = Math.round(clampNumber(t.minBars, 10, 500, 30));
@@ -172,7 +172,20 @@ export function sanitise(cfg: PullbackConfig): PullbackConfig {
   p.minConfirmationVolumeRatio = clampNumber(p.minConfirmationVolumeRatio, 0, 20, 1.2);
   p.cooldownMin = clampNumber(p.cooldownMin, 0, 375, 20);
   p.minMinutesLeft = clampNumber(p.minMinutesLeft, 0, 375, 30);
+  // Capped well under a session's worth of bars: at 25 bars a 15-minute signal would need 375
+  // minutes of session left, which only the opening bar has, and the timeframe would go dark.
+  p.minHoldBars = Math.round(clampNumber(p.minHoldBars, 0, 25, 12));
   p.rejectionAtr = clampNumber(p.rejectionAtr, 0.05, 5, 0.5);
+  // Both edges of the entry-drift band, floored above zero. Zero on either side would refuse every
+  // signal — the live price is never exactly the confirmation close — so "off" is a large number,
+  // not a zero, and the clamp says so.
+  p.maxChaseR = clampNumber(p.maxChaseR, 0.02, 20, 0.33);
+  p.maxGiveBackR = clampNumber(p.maxGiveBackR, 0.02, 20, 0.5);
+  // The entry-proximity band. The floor may be negative — an operator who wants entries taken
+  // inside the zone is choosing a different trade, not a broken config — but the ceiling has to
+  // sit above it or nothing can ever fire.
+  p.minEntryExtensionAtr = clampNumber(p.minEntryExtensionAtr, -5, 5, 0);
+  p.maxEntryExtensionAtr = clampNumber(p.maxEntryExtensionAtr, p.minEntryExtensionAtr + 0.05, 50, 1);
 
   const s = cfg.score;
   const wSum = Object.values(s.weights).reduce((a, v) => a + (Number.isFinite(v) && v > 0 ? v : 0), 0);

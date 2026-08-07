@@ -272,6 +272,35 @@ export function readPullback(i: PullbackInput): PullbackRead {
 }
 
 /**
+ * The volume expansion of bar `k`, against the `lookback` bars IMMEDIATELY BEFORE IT.
+ *
+ * The frame read's `avgVolume` is the mean of the window ending at the LAST bar, and using it for
+ * a confirmation that is not the last bar is wrong in the one direction that matters. A
+ * confirmation two bars back is then measured against a window that CONTAINS it, so the bar
+ * inflates its own benchmark — which is exactly the trap `readFrame` documents and avoids for the
+ * last bar and then reintroduces for every earlier one. A big turn two bars ago reads as 1.6x
+ * where it was 2.1x, and `minConfirmationVolumeRatio` refuses it: the error suppresses the
+ * strongest confirmations specifically, because the bigger the bar, the more it poisons its own
+ * denominator.
+ *
+ * Falls back to the frame's figure only when there is not enough history before `k` to build a
+ * window, which on a warm frame never happens.
+ */
+function volumeRatioAt(
+  bars: Bar[],
+  k: number,
+  lookback: number,
+  fallbackAvg: number | null,
+): number | null {
+  const from = k - Math.max(2, lookback);
+  const window = from >= 0 ? bars.slice(from, k) : [];
+  const avg = window.length
+    ? window.reduce((a, b) => a + b.volume, 0) / window.length
+    : (fallbackAvg ?? 0);
+  return avg > 0 ? +(bars[k].volume / avg).toFixed(2) : null;
+}
+
+/**
  * The confirmation bar: the newest closed bar, within the age limit, that turns.
  *
  * Searched newest-first and returns the first match, so a setup that confirmed twice reports
@@ -294,7 +323,7 @@ function findConfirmation(i: PullbackInput, touchIdx: number, atr: number): Conf
     });
     if (pattern === 'none') continue;
 
-    const ratio = i.avgVolume && i.avgVolume > 0 ? +(bars[k].volume / i.avgVolume).toFixed(2) : null;
+    const ratio = volumeRatioAt(bars, k, cfg.timeframes.volumeLookback, i.avgVolume);
     if (ratio !== null && ratio < p.minConfirmationVolumeRatio) continue;
     // A missing volume denominator is not a pass. Volume confirmation is one of the two halves
     // of the brief's entry rule, and letting a symbol with no volume history through would

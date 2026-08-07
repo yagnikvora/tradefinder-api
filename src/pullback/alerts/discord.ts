@@ -24,13 +24,44 @@ export const discordConfigured = (): boolean => /^https:\/\/(discord\.com|discor
 let failures = 0;
 let lastError: string | null = null;
 let lastSentAt: number | null = null;
+let reachable: boolean | null = null;
+let reachableAt: number | null = null;
 
 export const discordStatus = () => ({
   configured: discordConfigured(),
   failures,
   lastError,
   lastSentAt,
+  /** Result of the last `checkDiscord()` probe. Null before one has run. */
+  reachable,
+  reachableAt,
 });
+
+/**
+ * Can this host reach the webhook, and does it still exist?
+ *
+ * The same startup question `checkTelegram` answers, and worth asking separately because this
+ * channel has its own way of dying quietly: a webhook that someone deleted in Discord answers 404
+ * forever, and nothing about `configured: true` notices. A GET on the webhook URL validates it
+ * without posting anything into the channel.
+ */
+export async function checkDiscord(): Promise<boolean> {
+  if (!discordConfigured()) {
+    reachable = null;
+    return false;
+  }
+  try {
+    const res = await fetch(url(), { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error(`${res.status} — the webhook URL is rejected; it may have been deleted in Discord`);
+    reachable = true;
+    lastError = null;
+  } catch (e) {
+    reachable = false;
+    lastError = String((e as Error).message);
+  }
+  reachableAt = Date.now();
+  return reachable;
+}
 
 const BULL = 0x2ec76a;
 const BEAR = 0xe5484d;

@@ -14,6 +14,26 @@
 // that is actually actionable: by the time a confirmation candle has closed, the entry is
 // already one bar old.
 //
+// THREE OF THE GATES BELOW ARE ABOUT THE PRICE AND NOT ABOUT THE SETUP, and they are the ones
+// that changed this module's results most. Everything else here asks "is this a pullback worth
+// trading". These ask "is the number beside it a price you can still get", which is a different
+// question with a different answer, because the plan is measured from the confirmation bar's close
+// and by the time a scan publishes it the market has moved on:
+//
+//   ENTRY PROXIMITY   `minEntryExtensionAtr` … `maxEntryExtensionAtr`. How far the confirmation
+//                     closed beyond the pullback zone. Inside the band it has not turned; a long
+//                     way past it, it has turned without you — and the stop is drawn from the same
+//                     pullback low either way, so the second case pays for the bounce and keeps
+//                     all of the risk.
+//   ENTRY DRIFT       `maxChaseR` / `maxGiveBackR`. The same idea against the LIVE price rather
+//                     than against the zone, in units of the plan's own risk.
+//   HOLD TIME         `minHoldBars`, scaled by the timeframe, because a 15-minute pullback needs
+//                     about three times as long to reach its target as a 5-minute one and the old
+//                     fixed 30-minute floor let more than half of them be closed by the clock.
+//
+// All three were measured rather than chosen. A 45-symbol, 120-session replay is in
+// `tools/pullback-research.ts`; the per-gate numbers are on the config fields in `types.ts`.
+//
 // THE COOLDOWN IS A GATE, NOT A DEDUPE. `pullback.cooldownMin` stops the same leg firing twice.
 // It is deliberately shorter than a session — twenty minutes by default — because a stock that
 // is genuinely trending gives three or four pullbacks in a day and each is a separate trade with
@@ -69,6 +89,28 @@ export interface SignalResult {
  */
 const entryKindOf = (p: PullbackRead): EntryKind =>
   p.phase === 'Resuming' || p.phase === 'AtZone' ? 'pullback' : 'holding';
+
+/**
+ * How far `entry` sits beyond the near edge of the pullback zone, in ATR, signed with the trade.
+ *
+ * Measured to the edge rather than to the middle because the edge is what price had to clear for
+ * the retracement to be over — and the zone is already widened by `zoneToleranceAtr`, so this is
+ * distance past the outermost of {9 EMA, 20 EMA, VWAP} plus that tolerance. Negative means the
+ * entry is still inside the band.
+ *
+ * Null when there is no zone or no ATR, in which case the gate does not run: an unmeasurable
+ * reading is not a failed one, the same rule the score applies to a warming component.
+ */
+export function zoneExtensionAtr(
+  p: PullbackRead,
+  entry: number,
+  direction: 1 | -1,
+  atr: number | null,
+): number | null {
+  if (!p.zone || !atr || !(atr > 0)) return null;
+  const past = direction === 1 ? entry - p.zone.top : p.zone.bottom - entry;
+  return +(past / atr).toFixed(3);
+}
 
 /**
  * Evaluate one symbol on one timeframe.
@@ -132,6 +174,54 @@ export function evaluateSignal(i: SignalInput): SignalResult | null {
     );
   if (plan.stop.warning) reasons.push(plan.stop.warning);
 
+  /* ------------------------------------------------------------- where the entry sits --- */
+
+  // How far past the zone the confirmation closed. See `PullbackConfig.pullback.minEntryExtensionAtr`
+  // — below the floor the turn has not happened, above the ceiling it has happened without you, and
+  // this band is the strongest single separation in the module.
+  const extensionAtr = zoneExtensionAtr(pullback, entry, direction, read.atr);
+
+  if (extensionAtr !== null && extensionAtr < cfg.pullback.minEntryExtensionAtr)
+    blockers.push(
+      `the confirmation closed ${extensionAtr < 0 ? `${Math.abs(extensionAtr).toFixed(2)} ATR INSIDE the zone` : `only ${extensionAtr.toFixed(2)} ATR clear of it`} ` +
+      `(needs ${cfg.pullback.minEntryExtensionAtr}) — price is still at the level it is supposed to be ` +
+      'leaving, so this is a green bar inside a retracement rather than the end of one',
+    );
+
+  if (extensionAtr !== null && extensionAtr > cfg.pullback.maxEntryExtensionAtr)
+    blockers.push(
+      `the confirmation closed ${extensionAtr.toFixed(2)} ATR clear of the zone (limit ` +
+      `${cfg.pullback.maxEntryExtensionAtr}) — the stop is still drawn from the pullback low, so this ` +
+      'entry pays the whole bounce and keeps the whole risk',
+    );
+
+  /* ------------------------------------------------------------------ still an entry --- */
+
+  // How much of the plan's own risk the market has already spent while this setup was being
+  // published. See `PullbackConfig.pullback.maxChaseR` — the short version is that every number on
+  // this row is measured from the confirmation close, and once the live price is far enough from
+  // it the row is describing a trade that is no longer available at the price beside it.
+  const risk = plan.stop.recommended.distance;
+  const entryDriftR = risk > 0 ? +((((i.price - entry) * direction) / risk).toFixed(3)) : null;
+
+  if (entryDriftR !== null && entryDriftR > cfg.pullback.maxChaseR)
+    blockers.push(
+      `price is already ${entryDriftR.toFixed(2)}R past the ${entry.toFixed(2)} confirmation close ` +
+      `(limit ${cfg.pullback.maxChaseR}) — the stop has not moved, so buying here is a ` +
+      `${(plan.target.primary.r - entryDriftR).toFixed(2)}R trade taking ${(1 + entryDriftR).toFixed(2)}R of risk, ` +
+      'not the plan on this row',
+    );
+
+  if (entryDriftR !== null && entryDriftR < -cfg.pullback.maxGiveBackR)
+    blockers.push(
+      entryDriftR <= -1
+        ? `price is ${Math.abs(entryDriftR).toFixed(2)}R below the entry — the stop at ` +
+          `${plan.stop.recommended.price.toFixed(2)} has already been taken out and this setup is over`
+        : `price has given back ${Math.abs(entryDriftR).toFixed(2)}R of the ${risk.toFixed(2)} risk since the ` +
+          `confirmation (limit ${cfg.pullback.maxGiveBackR}) — the turn did not hold, and what is left ` +
+          'is a coin flip with a fraction of a stop under it',
+    );
+
   /* ------------------------------------------------------------------------ score --- */
 
   const score = scoreSignal({ trend, pullback, read, frames: i.frames, direction, cfg });
@@ -171,10 +261,15 @@ export function evaluateSignal(i: SignalInput): SignalResult | null {
   // How long is left to HOLD it, measured from the confirmation bar rather than from the wall clock,
   // so the gate means the same thing in a live scan and in a replay.
   const minutesLeft = SESSION_MINUTES - minuteOfSession(firedAt);
-  if (minutesLeft < cfg.pullback.minMinutesLeft)
+  // Scaled by the timeframe, not fixed. See `PullbackConfig.pullback.minHoldBars` — the short
+  // version is that a 15-minute pullback takes about three times as long to reach its target as a
+  // 5-minute one, and a single 30-minute floor let more than half of them be closed by the clock.
+  const minutesNeeded = Math.max(cfg.pullback.minMinutesLeft, cfg.pullback.minHoldBars * i.timeframe);
+  if (minutesLeft < minutesNeeded)
     blockers.push(
-      `only ${Math.max(0, minutesLeft)} minutes of session left (needs ${cfg.pullback.minMinutesLeft}) — ` +
-      'a pullback entry is a 30-to-90-minute hold, and this one would be closed into the auction',
+      `only ${Math.max(0, minutesLeft)} minutes of session left (needs ${minutesNeeded}) — ` +
+      `a ${i.timeframe}m pullback is about a ${cfg.pullback.minHoldBars}-bar hold, and this one would be ` +
+      'closed into the auction rather than at a level',
     );
 
   if (i.lastFiredAt !== null && firedAt - i.lastFiredAt < cfg.pullback.cooldownMin * 60_000)
@@ -213,6 +308,7 @@ export function evaluateSignal(i: SignalInput): SignalResult | null {
     entry: +entry.toFixed(2),
     price: +i.price.toFixed(2),
     movedSincePct,
+    entryDriftR,
     score,
     stop: plan.stop,
     target: plan.target,

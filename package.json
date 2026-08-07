@@ -13,9 +13,10 @@
     "check-upstox": "tsx tools/upstox-validate.ts",
     "check-momentum": "tsx tools/momentum-validate.ts",
     "check-pullback": "tsx tools/pullback-validate.ts",
+    "research-pullback": "tsx tools/pullback-research.ts",
     "demo-alert": "tsx tools/demo-alert.ts",
     "replay-trend": "tsx tools/trend-replay.ts",
-    "test": "node --import tsx --test \"test/**/*.test.ts\""
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

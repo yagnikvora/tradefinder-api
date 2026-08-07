@@ -531,6 +531,20 @@ export interface PullbackSignal {
   price: number;
   /** Move since the fire, signed with the direction. */
   movedSincePct: number;
+  /**
+   * The same move expressed in R — how much of the plan's own risk the live price has already
+   * spent, positive in the trade's favour.
+   *
+   * This is the number that says whether the ENTRY still exists, and percent cannot say it. A
+   * 0.4% run is nothing on a stock whose stop is 1.5% away and is most of the trade on one whose
+   * stop is 0.5% away; only the ratio against the risk being taken compares across the board.
+   * `+0.5` means half the distance to the 1R target has already been given away and the
+   * reward:risk the row advertises is no longer available at the price on the screen; `−0.5`
+   * means price is halfway to the stop before the position exists.
+   *
+   * Null when the plan has no priceable risk.
+   */
+  entryDriftR: number | null;
 
   score: ScoreBreakdown;
   stop: StopPlan;
@@ -743,6 +757,49 @@ export interface BacktestTrade {
   /** Best and worst excursion while open, in R. */
   mfeR: number;
   maeR: number;
+  /**
+   * What the signal looked like at the moment it fired.
+   *
+   * Carried so a replay can be sliced by the READING rather than only by the outcome, which is the
+   * difference between "the strategy made 0.15R a trade" and "it made 0.15R a trade because a
+   * third of the entries were taken at 10:00 on a 4-ATR extension and never moved". Every gate in
+   * this module was chosen from the brief or from desk convention; this is the field that lets one
+   * be chosen from the record instead.
+   *
+   * Absent on a trade replayed before this existed.
+   */
+  diagnostics?: TradeDiagnostics;
+}
+
+/** One fired signal's readings, flattened for bucketing. See `BacktestTrade.diagnostics`. */
+export interface TradeDiagnostics {
+  /** Minute of session the entry bar closed on. 0 = the 09:15 bar. */
+  minute: number;
+  /** How far the live price had already run from the confirmation close, in R. */
+  entryDriftR: number | null;
+  /** Bars between the confirmation and the bar that published it. */
+  confirmationAgeBars: number;
+  pattern: CandlePattern;
+  confirmationVolumeRatio: number | null;
+  retracement: number | null;
+  /** Impulse leg size in ATR — how much move there was to retrace. */
+  impulseAtr: number | null;
+  /** Signed distance from VWAP in ATR, positive with the trade. */
+  vwapAtr: number | null;
+  /** How far past the zone's near edge the entry sits, in ATR. Negative is still inside it. */
+  extensionAtr: number | null;
+  adx: number | null;
+  adxRising: boolean | null;
+  trendStrength: number;
+  /** How many higher context timeframes agreed. */
+  aligned: number;
+  stopKind: StopCandidate['kind'];
+  stopAtr: number;
+  /** The stop as a percentage of the entry price — what the round-trip cost is charged against. */
+  stopPct: number;
+  /** ATR as a percentage of price. A dead instrument has nowhere to go. */
+  atrPct: number | null;
+  roomR: number;
 }
 
 export interface BacktestResult {
@@ -885,10 +942,71 @@ export interface PullbackConfig {
      */
     minMinutesLeft: number;
     /**
+     * The same gate, expressed in BARS of the signal timeframe — and the half that scales.
+     *
+     * `minMinutesLeft` is one number for every timeframe, and the hold it was calibrated against is
+     * a 5-minute one. That silently makes it the wrong gate on the timeframes either side, because
+     * a pullback's target is a function of the timeframe's own ATR and so is the time it takes to
+     * get there: a 120-session, 45-symbol replay held 5-minute trades 81 minutes on average and
+     * 15-minute trades 158, and on 15 minutes FIFTY-FIVE PERCENT of them never reached a level at
+     * all — they were closed into the session end, six targets against sixty-seven timeouts, for
+     * −0.18R a trade. Those are not losing setups. They are winning setups measured by a clock that
+     * ran out, admitted by a gate that thought it had half an hour of room to spare.
+     *
+     * The requirement is therefore `max(minMinutesLeft, minHoldBars × timeframe)`, so the floor
+     * still catches the 15:25 entry on a fast chart and the multiplier stops a 15-minute signal
+     * being taken at 13:30 with two hours of a three-hour trade available.
+     */
+    minHoldBars: number;
+    /**
      * A rejection is a touch that FAILED — price closed through the zone against the trend.
      * This many ATR beyond the zone counts as through rather than as noise.
      */
     rejectionAtr: number;
+    /**
+     * How far the live price may have run PAST the planned entry, in R, and still be an entry.
+     *
+     * The confirmation bar's close is the price the setup was defined at, and by the time a scan
+     * publishes it that price is somewhere between one poll and `maxConfirmationAgeBars` bars old.
+     * Everything the row advertises — the stop distance, the 2R target, the reward:risk — is
+     * measured from a number the market may have left behind, and the further it has run the more
+     * the published plan describes a trade nobody can take: buying 0.6R above the entry against
+     * an unchanged stop turns a 2R plan into a 1.4R one and widens the real risk by 60%.
+     *
+     * So this is a gate and not a note. `entryDriftR` above it means the move happened without
+     * you, and the honest answer is the next pullback rather than this fill.
+     */
+    maxChaseR: number;
+    /**
+     * How far the confirmation must close BEYOND the pullback zone, in ATR — the entry-proximity
+     * band, and the gate that most directly decides whether an entry is a good one.
+     *
+     * Every other condition in this module asks whether the SETUP is right. This one asks whether
+     * the PRICE is, and they are not the same question: the same textbook pullback confirmed 0.3
+     * ATR out of the band and 1.5 ATR out of it is two different trades, because the stop is drawn
+     * from the same structure in both and the second one is paying an extra 1.2 ATR for it.
+     *
+     * The floor exists because a confirmation that closes back INSIDE the band has not confirmed
+     * anything — price is still at the level it is supposed to be leaving, and the "turn" is a bar
+     * that happens to be green in the middle of a retracement that is still going on. A 120-session
+     * replay put that bucket at 18.8% wins and −0.34R a trade, the worst of any reading measured.
+     *
+     * The ceiling exists because past about one ATR the move has already left without you. In the
+     * same replay, entries 0–0.5 ATR out returned +0.57R a trade and 1–1.75 ATR out returned
+     * −0.03R, monotonically across every bucket between — the single strongest separation any
+     * reading in this module produces.
+     */
+    minEntryExtensionAtr: number;
+    maxEntryExtensionAtr: number;
+    /**
+     * How far the live price may have fallen BACK toward the stop, in R, before the setup is gone.
+     *
+     * The mirror of `maxChaseR` and the more dangerous direction, because it looks like a better
+     * entry. A confirmation that has already given back most of its risk is not a discount — it is
+     * a turn that stopped turning, and the stop it was drawn behind is now a fraction of an ATR
+     * away. At −1 the stop is already hit and the trade is a loss the row has not noticed.
+     */
+    maxGiveBackR: number;
   };
 
   score: {

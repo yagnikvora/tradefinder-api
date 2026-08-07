@@ -25,6 +25,8 @@
 import { tokenSet } from '../upstox.js';
 import { istDay, istMinutes, marketOpen, SESSION_CLOSE_MIN } from '../momentum/session.js';
 import { resetAlerts } from './alerts/alert.engine.js';
+import { checkTelegram } from './alerts/telegram.js';
+import { checkDiscord } from './alerts/discord.js';
 import { configRepository } from './config/config.repository.js';
 import { buildSeed, frameStore, loadSeed } from './data/frames.js';
 import { signalRepository } from './data/signal.repository.js';
@@ -104,8 +106,28 @@ async function seedTick(nowMs = Date.now()): Promise<void> {
     resetUniverse();
     const fresh = await universe(cfg.universe, nowMs);
     const result = await buildSeed(fresh.members, cfg, nowMs);
-    if (result.covered < fresh.members.length * 0.5) {
-      lastSeedDay = ''; // let the next tick retry
+    /**
+     * RETRY WHILE THE REMAINING FAILURES ARE RECOVERABLE, not while coverage is under a threshold.
+     *
+     * The old test retried below 50% and `yesterdayCovered` above called it finished at 80%, which
+     * left a dead band nothing could climb out of: a build that landed anywhere between the two
+     * marked the day done and never ran again, so the board sat three-quarters lit until midnight
+     * with no error recorded. It is not a rare case either — it is the normal outcome of a
+     * budget-constrained build, and it is what happened here at 155 of 212.
+     *
+     * `throttled` is the right condition because it is the only one that says retrying will
+     * ACHIEVE anything. A symbol Upstox will not serve fails identically in every window, and
+     * retrying it every five minutes spends the budget the recoverable ones need.
+     */
+    if (result.throttled > 0) {
+      lastSeedDay = ''; // the next tick picks up where this one ran out
+      lastError = {
+        at: nowMs,
+        message:
+          `EMA seed covered ${result.covered}/${fresh.members.length} symbols; ${result.throttled} were ` +
+          'skipped because the Upstox candle budget was spent. Retrying next tick — coverage accumulates.',
+      };
+    } else if (result.covered < fresh.members.length * 0.5) {
       lastError = { at: nowMs, message: `EMA seed covered only ${result.covered}/${fresh.members.length} symbols` };
     }
   } catch (e) {
@@ -156,6 +178,11 @@ async function scanTick(nowMs = Date.now()): Promise<void> {
   }
 }
 
+/** Probe both phone channels, never throwing — a dead channel must not stop the scanner. */
+async function probeChannels(): Promise<void> {
+  await Promise.allSettled([checkTelegram(), checkDiscord()]);
+}
+
 /** Start the jobs. Idempotent — calling twice does not double the timers. */
 export async function startScheduler(): Promise<void> {
   if (timers.length) return;
@@ -172,6 +199,14 @@ export async function startScheduler(): Promise<void> {
   every(cfg.refresh.scanMs, () => void scanTick());
   every(5 * 60_000, () => void seedTick());
   every(FLUSH_MS, () => void signalRepository.flush());
+
+  // Ask each phone channel whether it actually works, now rather than at 10:45. A configured
+  // channel that cannot be reached is indistinguishable from a quiet market on `/pullback/status`
+  // — same `failures: 0`, same `lastSentAt: null` — and the first send is otherwise attempted at
+  // the precise moment a signal fires. Re-probed hourly so a channel that dies mid-session (a
+  // deleted webhook, a network that starts filtering) is reported rather than merely silent.
+  void probeChannels();
+  every(60 * 60_000, () => void probeChannels());
 
   // Kick both immediately rather than waiting a full interval for the first board. The seed goes
   // first and is awaited, because a scan that runs before it has nothing to compute.
