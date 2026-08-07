@@ -199,7 +199,6 @@ export function computePulse(
   const atrPct = baseline?.atrPct && baseline.atrPct > 0 ? baseline.atrPct : null;
 
   const fastMs = t.fastWindowMin * 60_000;
-  const slowMs = t.slowWindowMin * 60_000;
   const baseMs = t.baseWindowMin * 60_000;
 
   const fast = readingsSince(sym, fastMs, nowMs);

@@ -269,8 +269,5 @@ export function agrees(read: TimeframeRead | undefined, direction: 1 | -1): bool
   return stacked && priced;
 }
 
-/** The trend-strength curve input the score component reuses. Exported for the tests. */
-export const trendScoreOf = (t: TrendRead): number => t.strength;
-
 /** Piecewise helper re-exported so the score service has one import for its curves. */
 export { curve };

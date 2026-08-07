@@ -174,7 +174,7 @@ function stageOne(
   // universe — and being universe-wide matters more here than anywhere else in the module,
   // because a stock that has quietly walked one direction since 09:30 is by construction NOT
   // near the top of a momentum ranking and would never survive a shortlist to be measured.
-  const convictionReading = computeConviction(quote, symState, baseline, cfg, nowMs);
+  const convictionReading = computeConviction(symState, baseline, cfg, nowMs);
 
   const factors: FactorOutcome[] = [
     pulseFactor(pulseReading, cfg),

@@ -183,10 +183,3 @@ export async function sendTelegram(text: string): Promise<boolean> {
     return false;
   }
 }
-
-/** Test seam. */
-export const resetTelegramStatus = (): void => {
-  failures = 0;
-  lastError = null;
-  lastSentAt = null;
-};

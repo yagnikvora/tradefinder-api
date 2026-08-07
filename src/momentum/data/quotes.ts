@@ -27,12 +27,6 @@ import { universe } from './universe.js';
 /** Upstox takes 500 keys; 200 keeps the URL comfortably short and still costs 3 calls. */
 const CHUNK = 200;
 
-export interface DepthLevel {
-  price: number;
-  quantity: number;
-  orders: number;
-}
-
 export interface MomentumQuote {
   symbol: string;
   instrumentKey: string;

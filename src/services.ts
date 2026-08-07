@@ -7,10 +7,6 @@ import { remember, recall, ageLabel } from './snapshot.js';
 import * as mock from './mock.js';
 import type { MarketPulse, SectorScope, IndexMover, Source } from './types.js';
 
-const now = () => Math.floor(Date.now() / 1000);
-
-const rFactor = (p: number) => +Math.min(Math.abs(p || 0) / 1.5, 8).toFixed(2);
-
 export interface Result<T> { data: T; source: Source; error?: string; }
 
 // Everything the Market Pulse widgets need, which is exactly what a quote already carries.
@@ -179,11 +175,6 @@ export async function marketPulse(): Promise<Result<MarketPulse>> {
     return { source: 'mock', error: String((e as Error).message), data: mock.mockMarketPulse() };
   }
 }
-
-// Treemap group labels: the NIFTY prefix is dropped for sector indices, but kept
-// where it's part of how the index is actually known.
-const KEEP_NIFTY = new Set(['NIFTY 50', 'NIFTY MID SELECT']);
-const sectorLabel = (sec: string) => (KEEP_NIFTY.has(sec) ? sec : sec.replace('NIFTY ', ''));
 
 export async function sectorScope(): Promise<Result<SectorScope>> {
   try {

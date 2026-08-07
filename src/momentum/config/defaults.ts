@@ -337,7 +337,6 @@ export const DEFAULT_CONFIG: MomentumConfig = {
     // percent threshold would fill the board with the same dozen high-beta names every day.
     pulse: {
       fastWindowMin: 3,
-      slowWindowMin: 10,
       baseWindowMin: 15,
       minReadings: 3,
       // Burst leads: an ignition without volume behind it is a drift that will retrace, and

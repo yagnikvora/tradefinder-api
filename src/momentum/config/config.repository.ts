@@ -193,13 +193,12 @@ function sanitiseConviction(cfg: MomentumConfig): void {
  * These are the numbers that decide whether a signal is allowed to fire at all, so a
  * nonsense value here does not produce a wrong ranking — it produces a board that either
  * signals on everything or on nothing, and both look plausible from the outside. The
- * window ordering is enforced rather than clamped: a fast window longer than the slow one
- * would make acceleration measure a rate against itself and read as permanently zero.
+ * window ordering is enforced rather than clamped: a base window shorter than the fast one
+ * would put the breakout inside the base it is being measured against.
  */
 function sanitiseTiming(cfg: MomentumConfig): void {
   const p = cfg.thresholds.pulse;
   p.fastWindowMin = clampNumber(p.fastWindowMin, 0.5, 30, 3);
-  p.slowWindowMin = clampNumber(p.slowWindowMin, p.fastWindowMin + 0.5, 60, 10);
   p.baseWindowMin = clampNumber(p.baseWindowMin, p.fastWindowMin + 0.5, 60, 15);
   p.minReadings = Math.round(clampNumber(p.minReadings, 2, 50, 3));
   p.legReversalAtr = clampNumber(p.legReversalAtr, 0.02, 2, 0.3);

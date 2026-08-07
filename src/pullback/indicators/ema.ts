@@ -49,12 +49,6 @@ export function emaSeries(values: number[], period: number): Array<number | null
 export const emaOfCloses = (bars: Bar[], period: number): Array<number | null> =>
   emaSeries(bars.map((b) => b.close), period);
 
-/** Advance one EMA by one value. The incremental form, for the backtest's inner loop. */
-export const emaStep = (prev: number, value: number, period: number): number => {
-  const k = 2 / (period + 1);
-  return value * k + prev * (1 - k);
-};
-
 /**
  * How fast a series is moving, in ATR PER BAR.
  *

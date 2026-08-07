@@ -21,7 +21,6 @@
 //   poisons ATR for the next fourteen bars and shows up as a phantom breakout. Every grouping
 //   below is keyed by `${day}#${bucket}` rather than by bucket alone.
 
-import { candleDay, candleMinute } from '../../momentum/session.js';
 import type { Candle } from '../../momentum/data/candles.js';
 
 export interface Bar {
@@ -254,7 +253,5 @@ export function curve(knots: Array<{ at: number; score: number }>, value: number
 
 export const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
-/** Round for transport. Every number crossing the API boundary goes through one of these. */
+/** Round for transport. Every number crossing the API boundary goes through this. */
 export const r2 = (v: number): number => +v.toFixed(2);
-export const r3 = (v: number): number => +v.toFixed(3);
-export const r4 = (v: number): number => +v.toFixed(4);

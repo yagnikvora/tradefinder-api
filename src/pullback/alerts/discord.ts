@@ -109,10 +109,3 @@ export async function sendDiscord(text: string, direction?: 1 | -1): Promise<boo
     return false;
   }
 }
-
-/** Test seam. */
-export const resetDiscordStatus = (): void => {
-  failures = 0;
-  lastError = null;
-  lastSentAt = null;
-};

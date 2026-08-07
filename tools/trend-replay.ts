@@ -189,7 +189,7 @@ function replaySymbol(
 
     const symState = state.symbols[symbol];
     const pulse = computePulse(quote, symState, baseline, cfg, at);
-    const conviction = computeConviction(quote, symState, baseline, cfg, at);
+    const conviction = computeConviction(symState, baseline, cfg, at);
 
     const pulseScore = pulseFactor(pulse, cfg).score;
     const trendScore = convictionFactor(conviction, cfg).score;

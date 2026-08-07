@@ -47,9 +47,3 @@ export function atrSeries(bars: Bar[], period: number): Array<number | null> {
   }
   return out;
 }
-
-/** The last ATR, or null when there are not enough bars to have one. */
-export function atrLast(bars: Bar[], period: number): number | null {
-  const s = atrSeries(bars, period);
-  return s.length ? s[s.length - 1] : null;
-}

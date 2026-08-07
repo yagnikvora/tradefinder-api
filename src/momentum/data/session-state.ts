@@ -806,6 +806,3 @@ export async function flushSessionState(force = false, nowMs = Date.now()): Prom
   flushing = store.write(STORE_KEYS.session, payload).finally(() => { flushing = null; });
   return flushing;
 }
-
-/** Test seam — drops the in-memory copy so the next read comes off disk. */
-export const resetSessionState = (): void => { state = null; dirty = false; lastFlushAt = 0; };

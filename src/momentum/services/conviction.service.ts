@@ -71,7 +71,6 @@ import type {
   ConvictionReading, ConvictionSummary, Direction, MomentumConfig,
 } from '../types.js';
 import type { SymbolBaseline } from '../data/baseline.js';
-import type { MomentumQuote } from '../data/quotes.js';
 import { advanceTrend, type SessionShape, type SpineSample, type SymbolSessionState } from '../data/session-state.js';
 import { minuteOfSession } from '../session.js';
 import { clamp, curve, mix, outcome, unavailable, type MixComponent } from './scoring.js';
@@ -178,7 +177,6 @@ function directionOf(shape: SessionShape): { dir: 1 | -1 | null; agree: boolean 
 /* -------------------------------------------------------------------- the reading --- */
 
 export function computeConviction(
-  quote: MomentumQuote,
   sym: SymbolSessionState | undefined,
   baseline: SymbolBaseline | undefined,
   cfg: MomentumConfig,

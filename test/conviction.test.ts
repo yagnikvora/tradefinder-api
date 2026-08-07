@@ -98,7 +98,7 @@ function replay(
       spineIntervalMin: cfg.thresholds.conviction.spineIntervalMin,
     });
 
-    series.push(computeConviction(q, state.symbols.TEST, base, cfg, at));
+    series.push(computeConviction(state.symbols.TEST, base, cfg, at));
   }
 
   return { final: series[series.length - 1], series, state };

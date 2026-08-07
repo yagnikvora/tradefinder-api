@@ -200,11 +200,6 @@ export async function nearFuture(symbol: string, nowMs = Date.now()): Promise<Fu
   return list.find((c) => c.expiry > nowMs + 6 * 60 * 60e3) ?? list[0] ?? null;
 }
 
-/** NSE index trading symbol (case-insensitive) -> instrument key. */
-export async function indexKey(name: string): Promise<string | null> {
-  return (await instruments()).indices[name.toUpperCase()] ?? null;
-}
-
 /* ---------------------------------------------------------------------- quotes --- */
 
 interface RawQuote {

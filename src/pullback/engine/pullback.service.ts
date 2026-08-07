@@ -35,7 +35,7 @@ import { classify, bodyRatio, PATTERN_STRENGTH } from '../indicators/patterns.js
 import type { Bar } from '../indicators/series.js';
 import type { FrameSeries } from '../data/frames.js';
 import type {
-  ConfirmationRead, PullbackConfig, PullbackPhase, PullbackRead, Timeframe, ZoneTouch,
+  ConfirmationRead, PullbackConfig, PullbackRead, Timeframe, ZoneTouch,
 } from '../types.js';
 import { PATTERN_LABEL } from '../types.js';
 
@@ -260,7 +260,7 @@ export function readPullback(i: PullbackInput): PullbackRead {
       note: `touched the zone on only a ${(retracement * 100).toFixed(0)}% retracement — the averages caught up to price rather than price coming back`,
     };
 
-  const confirmation = findConfirmation(i, touchIdx, atr);
+  const confirmation = findConfirmation(i, touchIdx);
   return {
     ...base,
     phase: confirmation ? 'Resuming' : 'AtZone',
@@ -309,7 +309,7 @@ function volumeRatioAt(
  * scanner that surfaces a twenty-minute-old turn as "just fired" is worse than one that says
  * nothing, because it is actively wrong about the only thing it exists to say.
  */
-function findConfirmation(i: PullbackInput, touchIdx: number, atr: number): ConfirmationRead | null {
+function findConfirmation(i: PullbackInput, touchIdx: number): ConfirmationRead | null {
   const { bars, series: s, cfg, direction: dir } = i;
   const p = cfg.pullback;
   const n = bars.length;

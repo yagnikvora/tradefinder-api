@@ -316,7 +316,7 @@ export interface SignalTrigger {
 
 /**
  * The micro-momentum measurement, all of it from the 15-second quote poll this module
- * already makes. No reading here looks further back than `pulse.slowWindowMin`.
+ * already makes. No reading here looks further back than `pulse.baseWindowMin`.
  */
 export interface PulseSummary {
   /** False when there are not yet enough readings to measure anything. */
@@ -752,8 +752,6 @@ export interface MomentumConfig {
     pulse: {
       /** The "right now" window. Everything the ignition read is built on. */
       fastWindowMin: number;
-      /** The comparison window behind it, for acceleration and efficiency. */
-      slowWindowMin: number;
       /** How far back a pre-breakout base is looked for. */
       baseWindowMin: number;
       /** Fewer readings than this in the fast window and the pulse is `ready: false`. */
