@@ -1,0 +1,35 @@
+# systemd unit for the API. Run it on an always-on host and it serves whatever has been
+# recorded, to whoever asks.
+#
+#   1. Edit User= / WorkingDirectory= / EnvironmentFile= below.
+#   2. sudo cp tools/trinetra-api.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#      sudo systemctl enable --now trinetra-api
+#   4. curl http://localhost:4100/health
+#
+# On a SECOND replica, set MOMENTUM_SCHEDULER=off and PULLBACK_SCHEDULER=off in the env file.
+# Two processes scanning spend the same Upstox token's request budget twice for one board, and
+# the rate limiter is per-process — it cannot coordinate across them.
+
+[Unit]
+Description=Trinetra API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- edit for this host -------------------------------------------------------
+User=pi
+WorkingDirectory=/home/pi/trinetra-app/api
+ExecStart=/usr/bin/npm start
+# Holds UPSTOX_ACCESS_TOKEN and DATABASE_URL. Keep it 0600 — it carries live credentials.
+EnvironmentFile=/home/pi/trinetra-app/api/.env
+# ------------------------------------------------------------------------------
+
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

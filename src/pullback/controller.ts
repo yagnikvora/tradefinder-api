@@ -274,7 +274,7 @@ export function pullbackRouter(): express.Router {
 
     const cfg = await configRepository.get();
     const lines = (b: (s: string) => string) => [
-      `✅ ${b('TradeFinder alerts are wired up.')}`,
+      `✅ ${b('Trinetra alerts are wired up.')}`,
       '',
       `You will be messaged on: ${b(cfg.alerts.push.kinds.join(', '))}`,
       `Confidence floor: ${b(`${cfg.alerts.push.minBand} or better`)}`,

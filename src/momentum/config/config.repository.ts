@@ -261,4 +261,14 @@ function sortKnotsDeep(node: Record<string, unknown>): void {
   }
 }
 
-export const configRepository: ConfigRepository = new StoredConfigRepository();
+/**
+ * The live binding every consumer imports.
+ *
+ * `let` rather than `const` so `db/wire.ts` can point it at a Postgres-backed store at boot.
+ * ESM exports are live bindings, so the reassignment is seen by every module that has already
+ * imported this one — which is what keeps the swap to a single line and no plumbing.
+ */
+export let configRepository: ConfigRepository = new StoredConfigRepository();
+
+/** Replace the driver. Called once, before the modules are mounted. */
+export const useMomentumConfigRepository = (repo: ConfigRepository): void => { configRepository = repo; };

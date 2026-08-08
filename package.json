@@ -1,5 +1,5 @@
 {
-  "name": "tradefinder-api",
+  "name": "trinetra-api",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -14,18 +14,22 @@
     "check-momentum": "tsx tools/momentum-validate.ts",
     "check-pullback": "tsx tools/pullback-validate.ts",
     "research-pullback": "tsx tools/pullback-research.ts",
+    "db:migrate": "tsx tools/db-migrate.ts",
+    "db:archive": "tsx tools/db-archive.ts",
     "demo-alert": "tsx tools/demo-alert.ts",
     "replay-trend": "tsx tools/trend-replay.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "pg": "^8.22.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.0",
+    "@types/pg": "^8.21.0",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0"
   }

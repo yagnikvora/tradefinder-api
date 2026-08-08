@@ -4,9 +4,14 @@ dist/
 # Snapshot cache and volume history — regenerated from the feeds, not source.
 .cache/
 
-# Holds UPSTOX_ACCESS_TOKEN — credentials must never be committed.
-# .env.example is the template.
+# Holds UPSTOX_ACCESS_TOKEN, the database password and both alert credentials — none of these
+# may ever be committed. .env.example is the template and is the ONLY one that is tracked.
+#
+# The wildcard matters as much as the exact names: a `.env.backup-...` or `.env.old` made while
+# editing carries exactly the same live secrets as `.env` itself, and naming them one at a time
+# means the first one nobody thought of gets committed.
 .env
-.env.local
+.env.*
+!.env.example
 
 *.log

@@ -1,4 +1,4 @@
-// TradeFinder API — Express + TypeScript.
+// Trinetra API — Express + TypeScript.
 // Mirrors the real /api_be/* endpoints, backed by live NSE data with mock fallback.
 import './env.js'; // must precede anything that reads process.env
 import express from 'express';
@@ -10,11 +10,21 @@ import * as apex from './apex.js';
 import { isTimeframe } from './candles.js';
 import { mountMomentum } from './momentum/index.js';
 import { mountPullback } from './pullback/index.js';
+import { connectDb, dbStatus } from './db/wire.js';
 import type { Result } from './services.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4100;
 app.use(cors());
+
+// Point the queryable repositories at Postgres, if DATABASE_URL is set and the database
+// answers. Awaited before the mounts below because those start schedulers that read the config
+// immediately — a swap landing after that would leave a running scheduler on the file-backed
+// config while everything else used the database.
+//
+// No DATABASE_URL, or a database that cannot be reached, leaves every JSON file driver exactly
+// as it is. See db/wire.ts for what moves and, more importantly, what deliberately does not.
+await connectDb();
 
 // Momentum Scanner. Self-contained under src/momentum — its own controller, services,
 // repositories, config and cron. Mounting is one line because everything it needs from this
@@ -186,7 +196,7 @@ app.get('/api_be/money_flux/op_dial', async (req, res) => {
     cached(`dl:${script}:${exp ?? ''}:${iv}:${day ?? ''}`, 30e3, () => apex.dial(script, exp, day, iv)));
 });
 
-app.get('/health', (_q, res) => res.json({ ok: true }));
+app.get('/health', (_q, res) => res.json({ ok: true, db: dbStatus() }));
 
 // Diagnostics: how many trading days of volume history we've backfilled for RVOL.
 app.get('/health/volume', async (_q, res) => {
@@ -202,4 +212,4 @@ app.get('/health/volume', async (_q, res) => {
 // exit, and a market-data server going dark is a far worse outcome than a logged error.
 process.on('unhandledRejection', (e) => console.error('[api] unhandled rejection:', e));
 
-app.listen(PORT, () => console.log(`\n  TradeFinder API  →  http://localhost:${PORT}\n`));
+app.listen(PORT, () => console.log(`\n  Trinetra API  →  http://localhost:${PORT}\n`));

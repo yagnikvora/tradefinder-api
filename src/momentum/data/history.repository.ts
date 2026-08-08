@@ -108,4 +108,13 @@ export class StoredHistoryRepository implements HistoryRepository {
   }
 }
 
-export const historyRepository = new StoredHistoryRepository();
+/**
+ * The live binding every consumer imports.
+ *
+ * `let` rather than `const` so `db/wire.ts` can point it at `PgHistoryRepository` at boot; ESM
+ * live bindings mean the reassignment reaches modules that already imported this one.
+ */
+export let historyRepository: HistoryRepository = new StoredHistoryRepository();
+
+/** Replace the driver. Called once, before the modules are mounted. */
+export const useHistoryRepository = (repo: HistoryRepository): void => { historyRepository = repo; };

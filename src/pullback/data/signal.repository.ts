@@ -50,6 +50,14 @@ export interface SignalRepository {
   lastFiredAt(symbol: string, timeframe: Timeframe): Promise<number | null>;
   /** Advance every open signal against the live price. Returns the ones that just settled. */
   settle(prices: Map<string, number>, nowMs?: number): Promise<SignalRecord[]>;
+  /**
+   * Persist anything held only in memory.
+   *
+   * On the interface rather than just the class because the scheduler calls it on a 60-second
+   * tick, and both drivers need it: the file driver defers the whole-file write, and the
+   * Postgres one batches every moved outcome into a single UPDATE.
+   */
+  flush(): Promise<void>;
 }
 
 export class StoredSignalRepository implements SignalRepository {
@@ -212,7 +220,16 @@ export class StoredSignalRepository implements SignalRepository {
   }
 }
 
-export const signalRepository = new StoredSignalRepository();
+/**
+ * The live binding every consumer imports.
+ *
+ * `let` rather than `const` so `db/wire.ts` can point it at `PgSignalRepository` at boot; ESM
+ * live bindings mean the reassignment reaches modules that already imported this one.
+ */
+export let signalRepository: SignalRepository = new StoredSignalRepository();
+
+/** Replace the driver. Called once, before the modules are mounted. */
+export const useSignalRepository = (repo: SignalRepository): void => { signalRepository = repo; };
 
 /** Aggregate today's log into the board's headline counters. */
 export function summarise(records: SignalRecord[]): {

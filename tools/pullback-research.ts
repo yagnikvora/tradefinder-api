@@ -20,6 +20,8 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { tokenSet } from '../src/upstox.js';
+import { dbEnabled } from '../src/db/pool.js';
+import { bySession, readRange, writeDays } from '../src/db/candle.archive.js';
 import { historical } from '../src/momentum/data/candles.js';
 import { isoDaysBefore, istDay, SESSION_MINUTES } from '../src/momentum/session.js';
 import { configRepository } from '../src/pullback/config/config.repository.js';
@@ -43,7 +45,17 @@ const hr = (t: string) => console.log(`\n${'─'.repeat(96)}\n${t}\n${'─'.repe
 
 /* ------------------------------------------------------------------------- candles --- */
 
-/** One symbol's 1-minute history, from disk when we have it and from Upstox when we do not. */
+/**
+ * One symbol's 1-minute history: the archive first, then disk, then Upstox.
+ *
+ * THE ARCHIVE IS TRIED FIRST BECAUSE IT IS KEYED CORRECTLY. The disk cache below is keyed by
+ * `SYMBOL_from_to.json` — the date RANGE the sweep happened to ask for — so changing `--days`
+ * from 120 to 180 orphans every file and re-fetches history already paid for. The archive is
+ * keyed by symbol and session, so the same change costs only the sessions genuinely missing.
+ *
+ * It also accumulates. A backtest window is limited by what has been archived rather than by
+ * what Upstox will serve in one range, which is the whole point of `npm run db:archive`.
+ */
 async function oneMinute(
   symbol: string,
   key: string,
@@ -51,6 +63,18 @@ async function oneMinute(
   to: string,
   cachedOnly: boolean,
 ): Promise<Bar[]> {
+  if (dbEnabled()) {
+    try {
+      const held = await readRange(symbol, from, to);
+      // A partial answer is not usable: a window with silent holes replays as a real sample and
+      // reports a confident number from half the sessions. Anything short falls through to the
+      // fetch below, which fills the archive on its way past.
+      if (held.length >= MIN_BARS_FOR_RANGE(from, to)) return held;
+    } catch (e) {
+      console.error(`  ${symbol}: archive read failed (${(e as Error).message}) — falling back`);
+    }
+  }
+
   await mkdir(CACHE_DIR, { recursive: true });
   const file = join(CACHE_DIR, `${symbol}_${from}_${to}.json`);
   try {
@@ -89,9 +113,30 @@ async function oneMinute(
     cursor = isoDaysBefore(-(MAX_RANGE_DAYS + 1), cursor);
   }
   out.sort((a, b) => a.at - b.at);
-  if (out.length) await writeFile(file, JSON.stringify(out));
+  if (out.length) {
+    await writeFile(file, JSON.stringify(out));
+    // Into the archive too, keyed by session rather than by the range this sweep asked for, so
+    // the next sweep with different `--days` does not pay for these bars again.
+    if (dbEnabled()) {
+      await writeDays(symbol, bySession(out)).catch((e: Error) =>
+        console.error(`  ${symbol}: archive write failed (${e.message}) — disk cache still written`));
+    }
+  }
   return out;
 }
+
+/**
+ * The floor for calling an archived range complete.
+ *
+ * Deliberately crude: roughly five trading days in seven, times a conservative 300 of the 375
+ * session minutes, times a further 0.8 for exchange holidays. It is not trying to know the NSE
+ * calendar — this module has no business owning a second source of truth about holidays — it is
+ * only trying to tell "the archive has this window" from "the archive has a fortnight of it".
+ */
+const MIN_BARS_FOR_RANGE = (from: string, to: string): number => {
+  const days = Math.max(1, (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000);
+  return Math.floor(days * (5 / 7) * 300 * 0.8);
+};
 
 /* --------------------------------------------------------------------------- stats --- */
 
