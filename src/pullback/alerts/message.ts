@@ -9,7 +9,7 @@
 // So the content is written once against a `Markup` and each channel supplies its own. Adding a
 // third channel is a `Markup` and a `send`, not another copy of the message.
 
-import type { AlertEvent, OptionPick, PullbackSignal } from '../types.js';
+import type { AlertEvent, OptionPick, PullbackSignal, TrendContext } from '../types.js';
 import { TIMEFRAME_LABEL } from '../types.js';
 
 /** The three things a channel has to answer about text. */
@@ -60,11 +60,28 @@ function riskPerLot(signal: PullbackSignal, o: OptionPick): number | null {
   return Math.round((o.entryCost - premiumAtStop) * o.lotSize);
 }
 
-/** The option block: the contract, what a lot costs, and what a lot makes or loses. */
+/**
+ * The option block: the contract, what a lot costs, and what a lot makes or loses.
+ *
+ * THE ABSENT CASE IS NOT A LIQUIDITY FAILURE, and this used to say it was. `selectOption`
+ * returns null in three situations and none of them is a thin strike: there was no chain for
+ * this stock in the cycle, there was no usable spot, or nothing in the strike window came back
+ * priced. A genuine liquidity failure takes the opposite path on purpose — the nearest strike
+ * is returned WITH its warnings, because "here is the contract and here is what is wrong with
+ * it" beats silence, so that case arrives as a contract and a caveat and never reaches here.
+ *
+ * The distinction is worth the words. The old wording sent a reader to check whether the
+ * strikes were thin, when the chain had simply not been fetched — and it implied the setup was
+ * untradable, when the stock levels below are computed from the stock and stand regardless.
+ */
 function optionLines(signal: PullbackSignal, m: Markup): string[] {
   const o = signal.option;
   if (!o)
-    return ['', `⚠️ ${m.italic('No tradable option contract — the strikes here failed the liquidity gate.')}`];
+    return [
+      '',
+      `⚠️ ${m.italic('No option chain for this stock this cycle — no contract priced.')}`,
+      `    ${m.italic('The stock levels below still stand; pick the contract yourself.')}`,
+    ];
 
   const out = [
     '',
@@ -89,19 +106,49 @@ function optionLines(signal: PullbackSignal, m: Markup): string[] {
 }
 
 /**
+ * The session behind the setup, in one line.
+ *
+ * This is the context that decides whether the pullback is a pause or a failure, and it is the
+ * only thing on the message the pullback scanner did not work out for itself. It is written
+ * even when it disagrees or is missing: an alert that arrives with "the day is going the other
+ * way" is a judgement the reader can make, and one that silently omits it is not.
+ */
+function trendLine(signal: PullbackSignal, trend: TrendContext | null, m: Markup): string[] {
+  if (!trend)
+    return ['', `📈 ${m.italic('Trend day: not measurable — no live session reading for this stock.')}`];
+
+  const word = trend.direction === 1 ? 'bullish' : trend.direction === -1 ? 'bearish' : 'neutral';
+  const agrees = trend.direction === signal.direction;
+
+  if (trend.phase === 'Confirmed' && agrees)
+    return ['', `📈 ${m.bold(`With the day — confirmed ${word}`)}, conviction ${trend.score.toFixed(0)}` +
+      `${trend.confirmedAt ? ` since ${istClock(trend.confirmedAt)}` : ''}` +
+      `${trend.partial ? m.italic(' (partial read)') : ''}`];
+
+  if (trend.phase === 'Forming' && agrees)
+    return ['', `📈 One-sided day ${m.bold('forming')} ${word}, conviction ${trend.score.toFixed(0)} — not confirmed yet.`];
+
+  if (!agrees && trend.direction !== 0)
+    return ['', `⚠️ ${m.bold(`Against the day`)} — the session is ${word} at conviction ${trend.score.toFixed(0)}.`];
+
+  return ['', `📉 ${m.italic(`No one-sided day — conviction ${trend.score.toFixed(0)}, phase ${trend.phase.toLowerCase()}.`)}`];
+}
+
+/**
  * A fired signal as a message.
  *
- * Ordered as the decision is made: what it is, what to buy, what it costs, where it goes, where
- * you are wrong, how long you have. The stock levels come after the option because the option is
- * what gets traded — the stock levels are what the stop and target are MEASURED on.
+ * Ordered as the decision is made: what it is, whether the day agrees, what to buy, what it
+ * costs, where it goes, where you are wrong. The stock levels come after the option because the
+ * option is what gets traded — the stock levels are what the stop and target are MEASURED on.
  */
-export function buildSignalMessage(signal: PullbackSignal, m: Markup): string {
+export function buildSignalMessage(signal: PullbackSignal, m: Markup, trend: TrendContext | null = null): string {
   const dir = signal.direction === 1 ? '🟢 LONG' : '🔴 SHORT';
   const risk = Math.abs(signal.entry - signal.stop.recommended.price);
 
   return [
     `${dir}  ${m.bold(m.escape(signal.symbol))}  ·  ${signal.score.band} ${signal.score.total.toFixed(0)}/100`,
     m.italic(`${TIMEFRAME_LABEL[signal.timeframe]} pullback entry · fired ${istClock(signal.firedAt)}`),
+    ...trendLine(signal, trend, m),
     ...optionLines(signal, m),
     '',
     `📊 ${m.bold(m.escape(signal.symbol))} levels`,

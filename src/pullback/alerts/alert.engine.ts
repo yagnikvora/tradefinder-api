@@ -30,10 +30,11 @@
 
 import type {
   AlertEvent, AlertKind, ConfidenceBand, PullbackConfig, PullbackRow, PullbackSignal, SignalRecord,
-  Timeframe,
+  Timeframe, TrendContext,
 } from '../types.js';
 import { ALERT_LABEL, TIMEFRAME_LABEL } from '../types.js';
 import { marketOpen } from '../../momentum/session.js';
+import { trendContextStatus, trendFor } from '../data/trend-context.js';
 import * as telegram from './telegram.js';
 import * as discord from './discord.js';
 
@@ -63,13 +64,72 @@ const BAND_ORDER: ConfidenceBand[] = ['Weak', 'Medium', 'Strong', 'Excellent'];
 const bandOf = (score: number, b: PullbackConfig['score']['bands']): ConfidenceBand =>
   score >= b.excellent ? 'Excellent' : score >= b.strong ? 'Strong' : score >= b.medium ? 'Medium' : 'Weak';
 
+/* ------------------------------------------------------------------ the trend gate --- */
+
+/** Why a push was held back, counted so a quiet channel can always be explained. */
+const suppressed = { total: 0, wrongWay: 0, notOneSided: 0, tooWeak: 0, unknown: 0 };
+let passedUnknown = 0;
+
+const PHASE_RANK: Record<string, number> = { None: 0, Faded: 0, Forming: 1, Confirmed: 2 };
+
+export interface TrendVerdict {
+  /** Whether the push may go out. */
+  ok: boolean;
+  trend: TrendContext | null;
+  /** Null when it agreed; otherwise the reason, in the words the message and status use. */
+  reason: 'wrongWay' | 'notOneSided' | 'tooWeak' | 'unknown' | null;
+}
+
+/**
+ * Does the session agree with this entry?
+ *
+ * The order of the tests is the order they matter in. Direction first: an entry taken AGAINST a
+ * confirmed one-sided day is the worst row this gate can catch, and it is worse than an entry on
+ * a stock with no trend at all — so it is separated in the counters rather than folded into a
+ * single "no confluence" bucket that would hide it.
+ */
+export function trendVerdict(cfg: PullbackConfig, symbol: string, dir: 1 | -1, nowMs: number): TrendVerdict {
+  const t = cfg.alerts.push?.trend;
+  if (!t || t.mode === 'off') return { ok: true, trend: null, reason: null };
+
+  const trend = trendFor(symbol, t.maxBoardAgeSec, nowMs);
+  if (!trend) return { ok: t.allowWhenUnknown, trend: null, reason: 'unknown' };
+
+  // `annotate` still computes the verdict — the message wants it — but never blocks.
+  const blocking = t.mode === 'require';
+
+  if (t.sameDirection && trend.direction !== 0 && trend.direction !== dir)
+    return { ok: !blocking, trend, reason: 'wrongWay' };
+
+  if (PHASE_RANK[trend.phase] < PHASE_RANK[t.minPhase])
+    return { ok: !blocking, trend, reason: 'notOneSided' };
+
+  // A same-direction phase with no displacement behind it: rare, since the phase machine already
+  // gates on that, but the floor is here for anyone who wants to raise the bar past the phase.
+  if (t.minScore > 0 && trend.score < t.minScore)
+    return { ok: !blocking, trend, reason: 'tooWeak' };
+
+  return { ok: true, trend, reason: null };
+}
+
 /** Whether this event has earned an interruption. Deliberately stricter than the in-app feed. */
-function passesPush(cfg: PullbackConfig, e: AlertEvent): boolean {
+function passesPush(cfg: PullbackConfig, e: AlertEvent, verdict: TrendVerdict): boolean {
   const p = cfg.alerts.push;
   if (!p?.enabled || !p.kinds.includes(e.kind)) return false;
   // No score means nothing to judge, and "unknown confidence" is not "high confidence".
   if (e.score == null) return false;
-  return BAND_ORDER.indexOf(bandOf(e.score, cfg.score.bands)) >= BAND_ORDER.indexOf(p.minBand);
+  if (BAND_ORDER.indexOf(bandOf(e.score, cfg.score.bands)) < BAND_ORDER.indexOf(p.minBand)) return false;
+
+  if (!verdict.ok) {
+    suppressed.total++;
+    if (verdict.reason) suppressed[verdict.reason]++;
+    return false;
+  }
+  // Counted separately: a push that only passed because the session was not measurable is not
+  // the filtered alert the user thinks they configured, and a run of them means the momentum
+  // scanner has stopped rather than that every setup happened to be confluent.
+  if (verdict.reason === 'unknown') passedUnknown++;
+  return true;
 }
 
 function emit(
@@ -104,12 +164,16 @@ function emit(
   if (prev !== undefined && e.at - prev < cfg.alerts.dedupeMin * 60_000) return null;
   lastSent.set(k, e.at);
 
-  const event: AlertEvent = { ...e, id: `${e.at}-${++seq}` };
+  // Read once and carried, so the feed, the webhook, the phone message and the suppression
+  // counters can never disagree about what the session was doing when this fired.
+  const verdict = trendVerdict(cfg, e.symbol, dir, e.at);
+
+  const event: AlertEvent = { ...e, id: `${e.at}-${++seq}`, trend: verdict.trend };
   ring.push(event);
   if (ring.length > cfg.alerts.keep) ring.splice(0, ring.length - cfg.alerts.keep);
 
   void post(cfg, event);
-  if (passesPush(cfg, event)) void pushAll(event, signal);
+  if (passesPush(cfg, event, verdict)) void pushAll(event, signal);
   return event;
 }
 
@@ -122,11 +186,12 @@ function emit(
  * about, and both have to fail together for that to happen now.
  */
 function pushAll(event: AlertEvent, signal?: PullbackSignal): void {
+  const trend = event.trend ?? null;
   if (telegram.telegramConfigured())
-    void telegram.sendTelegram(signal ? telegram.signalMessage(signal) : telegram.eventMessage(event));
+    void telegram.sendTelegram(signal ? telegram.signalMessage(signal, trend) : telegram.eventMessage(event));
   if (discord.discordConfigured())
     void discord.sendDiscord(
-      signal ? discord.signalMessage(signal) : discord.eventMessage(event),
+      signal ? discord.signalMessage(signal, trend) : discord.eventMessage(event),
       event.direction,
     );
 }
@@ -277,6 +342,14 @@ export const alertStatus = () => ({
   held: ring.length,
   webhookFailures,
   lastWebhookError,
+  // The trend gate, in the open. A drop in alerts should always be explainable as a number
+  // here rather than as a suspicion that the channel broke — and `passedUnknown` climbing is
+  // how you find out the momentum scanner stopped without the phone going silent to tell you.
+  trendGate: {
+    ...suppressed,
+    passedUnknown,
+    context: trendContextStatus(),
+  },
   // A push channel that has quietly stopped working looks exactly like a quiet market, so its
   // health is reported rather than left to be inferred from an absence of notifications.
   telegram: telegram.telegramStatus(),
@@ -290,4 +363,10 @@ export const resetAlerts = (): void => {
   lastPhase.clear();
   webhookFailures = 0;
   lastWebhookError = null;
+  suppressed.total = 0;
+  suppressed.wrongWay = 0;
+  suppressed.notOneSided = 0;
+  suppressed.tooWeak = 0;
+  suppressed.unknown = 0;
+  passedUnknown = 0;
 };

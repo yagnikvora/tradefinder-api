@@ -22,6 +22,7 @@ import { CANDLE_ENDPOINT } from './data/candles.js';
 import { breakerState } from './data/throttle.js';
 import { historyRepository } from './data/history.repository.js';
 import { scanOnce, schedulerStatus } from './scheduler.js';
+import { seedSession } from './data/session-seed.js';
 import { cache, single } from './cache.js';
 import { applySignalFilters, isValidationError, parseBoardQuery, parseConfigPatch, parseSymbol } from './dto.js';
 import { marketOpen } from './session.js';
@@ -320,6 +321,30 @@ export function momentumRouter(): express.Router {
       trendLookback: cfg.thresholds.trendStructure.lookbackSessions,
     }).catch(() => {});
     send(res, { started: true, note: 'building — poll GET /momentum/status for progress' }, 'upstox');
+  });
+
+  // --------------------------------------------------------- POST /momentum/seed ----
+  //
+  // Rebuild today's session from the exchange's 1-minute candles. The scheduler already does
+  // this once per process per day; this is the escape hatch for the two cases it cannot cover:
+  // a boot that landed in a spent candle quota, and wanting to re-measure the morning after
+  // changing a conviction threshold.
+  //
+  // `?force=true` re-seeds even the symbols this process watched from the open. That is a
+  // DOWNGRADE — a 1-minute replay is coarser than the live 15-second record — so it is opt-in
+  // rather than the default. Like the baseline rebuild, it answers immediately and works
+  // behind the response, because ~208 candle requests outlive any sensible request timeout.
+  router.post('/seed', async (req: Request, res: Response) => {
+    if (!tokenSet())
+      return fail(res, 503, 'UPSTOX_ACCESS_TOKEN is not set — put your Upstox Analytics Token in api/.env');
+
+    const force = String(req.query.force ?? '') === 'true';
+    void seedSession({ force }).then(() => cache.del(BOARD_KEY)).catch(() => {});
+    send(res, {
+      started: true,
+      force,
+      note: 'rebuilding today’s session from 1-minute candles — poll GET /momentum/status for progress',
+    }, 'upstox');
   });
 
   // --------------------------------------------------- POST /momentum/scan (manual) ----

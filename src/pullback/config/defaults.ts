@@ -258,6 +258,31 @@ export const DEFAULT_CONFIG: PullbackConfig = {
       enabled: true,
       kinds: ['trendResume'],
       minBand: 'Strong',
+      // The second gate, and the one that reads the DAY rather than the setup.
+      //
+      // A pullback entry is a bet that an interrupted move resumes. Whether it does depends
+      // mostly on something this scanner cannot see from its own bars: if the session has been
+      // one-sided since the open, the retracement is the day pausing; if price has crossed VWAP
+      // nine times, the identical structure is chop, and the confirmation candle is the ninth
+      // crossing rather than a resumption. The two produce the same score here and opposite
+      // outcomes — which is the failure this gate exists for.
+      //
+      // `Confirmed` rather than `Forming`, because Forming is a claim that has not survived a
+      // test yet: promotion needs twenty minutes of sustained one-sidedness, and the alert is
+      // worth waiting for that. Direction has to agree, or the entry is being taken into the
+      // session rather than with it.
+      //
+      // Unknown is allowed through on purpose — see `allowWhenUnknown` — so that turning the
+      // momentum scheduler off degrades the alerts to their old behaviour rather than silencing
+      // them. The message says when a push arrived that way.
+      trend: {
+        mode: 'require',
+        minPhase: 'Confirmed',
+        sameDirection: true,
+        minScore: 0,
+        allowWhenUnknown: true,
+        maxBoardAgeSec: 120,
+      },
     },
   },
 

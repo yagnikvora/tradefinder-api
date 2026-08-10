@@ -13,7 +13,7 @@
 // the Telegram token it lives in the environment and never in the config that `GET /pullback/config`
 // serves over HTTP.
 
-import type { AlertEvent, PullbackSignal } from '../types.js';
+import type { AlertEvent, PullbackSignal, TrendContext } from '../types.js';
 import { buildEventMessage, buildSignalMessage, MARKDOWN } from './message.js';
 
 const url = () => (process.env.PULLBACK_DISCORD_WEBHOOK_URL ?? '').trim();
@@ -67,7 +67,8 @@ const BULL = 0x2ec76a;
 const BEAR = 0xe5484d;
 const NEUTRAL = 0x4c8dff;
 
-export const signalMessage = (signal: PullbackSignal): string => buildSignalMessage(signal, MARKDOWN);
+export const signalMessage = (signal: PullbackSignal, trend: TrendContext | null = null): string =>
+  buildSignalMessage(signal, MARKDOWN, trend);
 export const eventMessage = (e: AlertEvent): string => buildEventMessage(e, MARKDOWN);
 
 /** An embed description tops out at 4096 characters; ours run ~600, so this only ever guards. */

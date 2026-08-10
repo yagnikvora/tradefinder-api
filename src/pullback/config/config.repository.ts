@@ -9,11 +9,18 @@
 // The store is shared with the momentum module — `momentum/store.ts` is a driver, not that
 // module's private state — under its own key, so the two modules' configs cannot collide.
 
-import type { AlertKind, ConfidenceBand, PullbackConfig, Knot, Timeframe } from '../types.js';
+import type {
+  AlertKind, ConfidenceBand, PullbackConfig, Knot, Timeframe, TrendConfluence, TrendConfluenceMode,
+} from '../types.js';
 import { TIMEFRAMES } from '../types.js';
 
 const ALERT_KINDS: AlertKind[] = ['freshPullback', 'trendResume', 'emaRejection', 'targetHit', 'stopHit'];
 const BANDS: ConfidenceBand[] = ['Weak', 'Medium', 'Strong', 'Excellent'];
+const TREND_MODES: TrendConfluenceMode[] = ['require', 'annotate', 'off'];
+const DEFAULT_TREND_CONFLUENCE: TrendConfluence = {
+  mode: 'require', minPhase: 'Confirmed', sameDirection: true,
+  minScore: 0, allowWhenUnknown: true, maxBoardAgeSec: 120,
+};
 import { defaultConfig } from './defaults.js';
 import { store, type KeyValueStore } from '../../momentum/store.js';
 
@@ -236,10 +243,24 @@ export function sanitise(cfg: PullbackConfig): PullbackConfig {
   // incapable of ever sending, the most confusing of the possible wrong states.
   const push = cfg.alerts.push ?? { enabled: true, kinds: ['trendResume'], minBand: 'Strong' };
   const kinds = Array.isArray(push.kinds) ? push.kinds.filter((k) => ALERT_KINDS.includes(k)) : [];
+  // The trend gate, repaired the same way. An unrecognised mode falls back to `require` rather
+  // than to `off`: a typo in the one field that decides whether a filter runs should not quietly
+  // remove the filter, which is the failure that would be invisible until a week of bad alerts.
+  const tc = push.trend ?? DEFAULT_TREND_CONFLUENCE;
   cfg.alerts.push = {
     enabled: !!push.enabled,
     kinds: kinds.length ? [...new Set(kinds)] : ['trendResume'],
     minBand: BANDS.includes(push.minBand) ? push.minBand : 'Strong',
+    trend: {
+      mode: TREND_MODES.includes(tc.mode) ? tc.mode : 'require',
+      minPhase: tc.minPhase === 'Forming' ? 'Forming' : 'Confirmed',
+      sameDirection: tc.sameDirection !== false,
+      minScore: clampNumber(tc.minScore, 0, 100, 0),
+      allowWhenUnknown: tc.allowWhenUnknown !== false,
+      // Floored at one scan interval: anything shorter and every board is "stale" the moment it
+      // is read, which would turn the gate into a permanent unknown.
+      maxBoardAgeSec: clampNumber(tc.maxBoardAgeSec, 15, 3600, 120),
+    },
   };
 
   // A scan faster than 10s would spend the quote budget confirming that a 3-minute bar has not

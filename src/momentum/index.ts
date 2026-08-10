@@ -47,6 +47,7 @@ export { configRepository, StoredConfigRepository, sanitise } from './config/con
 export { defaultConfig, DEFAULT_CONFIG } from './config/defaults.js';
 export { historyRepository } from './data/history.repository.js';
 export { snapshotRepository } from './data/snapshot.repository.js';
+export { seedSession, seedStatus, replayQuotes } from './data/session-seed.js';
 export { buildBaseline, getBaseline, ensureBaseline } from './data/baseline.js';
 export { cache, MemoryCache, type MomentumCache } from './cache.js';
 export { startScheduler, stopScheduler, scanOnce, schedulerStatus } from './scheduler.js';

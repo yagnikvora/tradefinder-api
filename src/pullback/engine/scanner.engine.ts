@@ -46,6 +46,7 @@ import { snapshot, type Snapshot, type Tick } from '../data/quotes.js';
 import { universe, type Member, type Universe } from '../data/universe.js';
 import { signalRepository } from '../data/signal.repository.js';
 import { fromOutcome, fromRows, fromSignal } from '../alerts/alert.engine.js';
+import { primeTrendContext } from '../data/trend-context.js';
 import { readPullback } from './pullback.service.js';
 import { evaluateSignal, worthWatching, type SignalResult } from './signal.service.js';
 import { readTrend } from './trend.service.js';
@@ -432,6 +433,12 @@ export async function runScan(cfg: PullbackConfig, nowMs = Date.now()): Promise<
   /* ---------------------------------------------------------- log, settle, alert --- */
 
   const today = istDay(nowMs);
+
+  // The momentum module's session reading, loaded once for the whole batch. Every alert raised
+  // below is gated on whether the stock is also having a one-sided day, and the alert path is
+  // synchronous — so this is read here rather than per row per timeframe. Costs one memoised
+  // board read and no upstream request; failures leave the gate reading "unknown".
+  await primeTrendContext(nowMs);
 
   for (const r of rows) {
     if (!r.signal) continue;

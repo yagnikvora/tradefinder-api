@@ -29,7 +29,7 @@
 // no leg, and the timing layer would sit at `ready: false` while the market moved.
 
 import { store, STORE_KEYS } from '../store.js';
-import { istDay, minuteOfSession } from '../session.js';
+import { istDay, minuteOfSession, SESSION_MINUTES } from '../session.js';
 import type { MomentumQuote } from './quotes.js';
 import type { Direction, TrendPhase, TriggerKind } from '../types.js';
 
@@ -274,6 +274,23 @@ function forSymbol(s: SessionState, symbol: string): SymbolSessionState {
 }
 
 /**
+ * Wipe one symbol back to a blank session.
+ *
+ * Exists for the seed in `session-seed.ts`, and exists because `observe` ACCUMULATES: replaying
+ * a day into a symbol that already holds a partial one would add the two together, doubling
+ * `ticks` and `travelled` and reporting a session efficiency that describes neither. Making the
+ * reset explicit is what lets the seed be run twice — on boot and again by hand — and give the
+ * same answer both times.
+ */
+export function resetSymbolSession(s: SessionState, symbol: string): void {
+  s.symbols[symbol] = {
+    readings: [], openingRange: null, lastAtmDelta: null, lastFuturesOi: null, leg: null,
+    events: [], shape: null, spine: [], trend: null, smoothScore: null, dirHold: null,
+  };
+  dirty = true;
+}
+
+/**
  * Fold one quote-tier reading into the session state.
  *
  * The opening range is captured continuously and frozen the moment the window closes. It is
@@ -305,6 +322,12 @@ export function observe(
 ): void {
   const minute = minuteOfSession(nowMs);
   if (minute <= 0) return; // pre-open: nothing has traded, and ohlc is last session's shell
+  // Post-close, the feed repeats the closing print forever. Folding those in is not merely
+  // wasteful: an instance started in the evening would write a `fromMinute: 375` shape for a
+  // session it never watched, which reads downstream as "the accumulators are warming up"
+  // rather than as "this process was not here today". The seed below is how the evening gets
+  // a real session; this guard is what stops a fake one being written over it.
+  if (minute >= SESSION_MINUTES) return;
 
   const sym = forSymbol(s, q.symbol);
 

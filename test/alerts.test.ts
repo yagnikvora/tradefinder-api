@@ -15,11 +15,14 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, beforeEach } from 'node:test';
 
-import { fromRows, fromSignal, resetAlerts } from '../src/pullback/alerts/alert.engine.js';
+import { fromRows, fromSignal, resetAlerts, trendVerdict } from '../src/pullback/alerts/alert.engine.js';
+import { primeTrendContextFrom, resetTrendContext } from '../src/pullback/data/trend-context.js';
 import { signalMessage } from '../src/pullback/alerts/telegram.js';
 import { signalMessage as discordMessage, discordConfigured } from '../src/pullback/alerts/discord.js';
 import { defaultConfig } from '../src/pullback/config/defaults.js';
-import type { OptionPick, PullbackConfig, PullbackRow, PullbackSignal } from '../src/pullback/types.js';
+import type {
+  OptionPick, PullbackConfig, PullbackRow, PullbackSignal, TrendContext,
+} from '../src/pullback/types.js';
 
 /* ------------------------------------------------------------------------ fixtures --- */
 
@@ -163,6 +166,152 @@ describe('alerts: the push gate', () => {
   });
 });
 
+describe('alerts: the trend-day gate', () => {
+  beforeEach(() => {
+    resetAlerts();
+    resetTrendContext();
+  });
+
+  /** A momentum board carrying one symbol's conviction, as the gate reads it. */
+  const board = (over: Record<string, unknown> = {}, asOf = OPEN) =>
+    primeTrendContextFrom({
+      asOf,
+      rows: [{
+        symbol: 'GAIL',
+        conviction: {
+          ready: true, phase: 'Confirmed', direction: 'Bullish', score: 84,
+          confirmedAt: ist(10, 30), heldMin: 30, partial: false, ...over,
+        },
+      }],
+    }, OPEN);
+
+  it('lets a long through when the day is confirmed bullish', () => {
+    board();
+    const v = trendVerdict(config(), 'GAIL', 1, OPEN);
+    assert.equal(v.ok, true);
+    assert.equal(v.reason, null);
+    assert.equal(v.trend?.score, 84);
+  });
+
+  // The row this gate exists to catch: a textbook pullback taken into a session going the
+  // other way. It is counted apart from "no trend" because it is the worse of the two.
+  it('holds back an entry taken against a confirmed day', () => {
+    board();
+    const v = trendVerdict(config(), 'GAIL', -1, OPEN);
+    assert.equal(v.ok, false);
+    assert.equal(v.reason, 'wrongWay');
+  });
+
+  it('holds back a stock that is merely forming, by default', () => {
+    board({ phase: 'Forming' });
+    assert.equal(trendVerdict(config(), 'GAIL', 1, OPEN).reason, 'notOneSided');
+  });
+
+  it('accepts Forming once the floor is lowered to it', () => {
+    board({ phase: 'Forming' });
+    const cfg = config();
+    cfg.alerts.push.trend.minPhase = 'Forming';
+    assert.equal(trendVerdict(cfg, 'GAIL', 1, OPEN).ok, true);
+  });
+
+  it('treats a faded day as no day at all', () => {
+    board({ phase: 'Faded' });
+    assert.equal(trendVerdict(config(), 'GAIL', 1, OPEN).ok, false);
+  });
+
+  it('enforces a conviction floor above the phase when one is set', () => {
+    board({ score: 60 });
+    const cfg = config();
+    cfg.alerts.push.trend.minScore = 70;
+    assert.equal(trendVerdict(cfg, 'GAIL', 1, OPEN).reason, 'tooWeak');
+  });
+
+  // A conviction that is not ready is not a verdict of "not trending" — the accumulators simply
+  // have not seen enough of the session, and blocking on it would be inventing a reading.
+  it('reads an unready conviction as unknown, not as a refusal', () => {
+    board({ ready: false });
+    const v = trendVerdict(config(), 'GAIL', 1, OPEN);
+    assert.equal(v.reason, 'unknown');
+    assert.equal(v.trend, null);
+  });
+
+  it('fails OPEN when there is no reading, so the channel never goes silently dark', () => {
+    const v = trendVerdict(config(), 'NOTINBOARD', 1, OPEN);
+    assert.equal(v.reason, 'unknown');
+    assert.equal(v.ok, true);
+  });
+
+  it('fails closed instead when that is what was asked for', () => {
+    const cfg = config();
+    cfg.alerts.push.trend.allowWhenUnknown = false;
+    assert.equal(trendVerdict(cfg, 'NOTINBOARD', 1, OPEN).ok, false);
+  });
+
+  // A board older than the momentum scan interval means that scanner has stopped, and a phase
+  // nobody is maintaining is worse than no phase.
+  it('discards a stale board rather than trusting its phase', () => {
+    board({}, OPEN - 10 * 60_000);
+    assert.equal(trendVerdict(config(), 'GAIL', 1, OPEN).reason, 'unknown');
+  });
+
+  it('is inert when switched off', () => {
+    board({ direction: 'Bearish' });
+    const cfg = config();
+    cfg.alerts.push.trend.mode = 'off';
+    const v = trendVerdict(cfg, 'GAIL', 1, OPEN);
+    assert.equal(v.ok, true);
+    assert.equal(v.trend, null);
+  });
+
+  // `annotate` still reaches a verdict — the message prints it — it just never blocks.
+  it('reports the disagreement but sends anyway in annotate mode', () => {
+    board({ direction: 'Bearish' });
+    const cfg = config();
+    cfg.alerts.push.trend.mode = 'annotate';
+    const v = trendVerdict(cfg, 'GAIL', 1, OPEN);
+    assert.equal(v.ok, true);
+    assert.equal(v.reason, 'wrongWay');
+  });
+
+  it('ignores direction entirely when told to', () => {
+    board({ direction: 'Bearish' });
+    const cfg = config();
+    cfg.alerts.push.trend.sameDirection = false;
+    assert.equal(trendVerdict(cfg, 'GAIL', 1, OPEN).ok, true);
+  });
+});
+
+describe('alerts: the trend line on the message', () => {
+  const trend = (over: Partial<TrendContext> = {}): TrendContext => ({
+    phase: 'Confirmed', direction: 1, score: 84, confirmedAt: ist(10, 30),
+    heldMin: 30, partial: false, ageMs: 4000, ...over,
+  });
+
+  it('says the entry is with the day, and since when', () => {
+    const msg = signalMessage(signal(88), trend());
+    assert.match(msg, /With the day — confirmed bullish/);
+    assert.match(msg, /conviction 84/);
+    assert.match(msg, /10:30 AM/);
+  });
+
+  it('warns in as many words when the day disagrees', () => {
+    const msg = signalMessage(signal(88), trend({ direction: -1 }));
+    assert.match(msg, /Against the day/);
+  });
+
+  it('says the session was not measurable rather than staying silent about it', () => {
+    assert.match(signalMessage(signal(88), null), /not measurable/);
+  });
+
+  it('marks a partial read as one', () => {
+    assert.match(signalMessage(signal(88), trend({ partial: true })), /partial read/);
+  });
+
+  it('renders in Discord markup too, so the two channels agree', () => {
+    assert.match(discordMessage(signal(88), trend()), /With the day — confirmed bullish/);
+  });
+});
+
 describe('alerts: the message', () => {
   const msg = signalMessage(signal(88));
 
@@ -187,8 +336,32 @@ describe('alerts: the message', () => {
     assert.match(msg, /2\.00R/);
   });
 
-  it('says so when there is no tradable contract rather than going quiet', () => {
-    assert.match(signalMessage(signal(88, OPEN, { option: null })), /No tradable option contract/);
+  // The two absent-contract cases are DIFFERENT states and used to be described as one. A null
+  // option means no chain was priced this cycle; a thin strike comes back as a contract with a
+  // warning and never reaches this branch. Naming the wrong one sent the reader to inspect
+  // strike liquidity when the chain had simply not been fetched.
+  describe('when there is no contract', () => {
+    const none = signalMessage(signal(88, OPEN, { option: null }));
+
+    it('says the chain was missing, not that the strikes were thin', () => {
+      assert.match(none, /No option chain for this stock this cycle/);
+      assert.doesNotMatch(none, /liquidity gate/i);
+    });
+
+    it('says the stock levels still stand, because they do', () => {
+      assert.match(none, /stock levels below still stand/);
+      assert.match(none, /Entry <b>200\.00<\/b>/);
+    });
+
+    it('still reports a thin strike as a contract plus a warning', () => {
+      const thin = signal(88, OPEN, {
+        option: option({ warnings: ['no strike here is both tradable (liquidity ≥ 45) and has 1,000+ open interest'] }),
+      });
+      const msg = signalMessage(thin);
+      assert.match(msg, /BUY 200 CE/);
+      assert.match(msg, /liquidity ≥ 45/);
+      assert.doesNotMatch(msg, /No option chain/);
+    });
   });
 
   // A long option cannot lose more than its premium; a wide stop must not imply a debt.

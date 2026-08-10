@@ -12,7 +12,7 @@
 // must never be able to fail or slow the scan. Failures are counted and surfaced on
 // `/pullback/status` so a silent channel is diagnosable rather than merely quiet.
 
-import type { AlertEvent, PullbackSignal } from '../types.js';
+import type { AlertEvent, PullbackSignal, TrendContext } from '../types.js';
 import { buildEventMessage, buildSignalMessage, HTML } from './message.js';
 
 const DEFAULT_API = 'https://api.telegram.org';
@@ -140,7 +140,8 @@ function describeError(msg: string): string {
       'mirror you control (see tools/telegram-mirror.worker.js), or use a VPN. Discord is unaffected.';
 }
 
-export const signalMessage = (signal: PullbackSignal): string => buildSignalMessage(signal, HTML);
+export const signalMessage = (signal: PullbackSignal, trend: TrendContext | null = null): string =>
+  buildSignalMessage(signal, HTML, trend);
 export const eventMessage = (e: AlertEvent): string => buildEventMessage(e, HTML);
 
 /**

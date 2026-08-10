@@ -21,8 +21,13 @@ import { cache, single } from '../momentum/cache.js';
 import { CANDLE_ENDPOINT } from '../momentum/data/candles.js';
 import { breakerState } from '../momentum/data/throttle.js';
 import { alertStatus, alerts } from './alerts/alert.engine.js';
-import { sendTelegram, telegramConfigured, telegramStatus } from './alerts/telegram.js';
-import { sendDiscord, discordConfigured, discordStatus } from './alerts/discord.js';
+import {
+  sendTelegram, telegramConfigured, telegramStatus, signalMessage as telegramSignalMessage,
+} from './alerts/telegram.js';
+import {
+  sendDiscord, discordConfigured, discordStatus, signalMessage as discordSignalMessage,
+} from './alerts/discord.js';
+import { sampleAlert } from './alerts/sample.js';
 import { schedulerStatus } from './scheduler.js';
 import { backtest } from './backtest/backtest.engine.js';
 import { configRepository } from './config/config.repository.js';
@@ -266,29 +271,51 @@ export function pullbackRouter(): express.Router {
   // Sends one message to the phone, so the channel can be proved end to end without waiting for a
   // live signal — which, outside market hours, would mean waiting until tomorrow. It bypasses the
   // market-hours gate on purpose: this is a plumbing check, not an alert.
-  router.post('/alerts/test', async (_req, res) => {
+  router.post('/alerts/test', async (req, res) => {
     if (!telegramConfigured() && !discordConfigured())
       return fail(res, 503, 'No phone channel is configured', {
         hint: 'set PULLBACK_TELEGRAM_BOT_TOKEN + PULLBACK_TELEGRAM_CHAT_ID and/or PULLBACK_DISCORD_WEBHOOK_URL in api/.env, then restart the API',
       });
 
     const cfg = await configRepository.get();
-    const lines = (b: (s: string) => string) => [
-      `✅ ${b('TradeFinder alerts are wired up.')}`,
-      '',
-      `You will be messaged on: ${b(cfg.alerts.push.kinds.join(', '))}`,
-      `Confidence floor: ${b(`${cfg.alerts.push.minBand} or better`)}`,
-      'Only during market hours, 09:15 AM – 03:30 PM IST.',
-    ].join('\n');
+    const t = cfg.alerts.push.trend;
+
+    // `?sample=signal` sends a full entry message instead of the summary — same layout, same
+    // renderer, real symbol and real conviction — so the FORMAT can be checked before a session
+    // rather than discovered during one. Marked as a sample on its first line.
+    let sampleBasis: string | null = null;
+    let render: (html: boolean) => string;
+
+    if (String(req.query.sample ?? '') === 'signal') {
+      const { signal, trend, basis } = await sampleAlert();
+      sampleBasis = basis;
+      render = (html) =>
+        (html ? '🧪 <b>SAMPLE — not a live signal</b>\n\n' : '🧪 **SAMPLE — not a live signal**\n\n') +
+        (html ? telegramSignalMessage(signal, trend) : discordSignalMessage(signal, trend));
+    } else {
+      const lines = (b: (s: string) => string) => [
+        `✅ ${b('Trinetra alerts are wired up.')}`,
+        '',
+        `You will be messaged on: ${b(cfg.alerts.push.kinds.join(', '))}`,
+        `Confidence floor: ${b(`${cfg.alerts.push.minBand} or better`)}`,
+        t.mode === 'off'
+          ? 'Trend-day filter: off — every qualifying setup is sent.'
+          : `Trend-day filter: ${b(t.mode)} — the session must be ${b(`${t.minPhase.toLowerCase()} one-sided`)}` +
+            `${t.sameDirection ? ' in the same direction' : ''}.`,
+        'Only during market hours, 09:15 AM – 03:30 PM IST.',
+      ].join('\n');
+      render = (html) => lines((s) => (html ? `<b>${s}</b>` : `**${s}**`));
+    }
 
     // Both are attempted even if the first fails — the point of two channels is that they are
     // independent, and a test that stopped at the first failure could not show you that.
     const [tg, dc] = await Promise.all([
-      telegramConfigured() ? sendTelegram(lines((s) => `<b>${s}</b>`)) : Promise.resolve(null),
-      discordConfigured() ? sendDiscord(lines((s) => `**${s}**`)) : Promise.resolve(null),
+      telegramConfigured() ? sendTelegram(render(true)) : Promise.resolve(null),
+      discordConfigured() ? sendDiscord(render(false)) : Promise.resolve(null),
     ]);
 
     const result = {
+      ...(sampleBasis ? { sample: sampleBasis } : {}),
       telegram: tg === null ? { skipped: 'not configured' } : { sent: tg, ...telegramStatus() },
       discord: dc === null ? { skipped: 'not configured' } : { sent: dc, ...discordStatus() },
     };

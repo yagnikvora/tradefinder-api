@@ -45,7 +45,10 @@ import { configRepository } from '../src/momentum/config/config.repository.js';
 import { ensureBaseline, getBaseline, type SymbolBaseline } from '../src/momentum/data/baseline.js';
 import { historical, todaySession, type Candle } from '../src/momentum/data/candles.js';
 import { universe } from '../src/momentum/data/universe.js';
-import type { MomentumQuote } from '../src/momentum/data/quotes.js';
+// The candle-to-quote reconstruction now lives in the runtime, because the boot-time session
+// seed does the same thing for the same reason. Imported rather than duplicated so a change to
+// how a replayed session is built can never make the tool disagree with the live board.
+import { replayQuotes } from '../src/momentum/data/session-seed.js';
 import { computePulse, pulseFactor } from '../src/momentum/services/pulse.service.js';
 import { computeConviction, convictionFactor } from '../src/momentum/services/conviction.service.js';
 import { buildSignal } from '../src/momentum/engine/signal.service.js';
@@ -58,75 +61,6 @@ const hr = (t: string) => console.log(`\n${'─'.repeat(92)}\n${t}\n${'─'.repe
 const pad = (s: string, n: number) => s.padEnd(n).slice(0, n);
 const padL = (s: string, n: number) => s.padStart(n);
 const clock = (ms: number) => new Date(ms + 330 * 60_000).toISOString().slice(11, 16);
-
-/* ------------------------------------------------------------------- the fake quote --- */
-
-/**
- * Turn a candle series into the successive quote readings the poll would have produced.
- *
- * Everything the scanner reads off a quote is either in the candle (close, high, low, volume)
- * or accumulable from it (session high/low, cumulative volume, VWAP). The order-book fields
- * are left empty, which is the same state the live feed is in outside market hours — the
- * liquidity factor already reweights around a missing book rather than scoring it as illiquid,
- * so nothing here has to pretend.
- */
-function* replayQuotes(
-  symbol: string,
-  candles: Candle[],
-  prevClose: number,
-): Generator<{ quote: MomentumQuote; at: number }> {
-  let cumVolume = 0;
-  let cumTurnover = 0;
-  let high = -Infinity;
-  let low = Infinity;
-  let open = 0;
-
-  for (const c of candles) {
-    if (c.minute < 0) continue;
-    if (!open) open = c.open;
-
-    const typical = (c.high + c.low + c.close) / 3;
-    cumVolume += c.volume;
-    cumTurnover += typical * c.volume;
-    high = Math.max(high, c.high);
-    low = Math.min(low, c.low);
-
-    const vwap = cumVolume > 0 ? cumTurnover / cumVolume : c.close;
-    const at = Date.parse(c.stamp);
-
-    yield {
-      at,
-      quote: {
-        symbol,
-        instrumentKey: '',
-        ltp: c.close,
-        prevClose,
-        netChange: c.close - prevClose,
-        changePct: prevClose > 0 ? ((c.close - prevClose) / prevClose) * 100 : 0,
-        open,
-        high,
-        low,
-        volume: cumVolume,
-        vwap,
-        turnoverCr: cumTurnover / 1e7,
-        openInterest: 0,
-        oiDayHigh: 0,
-        oiDayLow: 0,
-        totalBuyQty: 0,
-        totalSellQty: 0,
-        bid: 0,
-        ask: 0,
-        bidQty: 0,
-        askQty: 0,
-        bidOrders: 0,
-        askOrders: 0,
-        depthCr: 0,
-        hasBook: false,
-        at,
-      },
-    };
-  }
-}
 
 /* ----------------------------------------------------------------------- the replay --- */
 

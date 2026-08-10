@@ -724,6 +724,65 @@ export interface AlertEvent {
   /** The signal this alert belongs to, when there is one. */
   signalId: string | null;
   score: number | null;
+  /**
+   * What the momentum module's conviction layer says about this stock's whole session.
+   *
+   * Attached to every event regardless of whether the push gate is using it, because the
+   * question "was this entry taken with the day or against it" is the first thing anyone asks
+   * of an alert afterwards, and it is unanswerable once the session is over.
+   */
+  trend?: TrendContext | null;
+}
+
+/** The trend-day phases, mirrored from the momentum module rather than imported — see
+ *  `data/trend-context.ts` for why this boundary is copied rather than crossed. */
+export type TrendPhaseName = 'None' | 'Forming' | 'Confirmed' | 'Faded';
+
+/** One symbol's whole-session reading, as the alert layer needs it. */
+export interface TrendContext {
+  phase: TrendPhaseName;
+  /** 1 bullish, −1 bearish, 0 neutral — matched against the pullback's own direction. */
+  direction: 1 | -1 | 0;
+  /** Conviction, 0–100. How one-sided the session has been. */
+  score: number;
+  /** When the day was promoted to Confirmed, epoch ms. Null if it never was. */
+  confirmedAt: number | null;
+  /** Minutes the current phase has held. */
+  heldMin: number | null;
+  /** True when the momentum process missed part of the session, so the reading is partial. */
+  partial: boolean;
+  /** Age of the momentum board this was read from, ms. */
+  ageMs: number;
+}
+
+/**
+ * What to do with a push whose stock is not having a one-sided day.
+ *
+ *   require   hold it back. The phone only buzzes for entries taken WITH the session.
+ *   annotate  send it anyway, with the trend reading on the message so the call is yours.
+ *   off       ignore the conviction layer entirely — the behaviour before this existed.
+ */
+export type TrendConfluenceMode = 'require' | 'annotate' | 'off';
+
+export interface TrendConfluence {
+  mode: TrendConfluenceMode;
+  /** The weakest phase that counts as confluence. */
+  minPhase: 'Forming' | 'Confirmed';
+  /** Require the day to be one-sided the SAME way the pullback is pointing. */
+  sameDirection: boolean;
+  /** Conviction floor on top of the phase. 0 disables it. */
+  minScore: number;
+  /**
+   * What to do when there is no reading at all — the momentum scheduler is off, the symbol is
+   * outside its universe, or its board has not been computed yet.
+   *
+   * Defaults to allowing the push, because the alternative is a channel that goes silent for a
+   * reason nobody can see. The message says the trend was not measurable, and
+   * `/pullback/status` counts how often it happens.
+   */
+  allowWhenUnknown: boolean;
+  /** How stale the momentum board may be before its reading is treated as unknown, seconds. */
+  maxBoardAgeSec: number;
 }
 
 /* --------------------------------------------------------------------- backtest --- */
@@ -1109,6 +1168,8 @@ export interface PullbackConfig {
       kinds: AlertKind[];
       /** Confidence floor, read against `score.bands`. An event with no score never passes. */
       minBand: ConfidenceBand;
+      /** Whether the stock also has to be having a one-sided day. See `TrendConfluence`. */
+      trend: TrendConfluence;
     };
   };
 

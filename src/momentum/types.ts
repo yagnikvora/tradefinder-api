@@ -178,6 +178,16 @@ export interface ConvictionReading {
   direction: Direction;
   /** Minutes the current phase has held. The persistence that stops the board churning. */
   heldMin: number | null;
+  /**
+   * When this row was promoted to Confirmed today, as an epoch. Null if it never was.
+   *
+   * Not the same fact as `heldMin`, and kept alongside it rather than derived from it, for two
+   * reasons. It is an ABSOLUTE time, so it can be read against the chart and against every
+   * other row — "confirmed at 10:30" places the signal on the session in a way "held 4h" does
+   * not. And it SURVIVES the fade: once a row demotes, `heldMin` restarts from the demotion
+   * and the only remaining record of when the day was called is this field.
+   */
+  confirmedAt: number | null;
   /** Highest conviction reached today, so a faded row still says how good it once was. */
   peak: number;
 
@@ -238,6 +248,8 @@ export interface ConvictionSummary {
   phase: TrendPhase;
   direction: Direction;
   heldMin: number | null;
+  /** When the row was promoted to Confirmed today, epoch ms. Null if it never was. */
+  confirmedAt: number | null;
   peak: number;
   vwapAdherence: number | null;
   vwapCrossings: number | null;
