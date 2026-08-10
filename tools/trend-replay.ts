@@ -43,7 +43,7 @@ import '../src/env.js';
 
 import { configRepository } from '../src/momentum/config/config.repository.js';
 import { ensureBaseline, getBaseline, type SymbolBaseline } from '../src/momentum/data/baseline.js';
-import { historical, todaySession, type Candle } from '../src/momentum/data/candles.js';
+import { historical, inBatches, todaySession, type Candle } from '../src/momentum/data/candles.js';
 import { universe } from '../src/momentum/data/universe.js';
 // The candle-to-quote reconstruction now lives in the runtime, because the boot-time session
 // seed does the same thing for the same reason. Imported rather than duplicated so a change to
@@ -373,6 +373,171 @@ function printSymbol(symbol: string, r: ReturnType<typeof replaySymbol>, cfg: Mo
   );
 }
 
+/* ------------------------------------------------------------------ the whole board --- */
+
+/**
+ * One line per stock, for replaying the universe rather than a handful of names.
+ *
+ * The per-symbol timeline above is the right output for three stocks and unreadable for two
+ * hundred — it prints a dozen lines each. This keeps only what distinguishes one day from
+ * another, so a finished session comes back as the board it WOULD have been, sorted the way the
+ * Trend Day page sorts it.
+ */
+interface Summary {
+  symbol: string;
+  dayPct: number;
+  peak: number;
+  finalPhase: string;
+  direction: string;
+  formedAt: number | null;
+  confirmedAt: number | null;
+  entries: number;
+  won: number;
+  lost: number;
+  netPct: number;
+}
+
+function summarise(symbol: string, r: ReturnType<typeof replaySymbol>): Summary | null {
+  const { snapshots, entries } = r;
+  if (!snapshots.length) return null;
+
+  const first = snapshots[0];
+  const last = snapshots[snapshots.length - 1];
+  const formed = snapshots.find((s) => s.conviction.phase === 'Forming');
+  const confirmed = snapshots.find((s) => s.conviction.phase === 'Confirmed');
+
+  return {
+    symbol,
+    dayPct: ((last.ltp - first.ltp) / first.ltp) * 100,
+    peak: Math.max(...snapshots.map((s) => s.conviction.score)),
+    finalPhase: last.conviction.phase,
+    direction: last.conviction.direction,
+    formedAt: formed?.at ?? null,
+    confirmedAt: confirmed?.at ?? null,
+    entries: entries.length,
+    won: entries.filter((e) => e.hitTarget).length,
+    lost: entries.filter((e) => e.hitStopFirst).length,
+    netPct: entries.reduce(
+      (a, e) => a + (e.hitStopFirst ? (e.worstAfterPct ?? 0) : e.hitTarget ? (e.bestAfterPct ?? 0) : (e.closeAfterPct ?? 0)),
+      0,
+    ),
+  };
+}
+
+/**
+ * Replay every stock in the F&O universe for one day.
+ *
+ * One candle request per symbol, eight at a time behind the same breaker the baseline uses —
+ * the same ~208 requests the live scanner's boot seed spends, for a day of your choosing. Only
+ * the summary of each replay is retained; the per-minute snapshots are dropped as each symbol
+ * finishes, or two hundred sessions of them would sit in memory at once.
+ */
+async function replayAll(
+  day: string,
+  members: Array<{ symbol: string; equityKey: string }>,
+  baseline: Awaited<ReturnType<typeof getBaseline>>['baseline'],
+  cfg: MomentumConfig,
+): Promise<{ rows: Summary[]; scanned: number; empty: number; failed: number }> {
+  const rows: Summary[] = [];
+  let scanned = 0;
+  let empty = 0;
+  let failed = 0;
+  const isToday = day === istDay();
+
+  await inBatches(members, 8, async (m) => {
+    try {
+      const candles = isToday
+        ? await todaySession(m.equityKey, day, 1)
+        : await historical(m.equityKey, 'minutes', 1, day, day);
+      const forDay = candles.filter((c) => c.day === day);
+      if (!forDay.length) {
+        empty++;
+        return;
+      }
+      const s = summarise(m.symbol, replaySymbol(m.symbol, forDay, baseline?.symbols[m.symbol], cfg));
+      if (s) rows.push(s);
+      scanned++;
+      // A long run with no output looks like a hang, and this one takes a couple of minutes.
+      if (scanned % 25 === 0) process.stderr.write(`  …${scanned} replayed\n`);
+    } catch {
+      failed++;
+    }
+  });
+
+  return { rows, scanned, empty, failed };
+}
+
+function printBoard(day: string, out: Awaited<ReturnType<typeof replayAll>>, cfg: MomentumConfig): void {
+  const phaseRank: Record<string, number> = { Confirmed: 3, Forming: 2, Faded: 1, None: 0 };
+  const called = out.rows
+    .filter((r) => r.peak >= cfg.thresholds.conviction.phase.formingScore && r.finalPhase !== 'None')
+    .sort((a, b) => phaseRank[b.finalPhase] - phaseRank[a.finalPhase] || b.peak - a.peak);
+
+  hr(`The board for ${day} — ${called.length} one-sided days out of ${out.scanned} stocks replayed`);
+
+  // MOST OF THE UNIVERSE COMING BACK EMPTY IS AN UPSTREAM STATE, NOT A RESULT, and the two look
+  // identical in a summary line. Upstox publishes a finished session into the historical endpoint
+  // stock by stock over the hours after the close — measured at 00:05 IST, the previous session
+  // was served for SBIN and not yet for PAYTM or RECLTD, while every day before it was complete.
+  // Reporting "206 stocks had no candles" without saying that reads as a broken replay.
+  if (out.empty > out.scanned) {
+    console.log(
+      `\n⚠️  ${out.empty} of ${out.empty + out.scanned} stocks returned no candles for ${day}.\n` +
+      '    That is Upstox still publishing this session rather than a quiet market — a finished\n' +
+      '    day lands in the historical endpoint stock by stock over the hours after the close.\n' +
+      '    Replay it again later, or pick an earlier day, which will be complete.',
+    );
+    if (!called.length) return;
+  }
+
+  if (!called.length) {
+    console.log('\nNothing held a one-sided shape on this day. On a rotational session that is the real answer.');
+    return;
+  }
+
+  console.log(
+    pad('stock', 13) + padL('day %', 8) + padL('peak', 6) + pad('  phase', 12) +
+    pad('dir', 9) + pad('formed', 8) + pad('confirmed', 11) +
+    padL('entries', 8) + padL('won', 5) + padL('lost', 6) + padL('net %', 9),
+  );
+  for (const r of called) {
+    console.log(
+      pad(r.symbol, 13) +
+        padL(`${r.dayPct >= 0 ? '+' : ''}${r.dayPct.toFixed(2)}`, 8) +
+        padL(r.peak.toFixed(0), 6) +
+        pad('  ' + r.finalPhase, 12) +
+        pad(r.direction, 9) +
+        pad(r.formedAt ? clock(r.formedAt) : '—', 8) +
+        pad(r.confirmedAt ? clock(r.confirmedAt) : '—', 11) +
+        padL(String(r.entries), 8) +
+        padL(String(r.won), 5) +
+        padL(String(r.lost), 6) +
+        padL(`${r.netPct >= 0 ? '+' : ''}${r.netPct.toFixed(2)}`, 9),
+    );
+  }
+
+  const withEntries = called.filter((r) => r.entries > 0);
+  const won = withEntries.reduce((a, r) => a + r.won, 0);
+  const lost = withEntries.reduce((a, r) => a + r.lost, 0);
+  const net = withEntries.reduce((a, r) => a + r.netPct, 0);
+  console.log(
+    `\n${called.filter((r) => r.finalPhase === 'Confirmed').length} confirmed · ` +
+      `${called.filter((r) => r.finalPhase === 'Forming').length} forming · ` +
+      `${called.filter((r) => r.finalPhase === 'Faded').length} faded` +
+      (out.empty ? ` · ${out.empty} stocks had no candles` : '') +
+      (out.failed ? ` · ${out.failed} failed` : ''),
+  );
+  console.log(
+    `entries across those stocks: ${withEntries.reduce((a, r) => a + r.entries, 0)} — ` +
+      `${won} reached target, ${lost} stopped, net ${net >= 0 ? '+' : ''}${net.toFixed(2)}% summed IN THE STOCK.`,
+  );
+  console.log(
+    '\nThe ATR baseline used is TODAY\'s, not the one that existed on the replayed day — every\n' +
+    'ATR-scaled reading (deepest dip, entry depth) carries that drift, which grows the further back\n' +
+    'you go. The shape readings — adherence, crossings, efficiency — do not depend on it.',
+  );
+}
+
 /* ---------------------------------------------------------------------------- main --- */
 
 async function main() {
@@ -381,15 +546,45 @@ async function main() {
     process.exit(1);
   }
 
+  // BARE WORDS ARE ACCEPTED AS WELL AS FLAGS, because the flags do not survive npm.
+  //
+  // `npm run replay-trend -- --all --day 2026-08-11` runs `tsx trend-replay.ts 2026-08-11`:
+  // npm's own option parser consumes `--all` (one of its config keys) and `--day` before the
+  // script is reached, and only the bare date is passed through. The script then read that date
+  // as a stock symbol and reported it was not in the F&O universe — a confusing answer to a
+  // command that looked right.
+  //
+  // Rather than only documenting `npx tsx`, both spellings work: a positional YYYY-MM-DD is the
+  // day, and a positional `all` is the universe. No stock is named either of those things.
   const args = process.argv.slice(2);
+  const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
   const dayIdx = args.indexOf('--day');
-  const day = dayIdx >= 0 ? args[dayIdx + 1] : istDay();
+  const flagDay = dayIdx >= 0 ? args[dayIdx + 1] : undefined;
   // `dayIdx + 1` is 0 when there is no `--day`, which would silently eat the first symbol.
   const skip = dayIdx >= 0 ? dayIdx + 1 : -1;
-  const symbols = args.filter((a, i) => !a.startsWith('--') && i !== skip).map((s) => s.toUpperCase());
 
-  if (!symbols.length) {
-    console.error('usage: npm run replay-trend -- BOSCHLTD NHPC SONACOMS [--day 2026-08-05]');
+  const bare = args.filter((a, i) => !a.startsWith('--') && i !== skip);
+  const bareDay = bare.find((a) => ISO_DAY.test(a));
+  const day = flagDay ?? bareDay ?? istDay();
+
+  const all = args.includes('--all') || bare.some((a) => a.toLowerCase() === 'all');
+  const symbols = bare
+    .filter((a) => a !== bareDay && a.toLowerCase() !== 'all')
+    .map((s) => s.toUpperCase());
+
+  if (!symbols.length && !all) {
+    console.error(
+      'usage:\n' +
+      '  npx tsx tools/trend-replay.ts BOSCHLTD NHPC [--day 2026-08-05]\n' +
+      '  npx tsx tools/trend-replay.ts --all [--day 2026-08-05]      the whole F&O universe, one line each\n' +
+      '\n' +
+      '  npm run replay-trend -- all 2026-08-05                      same thing through npm, which\n' +
+      '  npm run replay-trend -- BOSCHLTD 2026-08-05                 strips leading -- flags\n' +
+      '\n' +
+      'The day defaults to today (IST). Today is served straight from the intraday endpoint;\n' +
+      'a past session only appears once Upstox has published it, which takes hours after the close.',
+    );
     process.exit(1);
   }
 
@@ -397,7 +592,10 @@ async function main() {
   const uni = await universe();
 
   hr('Replay');
-  console.log(`day ${day}, symbols ${symbols.join(', ')}, config version ${cfg.version}`);
+  console.log(
+    `day ${day}, ${all ? `the whole universe (${uni.members.length} stocks)` : `symbols ${symbols.join(', ')}`}, ` +
+      `config version ${cfg.version}`,
+  );
   console.log(
     `conviction: forming from minute ${cfg.thresholds.conviction.phase.minMinutesForming} at score ` +
       `${cfg.thresholds.conviction.phase.formingScore}, confirmed from minute ` +
@@ -422,6 +620,12 @@ async function main() {
   console.log(
     `baseline: ${baseline ? `${baseline.day}, ${Object.keys(baseline.symbols).length} symbols` : 'NONE — ATR-scaled readings will be unavailable'}`,
   );
+
+  if (all) {
+    console.log(`\nreplaying ${uni.members.length} stocks — one candle request each, eight at a time…`);
+    printBoard(day, await replayAll(day, uni.members, baseline, cfg), cfg);
+    return;
+  }
 
   for (const symbol of symbols) {
     const member = uni.members.find((m) => m.symbol === symbol);
