@@ -700,15 +700,33 @@ export interface PullbackBoard {
 
 /* ------------------------------------------------------------------------ alerts --- */
 
-export type AlertKind = 'freshPullback' | 'trendResume' | 'emaRejection' | 'targetHit' | 'stopHit';
+export type AlertKind =
+  | 'freshPullback' | 'trendResume' | 'trendDay' | 'emaRejection' | 'targetHit' | 'stopHit';
 
 export const ALERT_LABEL: Record<AlertKind, string> = {
   freshPullback: 'Fresh pullback',
   trendResume: 'Trend resumed',
+  trendDay: 'Trend day confirmed',
   emaRejection: 'EMA rejection',
   targetHit: 'Target hit',
   stopHit: 'Stop hit',
 };
+
+/**
+ * `trendDay` IS `trendResume` WITH THE SESSION BEHIND IT, NOT A SIXTH INDEPENDENT EVENT.
+ *
+ * The same confirmation candle fires both; which one is emitted depends on whether the momentum
+ * board had this stock as a CONFIRMED one-sided day going the same way at that moment. So the two
+ * are mutually exclusive by construction — a signal is one or the other and never both, because
+ * emitting both would put two notifications on the phone for one trade, which is the exact failure
+ * `dedupeMin` exists to prevent and which it cannot catch here (the dedupe key includes the kind).
+ *
+ * Split out rather than left as a flag on the event because the whole point is that it can be
+ * SUBSCRIBED TO separately: `alerts.push.kinds = ['trendDay']` is "only interrupt me for entries
+ * taken with a confirmed trend day", which is not expressible when the distinction lives inside
+ * the payload of a kind you either take or leave.
+ */
+export const TREND_DAY_KIND: AlertKind = 'trendDay';
 
 export interface AlertEvent {
   id: string;

@@ -20,6 +20,7 @@ import { primeTrendContextFrom, resetTrendContext } from '../src/pullback/data/t
 import { signalMessage } from '../src/pullback/alerts/telegram.js';
 import { signalMessage as discordMessage, discordConfigured } from '../src/pullback/alerts/discord.js';
 import { defaultConfig } from '../src/pullback/config/defaults.js';
+import { sanitise } from '../src/pullback/config/config.repository.js';
 import type {
   OptionPick, PullbackConfig, PullbackRow, PullbackSignal, TrendContext,
 } from '../src/pullback/types.js';
@@ -139,15 +140,18 @@ describe('alerts: the push gate', () => {
     return order.indexOf(band) >= order.indexOf(p.minBand);
   };
 
-  it('defaults to confirmed entries only', () => {
+  it('defaults to confirmed entries only, in both their forms', () => {
+    // `trendDay` is the same event with the session behind it, so a default that pushed one and
+    // not the other would drop half the confirmations depending on what the day was doing.
     const cfg = config();
-    assert.deepEqual(cfg.alerts.push.kinds, ['trendResume']);
+    assert.deepEqual(cfg.alerts.push.kinds, ['trendResume', 'trendDay']);
     assert.equal(cfg.alerts.push.minBand, 'Strong');
   });
 
   it('lets a Strong confirmed entry through', () => {
     const cfg = config();
     assert.equal(passes(cfg, 'trendResume', cfg.score.bands.strong), true);
+    assert.equal(passes(cfg, 'trendDay', cfg.score.bands.strong), true);
   });
 
   it('holds back anything below the floor', () => {
@@ -278,6 +282,89 @@ describe('alerts: the trend-day gate', () => {
     const cfg = config();
     cfg.alerts.push.trend.sameDirection = false;
     assert.equal(trendVerdict(cfg, 'GAIL', 1, OPEN).ok, true);
+  });
+});
+
+describe('alerts: the trend-day alert kind', () => {
+  beforeEach(() => {
+    resetAlerts();
+    resetTrendContext();
+  });
+
+  const board = (over: Record<string, unknown> = {}) =>
+    primeTrendContextFrom({
+      asOf: OPEN,
+      rows: [{
+        symbol: 'GAIL',
+        conviction: {
+          ready: true, phase: 'Confirmed', direction: 'Bullish', score: 84,
+          confirmedAt: ist(10, 30), heldMin: 30, partial: false, ...over,
+        },
+      }],
+    }, OPEN);
+
+  const kindOf = (over: Record<string, unknown> | null): string | undefined => {
+    if (over) board(over);
+    return fromSignal(signal(90), config(), OPEN)?.kind;
+  };
+
+  it('promotes the entry to trendDay when the session is confirmed and agrees', () => {
+    assert.equal(kindOf({}), 'trendDay');
+  });
+
+  it('stays trendResume when no board has been primed at all', () => {
+    assert.equal(kindOf(null), 'trendResume');
+  });
+
+  it('stays trendResume when the confirmed day runs the other way', () => {
+    assert.equal(kindOf({ direction: 'Bearish' }), 'trendResume');
+  });
+
+  it('stays trendResume on a day that is only forming', () => {
+    assert.equal(kindOf({ phase: 'Forming' }), 'trendResume');
+  });
+
+  it('stays trendResume on a faded day', () => {
+    assert.equal(kindOf({ phase: 'Faded' }), 'trendResume');
+  });
+
+  // Switching the gate off means "stop filtering on the session", not "call every session
+  // confirmed" — a badge is a claim about the day, and nothing is measuring the day any more.
+  it('makes no trend-day claim once the gate is switched off', () => {
+    board();
+    const cfg = config();
+    cfg.alerts.push.trend.mode = 'off';
+    assert.equal(fromSignal(signal(90), cfg, OPEN)?.kind, 'trendResume');
+  });
+
+  it('carries the label on the phone message, and only then', () => {
+    const confirmed: TrendContext = {
+      phase: 'Confirmed', direction: 1, score: 84,
+      confirmedAt: ist(10, 30), heldMin: 30, partial: false, ageMs: 1000,
+    };
+    assert.match(signalMessage(signal(90), confirmed), /TREND DAY CONFIRMED/);
+    assert.doesNotMatch(signalMessage(signal(90), { ...confirmed, phase: 'Forming' }), /TREND DAY CONFIRMED/);
+    assert.doesNotMatch(signalMessage(signal(90), null), /TREND DAY CONFIRMED/);
+  });
+
+  // The regression this whole kind could have caused: `merge` replaces arrays wholesale, so a
+  // config saved before `trendDay` existed would keep pushing only `trendResume` — and since a
+  // confirmed-day entry now emits `trendDay` instead, that install would go quiet on exactly the
+  // trades worth interrupting for, and look like a slow week rather than a bug.
+  it('migrates a config saved before the kind existed', () => {
+    const stored = defaultConfig();
+    stored.alerts.push.kinds = ['trendResume'];
+    stored.alerts.kinds = ['freshPullback', 'trendResume', 'emaRejection', 'targetHit', 'stopHit'];
+
+    const fixed = sanitise(stored);
+    assert.ok(fixed.alerts.push.kinds.includes('trendDay'));
+    assert.ok(fixed.alerts.kinds.includes('trendDay'));
+  });
+
+  it('leaves a deliberate trend-day-only subscription alone', () => {
+    const stored = defaultConfig();
+    stored.alerts.push.kinds = ['trendDay'];
+    assert.deepEqual(sanitise(stored).alerts.push.kinds, ['trendDay']);
   });
 });
 

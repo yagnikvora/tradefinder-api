@@ -14,7 +14,25 @@ import type {
 } from '../types.js';
 import { TIMEFRAMES } from '../types.js';
 
-const ALERT_KINDS: AlertKind[] = ['freshPullback', 'trendResume', 'emaRejection', 'targetHit', 'stopHit'];
+const ALERT_KINDS: AlertKind[] = [
+  'freshPullback', 'trendResume', 'trendDay', 'emaRejection', 'targetHit', 'stopHit',
+];
+/**
+ * Anyone subscribed to `trendResume` is subscribed to `trendDay`, whether they know it or not.
+ *
+ * THIS IS A MIGRATION, NOT A PREFERENCE, and without it adding the kind is a silent regression.
+ * `merge` replaces arrays wholesale, so a config saved before `trendDay` existed keeps its old
+ * `kinds` list forever — and since a confirmed-trend-day entry now emits `trendDay` INSTEAD of
+ * `trendResume`, that stored list would filter out exactly the best signals the module produces.
+ * The channel would not break; it would go quiet on precisely the trades worth interrupting for,
+ * which is the failure mode nobody reports because it looks like a slow week.
+ *
+ * The reverse is deliberately not done: someone who has narrowed to `['trendDay']` has asked for
+ * confirmed sessions only, and widening that back to `trendResume` would undo their choice.
+ */
+const withTrendDay = (kinds: AlertKind[]): AlertKind[] =>
+  kinds.includes('trendResume') && !kinds.includes('trendDay') ? [...kinds, 'trendDay'] : kinds;
+
 const BANDS: ConfidenceBand[] = ['Weak', 'Medium', 'Strong', 'Excellent'];
 const TREND_MODES: TrendConfluenceMode[] = ['require', 'annotate', 'off'];
 const DEFAULT_TREND_CONFLUENCE: TrendConfluence = {
@@ -234,6 +252,11 @@ export function sanitise(cfg: PullbackConfig): PullbackConfig {
   const mix = Object.values(o.liquidityMix).reduce((a, v) => a + (Number.isFinite(v) && v > 0 ? v : 0), 0);
   if (!(mix > 0)) o.liquidityMix = { spread: 0.4, openInterest: 0.25, volume: 0.2, depth: 0.15 };
 
+  // The in-app feed's kinds get the same treatment as the push list, and for the same reason —
+  // a stored array predating `trendDay` would drop the event from the strip as well as the phone.
+  const feedKinds = Array.isArray(cfg.alerts.kinds) ? cfg.alerts.kinds.filter((k) => ALERT_KINDS.includes(k)) : [];
+  cfg.alerts.kinds = feedKinds.length ? [...new Set(withTrendDay(feedKinds))] : [...ALERT_KINDS];
+
   cfg.alerts.keep = Math.round(clampNumber(cfg.alerts.keep, 10, 5000, 300));
   cfg.alerts.dedupeMin = clampNumber(cfg.alerts.dedupeMin, 0, 375, 10);
   cfg.alerts.webhookUrl = String(cfg.alerts.webhookUrl ?? '').trim();
@@ -242,7 +265,7 @@ export function sanitise(cfg: PullbackConfig): PullbackConfig {
   // hand-edited one can still arrive with `kinds: []` — which reads as "push is on" while being
   // incapable of ever sending, the most confusing of the possible wrong states.
   const push = cfg.alerts.push ?? { enabled: true, kinds: ['trendResume'], minBand: 'Strong' };
-  const kinds = Array.isArray(push.kinds) ? push.kinds.filter((k) => ALERT_KINDS.includes(k)) : [];
+  const kinds = withTrendDay(Array.isArray(push.kinds) ? push.kinds.filter((k) => ALERT_KINDS.includes(k)) : []);
   // The trend gate, repaired the same way. An unrecognised mode falls back to `require` rather
   // than to `off`: a typo in the one field that decides whether a filter runs should not quietly
   // remove the filter, which is the failure that would be invisible until a week of bad alerts.

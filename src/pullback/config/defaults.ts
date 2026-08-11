@@ -246,7 +246,7 @@ export const DEFAULT_CONFIG: PullbackConfig = {
 
   alerts: {
     enabled: true,
-    kinds: ['freshPullback', 'trendResume', 'emaRejection', 'targetHit', 'stopHit'],
+    kinds: ['freshPullback', 'trendResume', 'trendDay', 'emaRejection', 'targetHit', 'stopHit'],
     keep: 300,
     dedupeMin: 10,
     webhookUrl: '',
@@ -256,7 +256,11 @@ export const DEFAULT_CONFIG: PullbackConfig = {
     // the turn actually printed on volume.
     push: {
       enabled: true,
-      kinds: ['trendResume'],
+      // Both, because they are the same event split by whether the session agreed — see
+      // `TREND_DAY_KIND` in `types.ts`. Narrowing this to `['trendDay']` is the one-line way to
+      // say "only interrupt me for entries taken with a confirmed one-sided day", which is the
+      // strictest useful filter this module has.
+      kinds: ['trendResume', 'trendDay'],
       minBand: 'Strong',
       // The second gate, and the one that reads the DAY rather than the setup.
       //

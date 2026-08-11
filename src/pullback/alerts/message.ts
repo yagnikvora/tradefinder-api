@@ -135,6 +135,33 @@ function trendLine(signal: PullbackSignal, trend: TrendContext | null, m: Markup
 }
 
 /**
+ * Whether this message carries the trend-day label, on the same test `alert.engine.ts` uses.
+ *
+ * Derived from the trend rather than passed in as a flag, so the badge and the `trendDay` alert
+ * kind cannot come apart: both are "phase is Confirmed and the direction agrees", and a message
+ * wearing the badge is by construction one the engine classified that way.
+ */
+export const isTrendDaySignal = (signal: PullbackSignal, trend: TrendContext | null): boolean =>
+  !!trend && trend.phase === 'Confirmed' && trend.direction === signal.direction;
+
+/**
+ * The label, on its own line above everything.
+ *
+ * AT THE TOP AND NOT FOLDED INTO THE TREND LINE, deliberately. The session reading is already
+ * written four lines down, and it is a sentence you have to read; this is a badge you can see
+ * without reading, on a phone, from a notification preview that shows two lines. The whole value
+ * of the distinction is that it is legible before the message is opened.
+ */
+const trendDayBadge = (signal: PullbackSignal, trend: TrendContext | null, m: Markup): string[] => {
+  if (!isTrendDaySignal(signal, trend)) return [];
+  const word = signal.direction === 1 ? 'bullish' : 'bearish';
+  return [
+    `🏆 ${m.bold('TREND DAY CONFIRMED')} · ${m.italic(`taken with a one-sided ${word} session`)}`,
+    '',
+  ];
+};
+
+/**
  * A fired signal as a message.
  *
  * Ordered as the decision is made: what it is, whether the day agrees, what to buy, what it
@@ -146,6 +173,7 @@ export function buildSignalMessage(signal: PullbackSignal, m: Markup, trend: Tre
   const risk = Math.abs(signal.entry - signal.stop.recommended.price);
 
   return [
+    ...trendDayBadge(signal, trend, m),
     `${dir}  ${m.bold(m.escape(signal.symbol))}  ·  ${signal.score.band} ${signal.score.total.toFixed(0)}/100`,
     m.italic(`${TIMEFRAME_LABEL[signal.timeframe]} pullback entry · fired ${istClock(signal.firedAt)}`),
     ...trendLine(signal, trend, m),

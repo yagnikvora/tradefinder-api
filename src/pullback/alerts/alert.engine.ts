@@ -284,16 +284,47 @@ export function fromRows(rows: PullbackRow[], cfg: PullbackConfig, nowMs: number
   return out;
 }
 
+/**
+ * Is this entry being taken on a CONFIRMED one-sided day going the same way?
+ *
+ * Read through `trendVerdict` rather than `trendFor` directly, so it answers against the same
+ * board age and the same direction rule the push gate uses. Asking the map itself would let this
+ * call a day "confirmed" off a board the gate had already rejected as stale, and the message would
+ * then carry a trend-day badge for a session nothing else in the module believed in.
+ *
+ * `mode: 'off'` deliberately makes this false rather than true. Turning the gate off means "stop
+ * filtering on the session", not "treat every session as confirmed", and a badge is a claim about
+ * the day that nobody is measuring any more.
+ */
+export function onConfirmedTrendDay(
+  cfg: PullbackConfig,
+  symbol: string,
+  dir: 1 | -1,
+  nowMs: number,
+): boolean {
+  if (cfg.alerts.push?.trend?.mode === 'off') return false;
+  const { trend } = trendVerdict(cfg, symbol, dir, nowMs);
+  return !!trend && trend.phase === 'Confirmed' && trend.direction === dir;
+}
+
 /** A fired signal. Separate from `fromRows` because it carries the plan and the contract. */
 export function fromSignal(signal: PullbackSignal, cfg: PullbackConfig, nowMs: number): AlertEvent | null {
+  // Which of the two kinds this is, decided ONCE here. `emit` re-reads the verdict for the
+  // event's own `trend` field; both reads hit the same primed map at the same `nowMs` and so
+  // cannot disagree, and keeping the kind decision out of `emit` leaves that function about
+  // gating rather than about naming.
+  const trendDay = onConfirmedTrendDay(cfg, signal.symbol, signal.direction, nowMs);
+
   return emit(cfg, {
-    kind: 'trendResume',
+    kind: trendDay ? 'trendDay' : 'trendResume',
     at: nowMs,
     symbol: signal.symbol,
     timeframe: signal.timeframe,
     direction: signal.direction,
     price: signal.entry,
-    title: `${signal.symbol} ${signal.side} — ${signal.score.band.toLowerCase()} pullback entry on ${TIMEFRAME_LABEL[signal.timeframe]}`,
+    title: trendDay
+      ? `${signal.symbol} ${signal.side} — TREND DAY ${signal.score.band.toLowerCase()} entry on ${TIMEFRAME_LABEL[signal.timeframe]}`
+      : `${signal.symbol} ${signal.side} — ${signal.score.band.toLowerCase()} pullback entry on ${TIMEFRAME_LABEL[signal.timeframe]}`,
     detail:
       `Confidence ${signal.score.total.toFixed(0)}/100. Entry ${signal.entry.toFixed(2)}, ` +
       `stop ${signal.stop.recommended.price.toFixed(2)} (${signal.stop.recommended.kind}), ` +

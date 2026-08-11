@@ -1,8 +1,9 @@
 // Send a demo trade alert to every configured phone channel.  Run: npm run demo-alert
 //
-//   npm run demo-alert            both a CALL and a PUT
-//   npm run demo-alert -- call    just the long
-//   npm run demo-alert -- put     just the short
+//   npm run demo-alert              a CALL, a PUT, and a trend-day entry
+//   npm run demo-alert -- call      just the long
+//   npm run demo-alert -- put       just the short
+//   npm run demo-alert -- trendday  just the trend-day-confirmed entry, with its label
 //
 // Exists because the real thing cannot be summoned: a live alert needs a Strong-or-better
 // confirmed pullback during market hours, so without this there is no way to see what one looks
@@ -19,7 +20,7 @@
 // trade. The banner is the difference between a demo and a fabricated trade instruction.
 
 import '../src/env.js';
-import type { PullbackSignal } from '../src/pullback/types.js';
+import type { PullbackSignal, TrendContext } from '../src/pullback/types.js';
 import { sendTelegram, telegramConfigured, telegramStatus, signalMessage as tgMessage } from '../src/pullback/alerts/telegram.js';
 import { sendDiscord, discordConfigured, discordStatus, signalMessage as dcMessage } from '../src/pullback/alerts/discord.js';
 
@@ -60,11 +61,45 @@ const PUT = {
   },
 } as unknown as PullbackSignal;
 
+/**
+ * A confirmed one-sided session, so the `trendDay` label renders.
+ *
+ * The other two demos pass no trend at all, which is the honest thing for them — a canned signal
+ * has no live board behind it — and it is also why neither of them could ever show what the
+ * trend-day badge looks like. This one carries a reading a real Confirmed row would have: a high
+ * conviction, a confirmation time earlier in the session, and a fresh board age.
+ */
+const TREND_DAY_CONTEXT: TrendContext = {
+  phase: 'Confirmed',
+  direction: 1,
+  score: 91,
+  confirmedAt: istToday(9, 52),
+  heldMin: 68,
+  partial: false,
+  ageMs: 12_000,
+};
+
+/** A long taken WITH a confirmed bullish trend day — the strictest thing the module emits. */
+const TREND_DAY = {
+  symbol: 'CGPOWER', timeframe: 5, direction: 1, side: 'BUY', entryKind: 'pullback',
+  firedAt: istToday(11, 0), entry: 874.25, price: 875.10, ageMin: 1, movedSincePct: 0.10,
+  score: { total: 93, band: 'Excellent', components: [], coverage: 1 },
+  stop: { candidates: [], recommended: { kind: 'structure', price: 871.97, reason: 'below the pullback low' } },
+  target: { candidates: [], primary: { kind: '2R', price: 878.81, r: 2 }, rewardRisk: 2 },
+  option: {
+    label: '900 CE', side: 'CE', strike: 900, expiry: '2026-08-27', expiryDays: 20,
+    entryCost: 13.65, delta: 0.35, lotSize: 850, costPerLot: 11603,
+    premiumAtTarget: 20.10, gainPctAtTarget: 47, profitPerLot: 5483, breakEven: 913.65,
+    liquidity: { score: 79, grade: 'Good', components: {}, reasons: [] }, warnings: [],
+  },
+} as unknown as PullbackSignal;
+
 const which = (process.argv[2] ?? '').toLowerCase();
-const picked: Array<[string, PullbackSignal]> =
-  which === 'call' ? [['CALL', CALL]]
-    : which === 'put' ? [['PUT', PUT]]
-      : [['CALL', CALL], ['PUT', PUT]];
+const picked: Array<[string, PullbackSignal, TrendContext | null]> =
+  which === 'call' ? [['CALL', CALL, null]]
+    : which === 'put' ? [['PUT', PUT, null]]
+      : which === 'trendday' || which === 'trend' ? [['TREND', TREND_DAY, TREND_DAY_CONTEXT]]
+        : [['CALL', CALL, null], ['PUT', PUT, null], ['TREND', TREND_DAY, TREND_DAY_CONTEXT]];
 
 if (!telegramConfigured() && !discordConfigured()) {
   console.error(
@@ -86,17 +121,17 @@ const BANNER_DC = '🧪 **DEMO — not a live signal.** Sent by `npm run demo-al
 
 let failed = 0;
 
-for (const [label, signal] of picked) {
+for (const [label, signal, trend] of picked) {
   const results: string[] = [];
 
   if (telegramConfigured()) {
-    const ok = await sendTelegram(BANNER_TG + tgMessage(signal));
+    const ok = await sendTelegram(BANNER_TG + tgMessage(signal, trend));
     results.push(`telegram ${ok ? 'sent' : `FAILED — ${telegramStatus().lastError ?? 'unknown'}`}`);
     if (!ok) failed++;
   }
   if (discordConfigured()) {
     // The direction only picks the embed's colour stripe: green for a long, red for a short.
-    const ok = await sendDiscord(BANNER_DC + dcMessage(signal), signal.direction);
+    const ok = await sendDiscord(BANNER_DC + dcMessage(signal, trend), signal.direction);
     results.push(`discord ${ok ? 'sent' : `FAILED — ${discordStatus().lastError ?? 'unknown'}`}`);
     if (!ok) failed++;
   }
