@@ -69,20 +69,30 @@ const istDow = (nowMs: number): number => new Date(nowMs + IST_OFFSET_MS).getUTC
 
 /* ------------------------------------------------------------------------- the words --- */
 
-const quoteBlock = (q: Quote, m: Markup, glyph: string): string[] => [
-  `${glyph} ${m.italic(`"${m.escape(q.text)}"`)}`,
-  ...(q.by ? [`     — ${m.escape(q.by)}`] : []),
-];
-
 /**
- * The credit, which is a LICENCE TERM rather than a nicety.
+ * The quote, and the credit that rides on its author line.
  *
- * ZenQuotes' free tier is conditioned on a visible attribution linking back to them. It is
- * rendered only when the quote actually came from them — the offline set is this codebase's own,
+ * THE CREDIT IS A LICENCE TERM RATHER THAN A NICETY — ZenQuotes' free tier is conditioned on a
+ * visible attribution linking back to them, so it cannot simply be dropped while their feed is
+ * being used. What it does not have to be is a separate line: as a trailing italic paragraph it
+ * read like an advert stapled to a personal message, which is the one thing a greeting cannot
+ * afford to look like. Folded onto the author line it satisfies the same requirement in two words,
+ * next to the name it is already crediting.
+ *
+ * It appears only when the quote actually came from them. The offline set is this codebase's own,
  * and crediting someone else for it would be its own kind of wrong.
  */
-const credit = (q: Quote, m: Markup): string[] =>
-  q.sourced ? ['', m.italic(`Quote via ${m.link('ZenQuotes', ZENQUOTES_URL)}`)] : [];
+const quoteBlock = (q: Quote, m: Markup, glyph: string): string[] => {
+  // Safe to hang the credit off the author line: `usable()` in `quotes.ts` rejects any fetched
+  // quote that arrives without an attribution, so anything with `sourced: true` HAS a `by` and the
+  // credit cannot be dropped by taking this branch. Only the built-in set reaches the other one,
+  // and it needs no credit.
+  const credit = q.sourced ? ` · ${m.link('ZenQuotes', ZENQUOTES_URL)}` : '';
+  return [
+    `${glyph} ${m.italic(`"${m.escape(q.text)}"`)}`,
+    ...(q.by ? [`     — ${m.escape(q.by)}${credit}`] : []),
+  ];
+};
 
 /** The 09:15 message. The quote is passed in because fetching it is async and this is not. */
 export function openMessage(nowMs: number, m: Markup, quote: Quote): string {
@@ -94,7 +104,6 @@ export function openMessage(nowMs: number, m: Markup, quote: Quote): string {
     '',
     `375 minutes on the clock. ${m.bold('Plan the trade, trade the plan.')}`,
     m.italic('Let the setup come to you. 🚀'),
-    ...credit(quote, m),
   ].join('\n');
 }
 
@@ -165,7 +174,6 @@ export function closeMessage(nowMs: number, m: Markup, quote: Quote): string {
     ...quoteBlock(quote, m, '🌙'),
     '',
     `${m.bold('Rest, review, reset.')} Back at 09:15 ${nextSession(nowMs)}.`,
-    ...credit(quote, m),
   ].join('\n');
 }
 

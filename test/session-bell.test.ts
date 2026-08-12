@@ -233,7 +233,7 @@ describe('session bell: the message', () => {
   });
 
   it('carries the quote it was handed', () => {
-    const msg = renderBell('open', true, ist(9, 15), quote({ text: 'A very specific line.', by: 'Nobody' }));
+    const msg = renderBell('open', true, ist(9, 15), quote({ text: 'A very specific line.', by: 'Nobody', sourced: false }));
     assert.match(msg, /A very specific line\./);
     assert.match(msg, /— Nobody/);
   });
@@ -249,6 +249,21 @@ describe('session bell: the message', () => {
   it('credits nobody when the quote came from the offline set', () => {
     const msg = renderBell('open', true, ist(9, 15), quote({ sourced: false }));
     assert.equal(msg.toLowerCase().includes('zenquotes'), false);
+  });
+
+  // The credit rides on the author line rather than sitting in a paragraph of its own: as a
+  // trailing italic line it read like an advert stapled to a personal message.
+  it('folds the credit onto the author line and adds no trailing line', () => {
+    const msg = renderBell('open', true, ist(9, 15), quote({ by: 'Jim Rohn', sourced: true }));
+    assert.match(msg, /— Jim Rohn · <a href="https:\/\/zenquotes\.io\/">ZenQuotes<\/a>/);
+    assert.match(msg.split('\n').at(-1) as string, /Let the setup come to you/);
+  });
+
+  it('ends the close bell on the sign-off, credit or not', () => {
+    for (const sourced of [true, false]) {
+      const msg = renderBell('close', true, ist(15, 30), quote({ sourced }));
+      assert.match(msg.split('\n').at(-1) as string, /Back at 09:15/, `sourced: ${sourced}`);
+    }
   });
 
   // Telegram parses the message as HTML and drops the WHOLE message on a malformed tag, so the
@@ -285,8 +300,6 @@ describe('session bell: the message', () => {
 //
 // August 2026 for reference: the 12th is a Wednesday, so 13 Thu, 14 Fri, 15 Sat, 16 Sun, 17 Mon.
 describe('session bell: when the next session is', () => {
-  // The offline quote carries no credit line, so the sign-off is the last line — which keeps this
-  // section about the calendar rather than about the layout.
   const closingLine = (nowMs: number): string =>
     renderBell('close', true, nowMs, quote({ sourced: false })).split('\n').at(-1) as string;
 
