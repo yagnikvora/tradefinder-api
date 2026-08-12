@@ -28,7 +28,7 @@ import {
   sendDiscord, discordConfigured, discordStatus, signalMessage as discordSignalMessage,
 } from './alerts/discord.js';
 import { sampleAlert } from './alerts/sample.js';
-import { renderBell, sessionBellStatus } from './alerts/session-bell.js';
+import { previewBell, sessionBellStatus } from './alerts/session-bell.js';
 import { schedulerStatus } from './scheduler.js';
 import { backtest } from './backtest/backtest.engine.js';
 import { configRepository } from './config/config.repository.js';
@@ -303,10 +303,11 @@ export function pullbackRouter(): express.Router {
         (html ? telegramSignalMessage(signal, trend) : discordSignalMessage(signal, trend));
     } else if (sample === 'open' || sample === 'close') {
       // `?sample=open` and `?sample=close` render the session bells exactly as they will go out,
-      // today's date and today's quote included. Without this the only way to check either message
-      // is to wait for 09:15, and the only way to check an edit to one is to wait until tomorrow.
+      // today's date and a freshly fetched quote included. Without this the only way to check
+      // either message is to wait for 09:15, and the only way to check an edit is to wait a day.
       sampleBasis = sample === 'open' ? 'the 09:15 good-morning bell' : 'the 15:30 session-closed bell';
-      render = (html) => banner(html, 'not the real bell') + renderBell(sample, html);
+      const preview = await previewBell(sample);
+      render = (html) => banner(html, 'not the real bell') + (html ? preview.html : preview.markdown);
     } else {
       const lines = (b: (s: string) => string) => [
         `✅ ${b('Trinetra alerts are wired up.')}`,

@@ -12,12 +12,20 @@
 import type { AlertEvent, OptionPick, PullbackSignal, TrendContext } from '../types.js';
 import { TIMEFRAME_LABEL } from '../types.js';
 
-/** The three things a channel has to answer about text. */
+/** The four things a channel has to answer about text. */
 export interface Markup {
   bold(s: string): string;
   italic(s: string): string;
   /** Neutralise anything the channel would otherwise read as formatting. */
   escape(s: string): string;
+  /**
+   * A labelled link.
+   *
+   * Here because an attribution that a licence REQUIRES cannot be left to whichever channel
+   * happens to autolink a bare URL — ZenQuotes' free tier asks for a credit with a link back, and
+   * both phones have to be able to render one.
+   */
+  link(text: string, url: string): string;
 }
 
 /** Telegram's `parse_mode: HTML`. A stray `&` in a symbol would drop the whole message. */
@@ -25,6 +33,7 @@ export const HTML: Markup = {
   bold: (s) => `<b>${s}</b>`,
   italic: (s) => `<i>${s}</i>`,
   escape: (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+  link: (text, url) => `<a href="${url}">${text}</a>`,
 };
 
 /** Discord's Markdown. Backslash-escaping is what Discord itself documents. */
@@ -32,6 +41,7 @@ export const MARKDOWN: Markup = {
   bold: (s) => `**${s}**`,
   italic: (s) => `_${s}_`,
   escape: (s) => s.replace(/([*_~`|\\])/g, '\\$1'),
+  link: (text, url) => `[${text}](${url})`,
 };
 
 const inr = (v: number): string => `₹${Math.round(v).toLocaleString('en-IN')}`;

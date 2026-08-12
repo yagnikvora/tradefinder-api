@@ -68,8 +68,11 @@ export { evaluateSignal, worthWatching } from './engine/signal.service.js';
 export { backtest } from './backtest/backtest.engine.js';
 export { alerts, alertStatus, resetAlerts } from './alerts/alert.engine.js';
 export {
-  dueBell, quoteFor, renderBell, sessionBellStatus, sessionBellTick, resetSessionBell, type Bell,
+  dueBell, previewBell, renderBell, sessionBellStatus, sessionBellTick, resetSessionBell, type Bell,
 } from './alerts/session-bell.js';
+export {
+  bestOf, fitness, parseBatch, quoteFor, quoteStatus, usable, type Quote,
+} from './alerts/quotes.js';
 export { configRepository, StoredConfigRepository, sanitise, PULLBACK_KEYS } from './config/config.repository.js';
 export { defaultConfig, DEFAULT_CONFIG, DEFAULT_INDICES } from './config/defaults.js';
 export { signalRepository, summarise } from './data/signal.repository.js';

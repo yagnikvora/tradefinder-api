@@ -22,11 +22,12 @@
 //   greeting — the window has passed and "good morning, markets are open" two hours into the
 //   session is worse than silence. The same window is what makes a restart inside it safe.
 //
-//   THE QUOTE MUST ACTUALLY CHANGE. Picked by day index rather than at random, because random
-//   repeats: over a five-day week `Math.random()` gives the same quote twice about a third of the
-//   time, and two identical good mornings in a row reads as a stuck cron. Indexing by the day
-//   guarantees the full list cycles before anything repeats, and makes the message reproducible
-//   in a test.
+//   THE QUOTE MUST ACTUALLY CHANGE. It is fetched live per bell from ZenQuotes and chosen out of
+//   a fifty-quote batch by fit — see `quotes.ts`, which owns the fetch, the filter and the offline
+//   fallback. This file's share of that job is the MEMORY: the last `QUOTE_MEMORY` texts sent are
+//   kept beside the sent-today record and passed back in, so the picker can rule them out. Without
+//   it, fifty random draws from ten thousand quotes will eventually serve the same line twice, and
+//   the day it does is the day the whole feature looks broken.
 //
 // HOLIDAYS. The session clock knows about weekends and nothing else — `marketOpen()` is weekday
 // plus time — so on Republic Day this would wish you good morning at a shut exchange. There is no
@@ -39,9 +40,19 @@ import { store } from '../../momentum/store.js';
 import { PULLBACK_KEYS } from '../config/config.repository.js';
 import { HTML, istClock, istDate, istWeekday, MARKDOWN, type Markup } from './message.js';
 import { discordConfigured, sendDiscord } from './discord.js';
+import { quoteFor, quoteStatus, ZENQUOTES_URL, type Quote } from './quotes.js';
 import { sendTelegram, telegramConfigured } from './telegram.js';
 
 export type Bell = 'open' | 'close';
+
+/**
+ * How many past quotes to remember, so none of them comes round again soon.
+ *
+ * Ninety is about four months of bells at two a day. Long enough that a repeat is not something a
+ * reader could notice, short enough that the record stays a few kilobytes and the exclusion list
+ * never starves a fifty-quote batch of candidates.
+ */
+export const QUOTE_MEMORY = 90;
 
 /**
  * How long after the bell a message may still be sent.
@@ -58,93 +69,32 @@ const istDow = (nowMs: number): number => new Date(nowMs + IST_OFFSET_MS).getUTC
 
 /* ------------------------------------------------------------------------- the words --- */
 
-interface Quote {
-  text: string;
-  /** Null for the ones that are trading-floor adages with no honest attribution. */
-  by: string | null;
-}
-
-/**
- * The morning set — energetic, and about doing the work rather than about being rich.
- *
- * Chosen to say something a trader can act on in the next six hours. Motivational wallpaper
- * ("believe in yourself") is fine on a poster and useless at 09:15, so most of these are about
- * process: defend capital, wait for your setup, cut what is not working.
- */
-const OPEN_QUOTES: Quote[] = [
-  { text: 'Every battle is won before it is ever fought.', by: 'Sun Tzu' },
-  { text: 'The most important rule of trading is to play great defence, not great offence.', by: 'Paul Tudor Jones' },
-  { text: 'Markets are never wrong — opinions often are.', by: 'Jesse Livermore' },
-  { text: 'The elements of good trading are cutting losses, cutting losses, and cutting losses.', by: 'Ed Seykota' },
-  { text: 'Amateurs think about how much money they can make. Professionals think about how much they could lose.', by: 'Jack Schwager' },
-  { text: 'Risk comes from not knowing what you are doing.', by: 'Warren Buffett' },
-  { text: 'The stock market is a device for transferring money from the impatient to the patient.', by: 'Warren Buffett' },
-  { text: 'The big money is not in the buying and the selling, but in the waiting.', by: 'Charlie Munger' },
-  { text: 'In investing, what is comfortable is rarely profitable.', by: 'Robert Arnott' },
-  { text: 'The four most dangerous words in investing are: this time it is different.', by: 'Sir John Templeton' },
-  { text: 'Fortune favours the prepared mind.', by: 'Louis Pasteur' },
-  { text: 'Discipline is the bridge between goals and accomplishment.', by: 'Jim Rohn' },
-  { text: 'Learn to take losses. The most important thing is not letting your losses get out of hand.', by: 'Marty Schwartz' },
-  { text: 'The goal of a successful trader is to make the best trades. Money is secondary.', by: 'Alexander Elder' },
-  { text: 'Losers average losers.', by: 'Paul Tudor Jones' },
-  { text: 'An investment in knowledge pays the best interest.', by: 'Benjamin Franklin' },
-  { text: 'There is a time to go long, a time to go short, and a time to go fishing.', by: 'Jesse Livermore' },
-  { text: 'Know what you own, and know why you own it.', by: 'Peter Lynch' },
-  { text: 'The trend is your friend until the end when it bends.', by: 'Ed Seykota' },
-  { text: 'Plan the trade. Trade the plan. Everything else is noise.', by: null },
-  { text: 'You do not have to be in every move. You have to be right about the one you are in.', by: null },
-  { text: 'The setup you skip costs you nothing. The one you force costs you the week.', by: null },
-  { text: 'Patience is a position.', by: null },
-];
-
-/** The evening set — reflective, and about the review that makes tomorrow better. */
-const CLOSE_QUOTES: Quote[] = [
-  { text: 'It was never my thinking that made the big money for me. It always was my sitting.', by: 'Jesse Livermore' },
-  { text: 'Win or lose, everybody gets what they want out of the market.', by: 'Ed Seykota' },
-  { text: 'The best traders have no ego.', by: 'Tom Baldwin' },
-  { text: 'I am always thinking about losing money, as opposed to making money.', by: 'Paul Tudor Jones' },
-  { text: 'Do more of what works and less of what does not.', by: 'Steve Clark' },
-  { text: 'The market will still be here tomorrow. Make sure you are too.', by: null },
-  { text: 'A losing day you followed your plan on is a better day than a winning one you did not.', by: null },
-  { text: 'Review the trades you did not take as carefully as the ones you did.', by: null },
-  { text: 'Green or red, the screen goes dark at the same time. Log it and let it go.', by: null },
-  { text: 'Tomorrow brings 375 fresh minutes. None of them care what today did.', by: null },
-  { text: 'The edge is not in one day. It is in a thousand of them kept honestly.', by: null },
-  { text: 'Count the process, not the P&L. The P&L is downstream.', by: null },
-  { text: 'Rest is part of risk management.', by: null },
-];
-
-/**
- * Which quote today gets.
- *
- * Indexed on days-since-epoch so the choice is a pure function of the date: the same day always
- * produces the same quote, consecutive days never repeat, and the whole list cycles before
- * anything comes round again. The two lists are deliberately different lengths, so the morning
- * and evening pairings drift instead of locking into the same couple every three weeks.
- */
-export function quoteFor(day: string, bell: Bell): Quote {
-  const list = bell === 'open' ? OPEN_QUOTES : CLOSE_QUOTES;
-  const index = Math.floor(Date.parse(`${day}T00:00:00Z`) / 86_400_000);
-  // `% length` on a negative epoch would index out of the array; dates before 1970 are not a real
-  // case here, but the guard costs nothing and an `undefined` quote would throw inside a timer.
-  return list[((index % list.length) + list.length) % list.length];
-}
-
 const quoteBlock = (q: Quote, m: Markup, glyph: string): string[] => [
   `${glyph} ${m.italic(`"${m.escape(q.text)}"`)}`,
   ...(q.by ? [`     — ${m.escape(q.by)}`] : []),
 ];
 
-/** The 09:15 message. */
-export function openMessage(nowMs: number, m: Markup): string {
+/**
+ * The credit, which is a LICENCE TERM rather than a nicety.
+ *
+ * ZenQuotes' free tier is conditioned on a visible attribution linking back to them. It is
+ * rendered only when the quote actually came from them — the offline set is this codebase's own,
+ * and crediting someone else for it would be its own kind of wrong.
+ */
+const credit = (q: Quote, m: Markup): string[] =>
+  q.sourced ? ['', m.italic(`Quote via ${m.link('ZenQuotes', ZENQUOTES_URL)}`)] : [];
+
+/** The 09:15 message. The quote is passed in because fetching it is async and this is not. */
+export function openMessage(nowMs: number, m: Markup, quote: Quote): string {
   return [
     `🔔 ${m.bold('GOOD MORNING — THE MARKET IS OPEN')}`,
     `${m.escape(istDate(nowMs))} · ${istClock(nowMs)} IST`,
     '',
-    ...quoteBlock(quoteFor(istDay(nowMs), 'open'), m, '⚡'),
+    ...quoteBlock(quote, m, '⚡'),
     '',
     `375 minutes on the clock. ${m.bold('Plan the trade, trade the plan.')}`,
     m.italic('Let the setup come to you. 🚀'),
+    ...credit(quote, m),
   ].join('\n');
 }
 
@@ -205,16 +155,17 @@ function nextSession(nowMs: number): string {
 }
 
 /** The 15:30 message. */
-export function closeMessage(nowMs: number, m: Markup): string {
+export function closeMessage(nowMs: number, m: Markup, quote: Quote): string {
   return [
     `🔕 ${m.bold('TRADING SESSION CLOSED')}`,
     `${m.escape(istDate(nowMs))} · ${istClock(nowMs)} IST`,
     '',
     'The bell has rung and the books are shut for the day.',
     '',
-    ...quoteBlock(quoteFor(istDay(nowMs), 'close'), m, '🌙'),
+    ...quoteBlock(quote, m, '🌙'),
     '',
     `${m.bold('Rest, review, reset.')} Back at 09:15 ${nextSession(nowMs)}.`,
+    ...credit(quote, m),
   ].join('\n');
 }
 
@@ -223,10 +174,29 @@ export function closeMessage(nowMs: number, m: Markup): string {
  *
  * Takes the same `html: boolean` the controller's other renderers take, so `/pullback/alerts/test`
  * can preview a bell without the HTTP layer having to know that Telegram wants HTML and Discord
- * wants Markdown.
+ * wants Markdown. Synchronous and pure: the quote is handed in, which is what keeps the wording
+ * testable without a network.
  */
-export const renderBell = (bell: Bell, html: boolean, nowMs = Date.now()): string =>
-  (bell === 'open' ? openMessage : closeMessage)(nowMs, html ? HTML : MARKDOWN);
+export const renderBell = (bell: Bell, html: boolean, nowMs: number, quote: Quote): string =>
+  (bell === 'open' ? openMessage : closeMessage)(nowMs, html ? HTML : MARKDOWN, quote);
+
+/**
+ * Both dialects of a bell, from ONE freshly fetched quote.
+ *
+ * One fetch and two renders rather than two of each, for two reasons that both bite: two fetches
+ * would put a different quote on Telegram than on Discord for the same bell, and they would spend
+ * two of the five requests ZenQuotes allows per thirty seconds on a single preview.
+ *
+ * It deliberately does NOT record the quote as sent. A preview that burned a line would mean
+ * testing the message costs you tomorrow's, and the recency memory exists to serve the real bells.
+ */
+export async function previewBell(bell: Bell, nowMs = Date.now()): Promise<{ html: string; markdown: string }> {
+  const quote = await quoteFor(bell, (await load()).recent);
+  return {
+    html: renderBell(bell, true, nowMs, quote),
+    markdown: renderBell(bell, false, nowMs, quote),
+  };
+}
 
 /* --------------------------------------------------------------------------- the gate --- */
 
@@ -249,9 +219,11 @@ function holidays(): Set<string> {
 export interface BellState {
   openSentDay: string | null;
   closeSentDay: string | null;
+  /** The last `QUOTE_MEMORY` quotes sent, newest last. What stops one coming round again. */
+  recent: string[];
 }
 
-const EMPTY: BellState = { openSentDay: null, closeSentDay: null };
+const EMPTY: BellState = { openSentDay: null, closeSentDay: null, recent: [] };
 
 /**
  * Which bell, if any, is due right now — pure, so the whole schedule is testable without a clock,
@@ -277,20 +249,30 @@ let lastSentAt: number | null = null;
 let lastBell: Bell | null = null;
 let lastError: string | null = null;
 
-const load = async (): Promise<BellState> =>
-  (await store.read<BellState>(PULLBACK_KEYS.sessionBell)) ?? { ...EMPTY };
+/**
+ * The stored record, defaulted field by field.
+ *
+ * Spread over `EMPTY` rather than returned as-is because a file written by an older build has no
+ * `recent` key, and `undefined.length` inside the picker would take the bell down on the first
+ * morning after a deploy.
+ */
+const load = async (): Promise<BellState> => {
+  const saved = await store.read<Partial<BellState>>(PULLBACK_KEYS.sessionBell);
+  return { ...EMPTY, ...saved, recent: saved?.recent ?? [] };
+};
 
 /**
  * Send one bell to every configured channel.
  *
  * Each channel is awaited only by its own promise — `sendTelegram` and `sendDiscord` already
  * swallow their failures and count them — so one dead channel cannot stop the other, exactly as
- * the strategy pushes behaved.
+ * the strategy pushes behaved. Both render the SAME quote object, so the two phones can never
+ * show different words on the same morning.
  */
-async function deliver(bell: Bell, nowMs: number): Promise<void> {
+async function deliver(bell: Bell, nowMs: number, quote: Quote): Promise<void> {
   const jobs: Promise<boolean>[] = [];
-  if (telegramConfigured()) jobs.push(sendTelegram(renderBell(bell, true, nowMs)));
-  if (discordConfigured()) jobs.push(sendDiscord(renderBell(bell, false, nowMs)));
+  if (telegramConfigured()) jobs.push(sendTelegram(renderBell(bell, true, nowMs, quote)));
+  if (discordConfigured()) jobs.push(sendDiscord(renderBell(bell, false, nowMs, quote)));
   if (!jobs.length) {
     lastError = 'no phone channel is configured';
     return;
@@ -316,16 +298,25 @@ export async function sessionBellTick(nowMs = Date.now()): Promise<Bell | null> 
     const bell = dueBell(nowMs, state);
     if (!bell) return null;
 
+    // Fetched before the record is written, so a quote host that is down costs a fallback line
+    // rather than the whole bell — `quoteFor` resolves either way and never throws.
+    const quote = await quoteFor(bell, state.recent);
+
     // Marked BEFORE the send, and that ordering is the whole dedupe. A channel that takes longer
     // than the tick interval would otherwise be sent to again on the next tick, and the failure
     // this protects against — twenty good mornings — is far worse than the one it accepts, which
     // is a bell lost to a channel that was down at exactly 09:15.
+    //
+    // The quote joins the memory in the same write. It is recorded as SENT at the point it is
+    // chosen rather than after delivery succeeds, for the same reason: a quote burned by a failed
+    // send is a cheaper loss than one repeated because the write never happened.
     const day = istDay(nowMs);
     if (bell === 'open') state.openSentDay = day;
     else state.closeSentDay = day;
+    state.recent = [...state.recent, quote.text].slice(-QUOTE_MEMORY);
     await store.write(PULLBACK_KEYS.sessionBell, state);
 
-    await deliver(bell, nowMs);
+    await deliver(bell, nowMs, quote);
     return bell;
   } catch (e) {
     lastError = String((e as Error).message);
@@ -336,14 +327,21 @@ export async function sessionBellTick(nowMs = Date.now()): Promise<Bell | null> 
 }
 
 /** Reported on `/pullback/status`, so a bell that never rang is diagnosable. */
-export const sessionBellStatus = async () => ({
-  enabled: enabled(),
-  holidays: holidays().size,
-  lastSentAt,
-  lastBell,
-  lastError,
-  ...(await load()),
-});
+export const sessionBellStatus = async () => {
+  const { recent, ...state } = await load();
+  return {
+    enabled: enabled(),
+    holidays: holidays().size,
+    lastSentAt,
+    lastBell,
+    lastError,
+    ...state,
+    // The texts themselves would be ninety lines of JSON on a status endpoint nobody reads for
+    // that. The COUNT is the diagnostic: stuck at zero means quotes are never being recorded.
+    quotesRemembered: recent.length,
+    quotes: quoteStatus(),
+  };
+};
 
 /** Test seam. Clears both the in-process counters and the persisted "sent today" record. */
 export const resetSessionBell = async (): Promise<void> => {

@@ -18,8 +18,9 @@ import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
 
 import {
-  dueBell, GRACE_MIN, quoteFor, renderBell, type BellState,
+  dueBell, GRACE_MIN, renderBell, type BellState,
 } from '../src/pullback/alerts/session-bell.js';
+import { bestOf, fitness, parseBatch, usable, type Quote } from '../src/pullback/alerts/quotes.js';
 
 /* ------------------------------------------------------------------------ fixtures --- */
 
@@ -28,8 +29,12 @@ const ist = (hh: number, mm: number): number => Date.UTC(2026, 7, 12, hh, mm) - 
 /** The same clock time on Saturday 15 Aug 2026. */
 const saturday = (hh: number, mm: number): number => Date.UTC(2026, 7, 15, hh, mm) - 330 * 60_000;
 
-const FRESH: BellState = { openSentDay: null, closeSentDay: null };
+const FRESH: BellState = { openSentDay: null, closeSentDay: null, recent: [] };
 const state = (over: Partial<BellState> = {}): BellState => ({ ...FRESH, ...over });
+
+/** A quote the renderer can be handed, so the wording is testable without a network. */
+const quote = (over: Partial<Quote> = {}): Quote =>
+  ({ text: 'Discipline is the bridge between goals and accomplishment.', by: 'Jim Rohn', sourced: true, ...over });
 
 /**
  * Run `fn` with a holiday list in place, and put the environment back afterwards.
@@ -125,61 +130,153 @@ describe('session bell: days the market is shut', () => {
   });
 });
 
-describe('session bell: the quote', () => {
-  // The whole reason the pick is indexed rather than random: two identical good mornings in a row
-  // reads as a stuck job, and `Math.random()` produces exactly that about a third of each week.
-  it('gives consecutive days different quotes', () => {
-    const days = ['2026-08-10', '2026-08-11', '2026-08-12', '2026-08-13', '2026-08-14'];
-    const seen = days.map((d) => quoteFor(d, 'open').text);
-    assert.equal(new Set(seen).size, days.length);
+// The quote picker. Nothing here touches the network: `fetchBatch` is the only part that does,
+// and everything worth testing about the feature is what happens to the batch AFTER it arrives.
+describe('session bell: choosing a quote', () => {
+  const q = (text: string, by: string | null = 'Someone'): Quote => ({ text, by, sourced: true });
+
+  it('rejects a quote too long for a lock screen', () => {
+    assert.equal(usable(q('x'.repeat(400))), false);
   });
 
-  it('gives the same day the same quote every time it is asked', () => {
-    assert.equal(quoteFor('2026-08-12', 'open').text, quoteFor('2026-08-12', 'open').text);
+  it('rejects a fragment that reads as truncation', () => {
+    assert.equal(usable(q('Be brave.')), false);
   });
 
-  it('draws the morning and the evening from different sets', () => {
-    assert.notEqual(quoteFor('2026-08-12', 'open').text, quoteFor('2026-08-12', 'close').text);
+  // ZenQuotes uses these to mean "we do not have an attribution", and an unattributed line reads
+  // as the app talking to itself.
+  it('rejects an unattributed quote', () => {
+    assert.equal(usable(q('Discipline is the bridge between goals and accomplishment.', null)), false);
+    assert.equal(usable(q('Discipline is the bridge between goals and accomplishment.', 'Unknown')), false);
+    assert.equal(usable(q('Discipline is the bridge between goals and accomplishment.', 'anonymous')), false);
   });
 
-  it('cycles the whole list before repeating', () => {
-    // 23 morning quotes, so a month of weekdays should not collide.
-    const texts = new Set<string>();
-    for (let i = 0; i < 23; i++) {
-      const day = new Date(Date.UTC(2026, 7, 12) + i * 86_400_000).toISOString().slice(0, 10);
-      texts.add(quoteFor(day, 'open').text);
-    }
-    assert.equal(texts.size, 23);
+  // The regression this filter exists for. `/api/quotes` is the whole inspirational genre, and
+  // this is a real response from it — the wrong register to open a trading day on.
+  it('rejects the wrong register for a bell', () => {
+    assert.equal(usable(q('Grief is the price we pay for love, and it is worth paying.')), false);
+  });
+
+  // Deliberately narrow: a blocklist wide enough to catch every unwanted quote kills good ones.
+  it('keeps a good quote that merely mentions fear or losing', () => {
+    assert.equal(usable(q('The only thing we have to fear is fear itself, and nothing more.')), true);
+  });
+
+  it('ranks a doing-the-work quote above a merely usable one at the open', () => {
+    const action = q('Discipline is the bridge between goals and accomplishment.');
+    const bland = q('The quality, not the longevity, of a life is what is important.');
+    assert.ok(fitness(action, 'open') > fitness(bland, 'open'));
+  });
+
+  it('ranks a reflective quote above an action one at the close', () => {
+    const reflective = q('We learn the most from the mistakes we are willing to look at again.');
+    const action = q('Start now. Begin the work and build the habit before you feel ready.');
+    assert.ok(fitness(reflective, 'close') > fitness(action, 'close'));
+  });
+
+  it('scores anything unusable at zero', () => {
+    assert.equal(fitness(q('Be brave.'), 'open'), 0);
+  });
+
+  it('picks the best fit out of a batch', () => {
+    const batch = [
+      q('Love is the expression of a person and their values in the world.'),
+      q('Discipline is the bridge between goals and accomplishment.'),
+      q('Be brave.'),
+    ];
+    assert.equal(bestOf(batch, 'open')?.by, 'Someone');
+    assert.match(bestOf(batch, 'open')!.text, /^Discipline/);
+  });
+
+  // This is what makes "new every day" true rather than merely likely — fifty random draws from
+  // ten thousand quotes will eventually serve the same line twice.
+  it('skips a quote sent recently, even when it is the best fit', () => {
+    const best = 'Discipline is the bridge between goals and accomplishment.';
+    const batch = [q(best), q('Focus on the work in front of you and let the rest arrive later.')];
+    assert.notEqual(bestOf(batch, 'open', [best])?.text, best);
+  });
+
+  it('matches the recency list past punctuation and case', () => {
+    const best = 'Discipline is the bridge between goals and accomplishment.';
+    assert.equal(bestOf([q(best)], 'open', ['  DISCIPLINE is the BRIDGE between goals and accomplishment!! ']), null);
+  });
+
+  it('returns null rather than something unusable when a batch has nothing', () => {
+    assert.equal(bestOf([q('Be brave.'), q('x'.repeat(400))], 'open'), null);
+  });
+
+  // Every one of these has arrived from a public API at some point, and any of them thrown inside
+  // a timer would take the bell down with no greeting and no error anyone reads.
+  it('survives whatever the endpoint returns', () => {
+    assert.deepEqual(parseBatch(null), []);
+    assert.deepEqual(parseBatch({ error: 'rate limited' }), []);
+    assert.deepEqual(parseBatch([{ q: 42, a: 'x' }]), []);
+    assert.deepEqual(parseBatch([{ a: 'no text here' }]), []);
+    assert.deepEqual(parseBatch([{ q: '  spaced  ', a: '  Someone  ' }]), [
+      { text: 'spaced', by: 'Someone', sourced: true },
+    ]);
   });
 });
 
 describe('session bell: the message', () => {
   it('names the right day and time in the morning', () => {
-    const msg = renderBell('open', true, ist(9, 15));
+    const msg = renderBell('open', true, ist(9, 15), quote());
     assert.match(msg, /Wednesday, 12 August 2026/);
     assert.match(msg, /09:15 AM IST/);
     assert.match(msg, /GOOD MORNING/);
   });
 
   it('says the session is closed in the evening', () => {
-    const msg = renderBell('close', true, ist(15, 30));
+    const msg = renderBell('close', true, ist(15, 30), quote());
     assert.match(msg, /TRADING SESSION CLOSED/);
     assert.match(msg, /03:30 PM IST/);
+  });
+
+  it('carries the quote it was handed', () => {
+    const msg = renderBell('open', true, ist(9, 15), quote({ text: 'A very specific line.', by: 'Nobody' }));
+    assert.match(msg, /A very specific line\./);
+    assert.match(msg, /— Nobody/);
+  });
+
+  // ZenQuotes' free tier is conditioned on a visible credit linking back to them. Getting this
+  // wrong is a licence breach rather than a cosmetic slip, which is why it is asserted in both
+  // directions.
+  it('credits ZenQuotes when the quote came from them', () => {
+    const msg = renderBell('open', true, ist(9, 15), quote({ sourced: true }));
+    assert.match(msg, /zenquotes\.io/);
+  });
+
+  it('credits nobody when the quote came from the offline set', () => {
+    const msg = renderBell('open', true, ist(9, 15), quote({ sourced: false }));
+    assert.equal(msg.toLowerCase().includes('zenquotes'), false);
   });
 
   // Telegram parses the message as HTML and drops the WHOLE message on a malformed tag, so the
   // only markup in it must be the markup this file put there.
   it('renders Telegram HTML with balanced tags and nothing else angled', () => {
-    const msg = renderBell('open', true, ist(9, 15));
-    assert.equal((msg.match(/<b>/g) ?? []).length, (msg.match(/<\/b>/g) ?? []).length);
-    assert.equal((msg.match(/<i>/g) ?? []).length, (msg.match(/<\/i>/g) ?? []).length);
-    assert.equal(msg.replace(/<\/?[bi]>/g, '').includes('<'), false);
+    const msg = renderBell('open', true, ist(9, 15), quote());
+    for (const tag of ['b', 'i', 'a'])
+      assert.equal(
+        (msg.match(new RegExp(`<${tag}[ >]`, 'g')) ?? []).length,
+        (msg.match(new RegExp(`</${tag}>`, 'g')) ?? []).length,
+        `unbalanced <${tag}>`,
+      );
+    assert.equal(msg.replace(/<\/?[bia](?: href="[^"]*")?>/g, '').includes('<'), false);
+  });
+
+  // A quote arriving with an ampersand or an angle bracket in it must not be able to break the
+  // parse — the whole message would be rejected by Telegram, not just the quote.
+  it('escapes markup that arrives inside a quote', () => {
+    const msg = renderBell('open', true, ist(9, 15), quote({ text: 'Risk & reward <are> a pair, always.', by: 'A & B' }));
+    assert.match(msg, /Risk &amp; reward &lt;are&gt; a pair/);
+    assert.match(msg, /A &amp; B/);
   });
 
   it('renders Discord Markdown rather than HTML', () => {
-    const msg = renderBell('close', false, ist(15, 30));
+    const msg = renderBell('close', false, ist(15, 30), quote());
     assert.equal(msg.includes('<b>'), false);
     assert.match(msg, /\*\*TRADING SESSION CLOSED\*\*/);
+    assert.match(msg, /\[ZenQuotes\]\(https:\/\/zenquotes\.io\/\)/);
   });
 });
 
@@ -188,8 +285,10 @@ describe('session bell: the message', () => {
 //
 // August 2026 for reference: the 12th is a Wednesday, so 13 Thu, 14 Fri, 15 Sat, 16 Sun, 17 Mon.
 describe('session bell: when the next session is', () => {
+  // The offline quote carries no credit line, so the sign-off is the last line — which keeps this
+  // section about the calendar rather than about the layout.
   const closingLine = (nowMs: number): string =>
-    renderBell('close', true, nowMs).split('\n').at(-1) as string;
+    renderBell('close', true, nowMs, quote({ sourced: false })).split('\n').at(-1) as string;
 
   it('says tomorrow on an ordinary weekday', () => {
     assert.match(closingLine(ist(15, 30)), /Back at 09:15 tomorrow\./);
