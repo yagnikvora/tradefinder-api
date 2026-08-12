@@ -2,23 +2,28 @@
 //
 // Sits beside Telegram rather than replacing it, and that is the point: a single channel that
 // fails silently is a missed trade you never learn about, and two independent ones have to fail
-// together. They carry the SAME message from `message.ts`, rendered as Markdown here and as HTML
-// there, so the two can never disagree about a price.
+// together. Both are handed the SAME content, rendered as Markdown here and as HTML there through
+// the `Markup` pair in `markup.ts`, so the two can never disagree about a price.
 //
 // Sent as an EMBED rather than plain content, for one reason worth keeping: an embed carries a
 // colour stripe, so long and short are distinguishable from across the room without reading a
 // word. The colours are the app's own bull and bear.
 //
 // The webhook URL is a credential — anyone holding it can post into that channel as you — so like
-// the Telegram token it lives in the environment and never in the config that `GET /pullback/config`
+// the Telegram token it lives in the environment and never in the config that `PUT /momentum/config`
 // serves over HTTP.
 
-import type { AlertEvent, PullbackSignal, TrendContext } from '../types.js';
-import { buildEventMessage, buildSignalMessage, MARKDOWN } from './message.js';
+/**
+ * The webhook URL, under its new name or the old `PULLBACK_`-prefixed one.
+ *
+ * Same reasoning as `telegram.ts`: the credentials were named for the module that first sent
+ * anything, that module is gone, and dropping the old spelling would silently unconfigure the
+ * channel on any `.env` that still uses it.
+ */
+const url = () =>
+  (process.env.DISCORD_WEBHOOK_URL ?? process.env.PULLBACK_DISCORD_WEBHOOK_URL ?? '').trim();
 
-const url = () => (process.env.PULLBACK_DISCORD_WEBHOOK_URL ?? '').trim();
-
-/** Whether the channel is set up at all. Reported on `/pullback/status`. */
+/** Whether the channel is set up at all. Reported on `/momentum/status`. */
 export const discordConfigured = (): boolean => /^https:\/\/(discord\.com|discordapp\.com)\/api\/webhooks\//.test(url());
 
 let failures = 0;
@@ -67,9 +72,6 @@ const BULL = 0x2ec76a;
 const BEAR = 0xe5484d;
 const NEUTRAL = 0x4c8dff;
 
-export const signalMessage = (signal: PullbackSignal, trend: TrendContext | null = null): string =>
-  buildSignalMessage(signal, MARKDOWN, trend);
-export const eventMessage = (e: AlertEvent): string => buildEventMessage(e, MARKDOWN);
 
 /** An embed description tops out at 4096 characters; ours run ~600, so this only ever guards. */
 const CAP = 4000;

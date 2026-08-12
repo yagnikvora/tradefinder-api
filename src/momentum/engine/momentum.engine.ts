@@ -67,8 +67,9 @@ import { computePulse, pulseFactor, type PulseReading } from '../services/pulse.
 import {
   computeConviction, convictionFactor, convictionSummary,
 } from '../services/conviction.service.js';
+import { onScan } from '../alerts/trend-day.js';
 import type { ConvictionReading } from '../types.js';
-import { buildSignal, gateTradeType } from './signal.service.js';
+import { buildSignal, buildTrendDayPlan, gateTradeType, type SignalInputs } from './signal.service.js';
 import { institutionalActivity, scoreRow } from './score.service.js';
 import { cache } from '../cache.js';
 
@@ -83,6 +84,22 @@ interface Enrichment {
 }
 
 const enrichKey = (symbol: string) => `momentum:enrich:${symbol}`;
+
+/** The entry, stop, target and contract a confirmed trend day is announced with. */
+export type TrendDayPlan = NonNullable<ReturnType<typeof buildTrendDayPlan>>;
+
+/**
+ * The trend-mode plans from the most recent scan, keyed by symbol.
+ *
+ * Held here so `GET /momentum/alerts/test` can preview the SAME numbers the live alert would send.
+ * Without it the preview fell back to `row.signal.plan`, which is null for most of the board —
+ * `buildSignal` returns early with no plan whenever the pulse ring is not yet ready — so the test
+ * message showed "no price plan" for stocks the live alert would have priced perfectly well. A test
+ * that understates the real thing is worse than no test, because it sends you looking for a bug
+ * that is not there.
+ */
+let lastTrendPlans = new Map<string, TrendDayPlan>();
+export const latestTrendPlans = (): Map<string, TrendDayPlan> => lastTrendPlans;
 
 /* --------------------------------------------------------------- stage 1: the board --- */
 
@@ -335,6 +352,13 @@ function buildRow(
   breadth: BreadthReading,
   cfg: MomentumConfig,
   nowMs: number,
+  /**
+   * Collects the trend-mode plan for any row whose conviction is Confirmed, for the alert.
+   *
+   * An out-parameter rather than a second return value, because every other caller of this
+   * function wants a `MomentumRow` and only the scan wants this. Omitted, nothing is built.
+   */
+  trendPlans?: Map<string, TrendDayPlan>,
 ): MomentumRow {
   const chain = enrichment?.chain ?? null;
   const carry = s.metricsCarry;
@@ -378,27 +402,44 @@ function buildRow(
   // against the delta and premium actually quoted, so the plan says what the option does
   // rather than only what the stock does. `recordTrigger` dedupes inside the cooldown, so
   // this does not restamp the trigger the stage-1 build already dated.
-  const signal = cfg.signal.enabled
-    ? buildSignal({
-        quote: s.quote,
-        pulse: s.pulse,
-        pulseScore: factors.find((f) => f.key === 'momentumPulse')?.score ?? null,
-        symState: s.symState,
-        baseline: s.baseline,
-        openingRange: s.symState?.openingRange ?? null,
-        greeks,
-        // With the chain in hand the plan names a specific contract rather than pricing a
-        // notional ATM one; the lot comes off the future, which NSE lists identically for
-        // that underlying's options.
-        chain,
-        lotSize: s.member.future?.lotSize ?? null,
-        direction: result.direction,
-        conviction: s.conviction,
-        liquidityScore,
-        config: cfg,
-        nowMs,
-      })
-    : null;
+  const signalInputs: SignalInputs = {
+    quote: s.quote,
+    pulse: s.pulse,
+    pulseScore: factors.find((f) => f.key === 'momentumPulse')?.score ?? null,
+    symState: s.symState,
+    baseline: s.baseline,
+    openingRange: s.symState?.openingRange ?? null,
+    greeks,
+    // With the chain in hand the plan names a specific contract rather than pricing a
+    // notional ATM one; the lot comes off the future, which NSE lists identically for
+    // that underlying's options.
+    chain,
+    lotSize: s.member.future?.lotSize ?? null,
+    direction: result.direction,
+    conviction: s.conviction,
+    liquidityScore,
+    config: cfg,
+    nowMs,
+  };
+
+  const signal = cfg.signal.enabled ? buildSignal(signalInputs) : null;
+
+  // The plan a confirmed trend day deserves, for the alert.
+  //
+  // Built here rather than inside the alert because it must come from the SAME inputs object the
+  // row's own signal was built from — a second construction of those inputs is how a message and
+  // a board start quoting different stops for the same stock.
+  //
+  // It is a separate build rather than `signal.plan` because that one is only in trend mode when
+  // the state machine happens to be `Trending`, which is a claim about the last three minutes. A
+  // stock is very often `Quiet` at the instant its conviction is confirmed, and the plan then
+  // carries the ignition stop instead of the VWAP one — and VWAP is the level a one-sided day is
+  // actually defended at, so it is the honest stop for this signal.
+  if (trendPlans && cfg.signal.enabled && s.conviction.phase === 'Confirmed') {
+    const dir = s.conviction.direction === 'Bullish' ? 1 : s.conviction.direction === 'Bearish' ? -1 : null;
+    const built = dir === null ? null : buildTrendDayPlan(signalInputs, dir);
+    if (built) trendPlans.set(s.member.symbol, built);
+  }
 
   // The ordering key. Smoothed, because the board was previously sorted on a number recomputed
   // every fifteen seconds with a 16-weight three-minute factor inside it — so a row moved
@@ -579,18 +620,37 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   // reports and the number every threshold is measured against — this changes only the order
   // rows are presented in, which is the difference between a board that can be read and one
   // that reshuffles under the cursor.
+  const trendPlans = new Map<string, TrendDayPlan>();
   const rows = staged
-    .map((s) => buildRow(s, enrichments.get(s.member.symbol), ivReadings.get(s.member.symbol) ?? null, breadth, cfg, nowMs))
+    .map((s) =>
+      buildRow(s, enrichments.get(s.member.symbol), ivReadings.get(s.member.symbol) ?? null, breadth, cfg, nowMs, trendPlans))
     .filter((r) => r.coverage >= cfg.scoring.minCoverage)
     .sort((a, b) => b.stability.rankScore - a.stability.rankScore || b.score - a.score);
 
   rows.forEach((r, i) => { r.rank = i + 1; });
+
+  // Published for the preview endpoint, whether or not the market is open — checking the message
+  // format is exactly the thing you want to do out of hours.
+  lastTrendPlans = trendPlans;
 
   // Record what the enrichment pass learned, both for the next pass's measured delta shift
   // and for the IV history that IV Rank will eventually be built on.
   await persistSessionLearning(shortlist, enrichments, ivReadings, rows, nowMs);
 
   const open = marketOpen(nowMs);
+
+  // Announce anything whose conviction has just been CONFIRMED.
+  //
+  // Here rather than in the scheduler because this is the only place the finished board exists,
+  // and the alert has to be keyed off the same rows the board serves — a second pass over a
+  // re-read snapshot could announce a confirmation the board no longer shows.
+  //
+  // Gated on the market being open: `currentBoard()` runs a full scan on demand for any HTTP
+  // request whose cache has expired, at any hour, and the phase machine's `confirmedAt` survives
+  // in the session file. Without this an evening page load could re-announce the day. Awaited so
+  // a failure is caught by `runScan`'s own caller rather than becoming an unhandled rejection —
+  // `onScan` never throws, and its own channels are fire-and-forget inside it.
+  if (open) await onScan(rows, trendPlans, cfg, nowMs);
 
   // A restart mid-session leaves the price ring empty, and the timing layer is dark until it
   // refills. That is a real state and is said out loud rather than looking like "nothing is

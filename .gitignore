@@ -9,4 +9,10 @@ dist/
 .env
 .env.local
 
+# Timestamped copies made before editing .env. These are FULL COPIES of the real file,
+# credentials and all, and one of them (.env.backup-20260808-213723) was committed and pushed
+# to origin/master before this rule existed — see the note in .env.example. The pattern is
+# here so the next backup cannot repeat it.
+.env.backup-*
+
 *.log

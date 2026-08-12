@@ -66,4 +66,15 @@ export const STORE_KEYS = {
   history: 'history',
   snapshot: 'snapshot',
   session: 'session',
+  /** Which trend-day confirmations have already been announced today. See alerts/trend-day.js. */
+  trendAlerts: 'trend_alerts',
+  /**
+   * Which of today's session bells have been sent, and the quotes used lately.
+   *
+   * Lives in this key set rather than its own store because the bells are not a momentum feature —
+   * they are platform-level — and this is the only disk store the app has. It moved here from the
+   * pullback module's key set when that module was removed; the old file is simply orphaned, and a
+   * bell that re-fires once on the first morning after the change is the whole cost of that.
+   */
+  sessionBell: 'session_bell',
 } as const;

@@ -35,11 +35,28 @@ import { flushSessionState } from './data/session-state.js';
 import { seedSession, seedStatus, type SeedOutcome } from './data/session-seed.js';
 import { resetUniverse } from './data/universe.js';
 import { istDay, istMinutes, marketOpen, SESSION_CLOSE_MIN } from './session.js';
+import { sessionBellTick } from '../alerts/session-bell.js';
+import { checkTelegram } from '../alerts/telegram.js';
+import { checkDiscord } from '../alerts/discord.js';
 import { tokenSet } from '../upstox.js';
 
 /** How long after the close the final settling scan runs. */
 const POST_CLOSE_MINUTES = 5;
 const FLUSH_MS = 60_000;
+
+/**
+ * How often the session bells are checked.
+ *
+ * Its own timer rather than a line inside `scanTick`, because that returns early without an Upstox
+ * token and a good morning does not need one — an API whose token expired should still say good
+ * morning, and would otherwise go quiet on exactly the day you most want to notice. Thirty seconds
+ * puts the message within half a minute of the bell.
+ *
+ * This job — and the channel probe below it — moved here from the pullback scheduler when that
+ * module was removed. Neither has anything to do with momentum; this is simply the scheduler that
+ * still exists.
+ */
+const BELL_MS = 30_000;
 
 let timers: NodeJS.Timeout[] = [];
 let scanning = false;
@@ -164,6 +181,11 @@ async function scanTick(nowMs = Date.now()): Promise<void> {
   }
 }
 
+/** Probe both phone channels, never throwing — a dead channel must not stop the scanner. */
+async function probeChannels(): Promise<void> {
+  await Promise.allSettled([checkTelegram(), checkDiscord()]);
+}
+
 /** Start the jobs. Idempotent — calling twice does not double the timers. */
 export async function startScheduler(): Promise<void> {
   if (timers.length) return;
@@ -188,9 +210,23 @@ export async function startScheduler(): Promise<void> {
 
   every(cfg.refresh.quoteMs, () => void scanTick());
   every(5 * 60_000, () => void baselineThenSeed());
+  every(BELL_MS, () => void sessionBellTick());
+
+  // Ask each phone channel whether it actually works, now rather than at 10:30. A configured
+  // channel that cannot be reached is indistinguishable from a quiet market on `/momentum/status`
+  // — same `failures: 0`, same `lastSentAt: null` — and the first send is otherwise attempted at
+  // the precise moment a trend day confirms. Re-probed hourly so a channel that dies mid-session
+  // (a deleted webhook, a network that starts filtering) is reported rather than merely silent.
+  void probeChannels();
+  every(60 * 60_000, () => void probeChannels());
   // Forced on this tick: the scan's own flush is throttled to keep a 2MB write off every
   // 15-second cycle, and this is the one that guarantees the morning reaches disk anyway.
   every(FLUSH_MS, () => void flushSessionState(true));
+
+  // Rung once on the way in as well as on the timer, so a process that restarts inside the ten
+  // minutes after a bell still delivers it. The persisted "sent today" record is what stops that
+  // from becoming a second copy.
+  void sessionBellTick();
 
   // Kick both immediately rather than waiting a full interval for the first board.
   void baselineThenSeed();

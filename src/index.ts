@@ -9,30 +9,24 @@ import * as clock from './clock.js';
 import * as apex from './apex.js';
 import { isTimeframe } from './candles.js';
 import { mountMomentum } from './momentum/index.js';
-import { mountPullback } from './pullback/index.js';
 import type { Result } from './services.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4100;
 app.use(cors());
 
-// Momentum Scanner. Self-contained under src/momentum — its own controller, services,
-// repositories, config and cron. Mounting is one line because everything it needs from this
-// app (the Upstox client, the instrument master) it imports directly.
+// Momentum Scanner, Trend Day, and the phone alerts. Self-contained under src/momentum — its own
+// controller, services, repositories, config and cron. Mounting is one line because everything it
+// needs from this app (the Upstox client, the instrument master) it imports directly.
+//
+// Its scheduler also drives the platform-level alerts in `src/alerts/`: the trend-day confirmation
+// signals and the 09:15 / 15:30 session bells. Those used to hang off the EMA Pullback Scanner's
+// cron, and moved here when that module was removed — it was the only other scheduler in the app.
 //
 // The scheduler is off without a token: its jobs would otherwise fail every 30 seconds on a
-// clone that has not been configured, filling the log with the same error.
+// clone that has not been configured, filling the log with the same error. Note the session bells
+// are the exception inside it — they need no token and ring regardless.
 mountMomentum(app, { path: '/momentum', scheduler: process.env.MOMENTUM_SCHEDULER !== 'off' });
-
-// EMA Pullback Scanner. Same arrangement, under src/pullback — its own controller, services,
-// indicators, repositories, config, backtest engine and cron.
-//
-// It shares this app's infrastructure (the Upstox client, the instrument master, the session
-// arithmetic, the disk store, the candle fetcher with its circuit breaker) and none of the
-// momentum module's domain logic, so the two can be reasoned about and deployed apart. Their
-// combined quote polling is ~540 requests per 30 minutes against a 2000 ceiling; the arithmetic
-// is in each engine's header.
-mountPullback(app, { path: '/pullback', scheduler: process.env.PULLBACK_SCHEDULER !== 'off' });
 
 // In-memory cache so we don't hammer NSE. Every avoidable upstream hit is another
 // chance to be tarpitted and drop to a fallback, so the window widens once the market

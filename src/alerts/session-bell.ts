@@ -1,14 +1,13 @@
 // The two session bells: good morning at 09:15, and stumps at 15:30.
 //
-// These are NOT strategy alerts and deliberately do not go through `alert.engine.ts`. That engine
-// is about events the market produced — it dedupes on symbol and direction, scores them, and gates
-// them behind the trend filter, none of which means anything for a greeting. These two are
-// calendar events: the market opened, the market closed, and they fire whether or not a single
-// setup printed all day.
+// These are NOT strategy alerts. The trend-day signal beside them is about an event the market
+// produced — it dedupes on symbol and direction, scores it and filters on conviction, none of which
+// means anything for a greeting. These two are CALENDAR events: the market opened, the market
+// closed, and they fire whether or not a single setup printed all day.
 //
-// They live beside the channels because that is where delivery lives, and they reuse `message.ts`
-// so the same words render as Telegram's HTML and as Discord's Markdown without being written
-// twice.
+// They live beside the channels because that is where delivery lives, and they render through the
+// `Markup` pair in `markup.ts` so the same words reach Telegram as HTML and Discord as Markdown
+// without being written twice.
 //
 // THREE THINGS ARE LOAD-BEARING HERE.
 //
@@ -34,11 +33,15 @@
 // holiday calendar in this codebase and inventing one that silently goes stale is worse than not
 // having it, so the dates come from the environment: `MARKET_HOLIDAYS=2026-01-26,2026-03-04`.
 // Unset means weekends only, which is the honest default.
+//
+// WHERE THIS LIVES. It began under the pullback module because that module owned the phone channels
+// first, and it moved here when that scanner was removed. Nothing about a good morning was ever
+// pullback-specific; the only thing it needs from the rest of the app is the session clock and a
+// place on disk to remember what it has already sent.
 
-import { istDay, istMinutes, SESSION_CLOSE_MIN, SESSION_OPEN_MIN } from '../../momentum/session.js';
-import { store } from '../../momentum/store.js';
-import { PULLBACK_KEYS } from '../config/config.repository.js';
-import { HTML, istClock, istDate, istWeekday, MARKDOWN, type Markup } from './message.js';
+import { istDay, istMinutes, SESSION_CLOSE_MIN, SESSION_OPEN_MIN } from '../momentum/session.js';
+import { store, STORE_KEYS } from '../momentum/store.js';
+import { HTML, istClock, istDate, istWeekday, MARKDOWN, type Markup } from './markup.js';
 import { discordConfigured, sendDiscord } from './discord.js';
 import { quoteFor, quoteStatus, ZENQUOTES_URL, type Quote } from './quotes.js';
 import { sendTelegram, telegramConfigured } from './telegram.js';
@@ -180,7 +183,7 @@ export function closeMessage(nowMs: number, m: Markup, quote: Quote): string {
 /**
  * A bell in whichever dialect the channel speaks.
  *
- * Takes the same `html: boolean` the controller's other renderers take, so `/pullback/alerts/test`
+ * Takes the same `html: boolean` the controller's other renderers take, so `/momentum/alerts/test`
  * can preview a bell without the HTTP layer having to know that Telegram wants HTML and Discord
  * wants Markdown. Synchronous and pure: the quote is handed in, which is what keeps the wording
  * testable without a network.
@@ -265,7 +268,7 @@ let lastError: string | null = null;
  * morning after a deploy.
  */
 const load = async (): Promise<BellState> => {
-  const saved = await store.read<Partial<BellState>>(PULLBACK_KEYS.sessionBell);
+  const saved = await store.read<Partial<BellState>>(STORE_KEYS.sessionBell);
   return { ...EMPTY, ...saved, recent: saved?.recent ?? [] };
 };
 
@@ -322,7 +325,7 @@ export async function sessionBellTick(nowMs = Date.now()): Promise<Bell | null> 
     if (bell === 'open') state.openSentDay = day;
     else state.closeSentDay = day;
     state.recent = [...state.recent, quote.text].slice(-QUOTE_MEMORY);
-    await store.write(PULLBACK_KEYS.sessionBell, state);
+    await store.write(STORE_KEYS.sessionBell, state);
 
     await deliver(bell, nowMs, quote);
     return bell;
@@ -334,7 +337,7 @@ export async function sessionBellTick(nowMs = Date.now()): Promise<Bell | null> 
   }
 }
 
-/** Reported on `/pullback/status`, so a bell that never rang is diagnosable. */
+/** Reported on `/momentum/status`, so a bell that never rang is diagnosable. */
 export const sessionBellStatus = async () => {
   const { recent, ...state } = await load();
   return {
@@ -356,5 +359,5 @@ export const resetSessionBell = async (): Promise<void> => {
   lastSentAt = null;
   lastBell = null;
   lastError = null;
-  await store.write(PULLBACK_KEYS.sessionBell, { ...EMPTY });
+  await store.write(STORE_KEYS.sessionBell, { ...EMPTY });
 };

@@ -605,6 +605,30 @@ function buildPlan(
   return { plan, strike };
 }
 
+/**
+ * The plan a CONFIRMED TREND DAY deserves, whatever the timing layer is currently saying.
+ *
+ * `buildPlan` above already takes a `trendMode` flag that widens the target and prefers the VWAP
+ * stop — the level a one-sided day is actually defended at, and the one whose loss ends the
+ * thesis. Inside `buildSignal` that flag is only set when the state machine happens to be
+ * `Trending`, which is a statement about the last few minutes and not about the day.
+ *
+ * The trend-day ALERT needs the same maths at a different moment: conviction is promoted to
+ * Confirmed on a session-scale reading, and the row is very often `Quiet` at that instant because
+ * nothing is igniting right now. Rebuilding the plan in the alert would be a second
+ * implementation of the strategy, which this codebase does not do anywhere else and should not
+ * start doing for the message that tells you to place an order. So the existing builder is
+ * exposed, pinned to trend mode.
+ */
+export function buildTrendDayPlan(
+  i: SignalInputs,
+  dir: 1 | -1,
+): { plan: SignalPlan; strike: StrikeChoice | null } | null {
+  // The trend context is derived from the same inputs rather than passed in, so a caller outside
+  // this file cannot construct one that disagrees with what `buildSignal` would have used.
+  return buildPlan(i, dir, trendContext(i), true);
+}
+
 /* -------------------------------------------------------------------------- build --- */
 
 export function buildSignal(i: SignalInputs): MomentumSignal {

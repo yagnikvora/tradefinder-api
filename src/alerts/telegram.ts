@@ -1,21 +1,31 @@
 // The Telegram channel.
 //
-// Delivery only — what the message SAYS lives in `message.ts`, shared with every other channel so
-// the two phones in your pocket cannot disagree about the same trade.
+// DELIVERY ONLY. What a message SAYS belongs to whatever produced it — the trend-day alert and the
+// session bells each render their own text against a `Markup` from `markup.ts`, which is what lets
+// the two phones in your pocket carry identical content in two different dialects.
 //
-// CREDENTIALS COME FROM THE ENVIRONMENT, NOT FROM THE CONFIG. `GET /pullback/config` serves the
+// CREDENTIALS COME FROM THE ENVIRONMENT, NOT FROM THE CONFIG. `PUT /momentum/config` serves the
 // whole config object, so a bot token stored there would be readable by anything that can reach
 // the API — and a leaked bot token lets a stranger post trade instructions into your chat, which
 // is a considerably worse outcome than a leaked threshold.
 //
 // SENDING IS FIRE-AND-FORGET, for the same reason the webhook is: an alert channel that can fail
 // must never be able to fail or slow the scan. Failures are counted and surfaced on
-// `/pullback/status` so a silent channel is diagnosable rather than merely quiet.
-
-import type { AlertEvent, PullbackSignal, TrendContext } from '../types.js';
-import { buildEventMessage, buildSignalMessage, HTML } from './message.js';
+// `/momentum/status` so a silent channel is diagnosable rather than merely quiet.
 
 const DEFAULT_API = 'https://api.telegram.org';
+
+/**
+ * Read `NAME`, falling back to `PULLBACK_NAME`.
+ *
+ * The credentials were named for the pullback module because it was the first thing here that sent
+ * anything, and that module is gone. Renaming them outright would silently unconfigure the channel
+ * on every deployment whose `.env` still uses the old spelling — a channel that goes quiet with no
+ * error is the exact failure this file spends fifty lines trying to make impossible. So the new
+ * name wins and the old one still works.
+ */
+const env = (name: string): string =>
+  process.env[name] ?? process.env[`PULLBACK_${name}`] ?? '';
 
 /**
  * Where the Bot API lives — overridable, because on some networks the real one is unreachable.
@@ -38,15 +48,15 @@ const DEFAULT_API = 'https://api.telegram.org';
  * produce `//bot123:ABC/sendMessage`, which Telegram answers with a 404 that reads like a bad token.
  */
 const apiBase = (): string =>
-  (process.env.PULLBACK_TELEGRAM_API_BASE || DEFAULT_API).trim().replace(/\/+$/, '');
+  (env('TELEGRAM_API_BASE') || DEFAULT_API).trim().replace(/\/+$/, '');
 
 /** True when sends are going somewhere other than Telegram's own host. Reported on `/status`. */
 const usingMirror = (): boolean => apiBase() !== DEFAULT_API;
 
-const token = () => (process.env.PULLBACK_TELEGRAM_BOT_TOKEN ?? '').trim();
-const chatId = () => (process.env.PULLBACK_TELEGRAM_CHAT_ID ?? '').trim();
+const token = () => env('TELEGRAM_BOT_TOKEN').trim();
+const chatId = () => env('TELEGRAM_CHAT_ID').trim();
 
-/** Whether the channel is set up at all. Reported on `/pullback/status`. */
+/** Whether the channel is set up at all. Reported on `/momentum/status`. */
 export const telegramConfigured = (): boolean => !!token() && !!chatId();
 
 let failures = 0;
@@ -66,7 +76,7 @@ export const telegramStatus = () => ({
   /**
    * The host sends are going to, and whether it is Telegram's own.
    *
-   * Worth reporting because a mirror is invisible otherwise: a typo in `PULLBACK_TELEGRAM_API_BASE`
+   * Worth reporting because a mirror is invisible otherwise: a typo in `TELEGRAM_API_BASE`
    * fails in exactly the same way as the block it was set up to route around, and there would be
    * nothing on `/status` to tell the two apart. No token is included — this is the base only.
    */
@@ -123,7 +133,7 @@ export async function checkTelegram(): Promise<boolean> {
  * Shared by the probe and the send because they fail the same way and were explaining it
  * differently — `checkTelegram` said "this is a network block, here is the fix" and `sendTelegram`
  * said `fetch failed`, which is the message that sends you to re-check a token that is fine. The
- * one people actually read is the send's, because that is what `POST /pullback/alerts/test` puts on
+ * one people actually read is the send's, because that is what `POST /momentum/alerts/test` puts on
  * screen.
  *
  * Anything that is not a transport error is passed through untouched: a 401 or a "chat not found"
@@ -132,23 +142,19 @@ export async function checkTelegram(): Promise<boolean> {
 function describeError(msg: string): string {
   if (msg !== 'fetch failed') return msg;
   return usingMirror()
-    ? `cannot reach the configured Telegram mirror at ${apiBase()} — check PULLBACK_TELEGRAM_API_BASE ` +
+    ? `cannot reach the configured Telegram mirror at ${apiBase()} — check TELEGRAM_API_BASE ` +
       'is reachable from this host and forwards the path through to api.telegram.org unchanged.'
     : 'cannot reach api.telegram.org from this host — the TLS connection is refused or reset. ' +
       'This is a network block (many Indian ISPs filter Telegram by SNI), not a bad token: the ' +
-      'TCP connection succeeds and the handshake is killed. Set PULLBACK_TELEGRAM_API_BASE to a ' +
+      'TCP connection succeeds and the handshake is killed. Set TELEGRAM_API_BASE to a ' +
       'mirror you control (see tools/telegram-mirror.worker.js), or use a VPN. Discord is unaffected.';
 }
-
-export const signalMessage = (signal: PullbackSignal, trend: TrendContext | null = null): string =>
-  buildSignalMessage(signal, HTML, trend);
-export const eventMessage = (e: AlertEvent): string => buildEventMessage(e, HTML);
 
 /**
  * Send, never throwing.
  *
  * `disable_notification` is NOT set: the entire point of this channel is that the phone makes a
- * noise. If that becomes too much the fix is the threshold in `alerts.push`, not a silent send.
+ * noise. If that becomes too much the fix is the threshold in `the conviction floor`, not a silent send.
  */
 export async function sendTelegram(text: string): Promise<boolean> {
   const [t, c] = [token(), chatId()];

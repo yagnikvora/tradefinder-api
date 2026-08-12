@@ -259,7 +259,7 @@ export async function quoteFor(mood: Mood, recent: string[] = []): Promise<Quote
 }
 
 /**
- * Reported on `/pullback/status`, so a channel quietly serving fallbacks is visible.
+ * Reported on `/momentum/status`, so a channel quietly serving fallbacks is visible.
  *
  * Worth having because the failure is silent by design: a bell that fell back still arrives, still
  * reads well, and says nothing about the fetch behind it. A climbing `fetchFailures` is the only

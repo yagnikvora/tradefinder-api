@@ -15,6 +15,11 @@
 import express, { type Request, type Response } from 'express';
 import type { MomentumBoard, MomentumRow } from './types.js';
 import { configRepository } from './config/config.repository.js';
+import { buildMessage, previewAlerts, trendAlertStatus } from './alerts/trend-day.js';
+import { HTML, MARKDOWN } from '../alerts/markup.js';
+import { previewBell, sessionBellStatus } from '../alerts/session-bell.js';
+import { sendTelegram, telegramConfigured, telegramStatus } from '../alerts/telegram.js';
+import { sendDiscord, discordConfigured, discordStatus } from '../alerts/discord.js';
 import { runScan } from './engine/momentum.engine.js';
 import { snapshotRepository, ageLabel } from './data/snapshot.repository.js';
 import { ensureBaseline, getBaseline } from './data/baseline.js';
@@ -79,6 +84,10 @@ async function currentBoard(): Promise<{ board: MomentumBoard; source: Source; n
 async function invalidateBoard(): Promise<void> {
   await cache.del(BOARD_KEY);
 }
+
+/** Every sample says so on its first line, so nothing sent from a test can be read as real. */
+const bellBanner = (html: boolean) =>
+  html ? '🧪 <b>SAMPLE — not the real bell</b>\n\n' : '🧪 **SAMPLE — not the real bell**\n\n';
 
 /** Rows carry their full twelve-factor breakdown; the list view does not need it. */
 const slim = (r: MomentumRow): Omit<MomentumRow, 'factors'> => {
@@ -300,6 +309,12 @@ export function momentumRouter(): express.Router {
       configUpdatedAt: cfg.updatedAt,
       shortlistSize: cfg.universe.shortlistSize,
       refresh: cfg.refresh,
+      // The trend-day confirmation alerts. `announcedToday` stuck at 0 through an afternoon of
+      // confirmed rows is the symptom to watch for — it separates a quiet tape from a dead channel.
+      trendAlerts: trendAlertStatus(),
+      // The 09:15 and 15:30 bells. Carries which of today's have gone out, so a morning with no
+      // greeting can be told apart from a morning the process slept through.
+      sessionBell: await sessionBellStatus(),
       baseline: baseline.baseline
         ? {
             day: baseline.baseline.day,
@@ -310,6 +325,122 @@ export function momentumRouter(): express.Router {
         : null,
     }, 'upstox');
   });
+
+  // ------------------------------------------ GET|POST /momentum/alerts/test ----
+  //
+  // Send one trend-day confirmation to the phone, now, so the channel and the layout can be
+  // proved without waiting for 10:30 tomorrow.
+  //
+  // GET as well as POST, deliberately. A send is not idempotent and normally has no business on a
+  // GET, but the whole value of this endpoint is being a link you can open — a POST-only version
+  // means finding a terminal, which is exactly the friction that stops anyone checking their alerts
+  // until the morning one fails. It is a localhost dev API, nothing here mutates the board, and
+  // every message it sends is stamped SAMPLE on its first line.
+  //
+  //   /momentum/alerts/test            one stock, the highest conviction on the board
+  //   /momentum/alerts/test?count=3    three, so the batched 10:30 layout can be read
+  //   /momentum/alerts/test?demo=1     the full layout with levels and a contract, any hour
+  //   /momentum/alerts/test?bell=open  the 09:15 good morning (or `close` for 15:30)
+  //
+  // The default is built from the REAL board, so it exercises the chain fetch and the strike
+  // selection too. Out of hours that is honestly incomplete — entry, stop and target come off the
+  // pulse's ATR, which is dark until the quote ring refills after the open — so the response names
+  // what was missing rather than the message inventing it, and `?demo=1` covers the format check
+  // in the meantime on a symbol called SAMPLE that nobody can trade by mistake.
+  const alertTest = async (req: Request, res: Response) => {
+    if (!telegramConfigured() && !discordConfigured())
+      return fail(res, 503, 'No phone channel is configured', {
+        hint: 'set PULLBACK_TELEGRAM_BOT_TOKEN + PULLBACK_TELEGRAM_CHAT_ID and/or PULLBACK_DISCORD_WEBHOOK_URL in api/.env, then restart the API',
+      });
+
+    try {
+      const cfg = await configRepository.get();
+      const count = Math.max(1, Math.min(Number(req.query.count) || 1, 8));
+      // `?bell=open|close` previews a SESSION BELL instead of a confirmation. The two live on one
+      // endpoint because they share the channels, and a single link that proves "my phone works"
+      // beats two that each prove half of it.
+      const bell = String(req.query.bell ?? '');
+      if (bell === 'open' || bell === 'close') {
+        const preview = await previewBell(bell);
+        const [tg, dc] = await Promise.all([
+          telegramConfigured() ? sendTelegram(bellBanner(true) + preview.html) : Promise.resolve(null),
+          discordConfigured() ? sendDiscord(bellBanner(false) + preview.markdown) : Promise.resolve(null),
+        ]);
+        const out = {
+          sample: `the ${bell === 'open' ? '09:15 good-morning' : '15:30 session-closed'} bell`,
+          telegram: tg === null ? { skipped: 'not configured' } : { sent: tg, ...telegramStatus() },
+          discord: dc === null ? { skipped: 'not configured' } : { sent: dc, ...discordStatus() },
+          live: await sessionBellStatus(),
+        };
+        if (tg === false || dc === false) return fail(res, 502, 'A configured channel refused the message', out);
+        return send(res, out, 'upstox');
+      }
+
+      const demo = String(req.query.demo ?? '') !== '' && String(req.query.demo) !== '0';
+      const { board, source, note } = await currentBoard();
+      const { alerts, basis } = await previewAlerts(board.rows, cfg, board.asOf, count, demo);
+
+      // Rendered once per dialect from the SAME alert objects, so the two phones cannot show
+      // different numbers for the same test.
+      const banner = (html: boolean) =>
+        html
+          ? '🧪 <b>SAMPLE — not a live confirmation</b>\n\n'
+          : '🧪 **SAMPLE — not a live confirmation**\n\n';
+
+      const [tg, dc] = await Promise.all([
+        telegramConfigured()
+          ? sendTelegram(banner(true) + buildMessage(alerts, HTML, board.asOf))
+          : Promise.resolve(null),
+        discordConfigured()
+          ? sendDiscord(banner(false) + buildMessage(alerts, MARKDOWN, board.asOf), alerts[0].direction)
+          : Promise.resolve(null),
+      ]);
+
+      // Baseline coverage, because it is the ONE thing that decides whether a stock can carry a
+      // stop and a target at all. The ATR comes from the daily build, `buildPlan` refuses without
+      // it, and a build that ran out of request budget leaves a silent hole: those symbols confirm
+      // trend days all day and get announced with no levels. Reported here so "why has this one no
+      // contract" is answerable from the same response rather than by reading a cache file.
+      const bl = await getBaseline();
+      const covered = bl.baseline ? Object.keys(bl.baseline.symbols).length : 0;
+      const failed = bl.baseline ? Object.keys(bl.baseline.failures).length : 0;
+
+      const result = {
+        sample: basis,
+        board: { source, asOf: board.asOf, trendConfirmed: board.trendConfirmed, ...(note ? { note } : {}) },
+        symbols: alerts.map((a) => a.symbol),
+        // The two absences worth knowing about, named rather than left to be noticed on the phone.
+        missing: {
+          plan: alerts.filter((a) => !a.plan).map((a) => a.symbol),
+          contract: alerts.filter((a) => !a.strike).map((a) => a.symbol),
+        },
+        baseline: {
+          day: bl.baseline?.day ?? null,
+          stale: bl.stale,
+          covered,
+          failed,
+          // The symbols in this very sample that the baseline never reached — the direct answer to
+          // "why is there no stop on this one".
+          noAtrInSample: alerts
+            .filter((a) => a.symbol !== 'SAMPLE' && !bl.baseline?.symbols[a.symbol])
+            .map((a) => a.symbol),
+          ...(failed > 0
+            ? { hint: `${failed} symbols have no ATR today — POST /momentum/baseline/rebuild refills it (~416 requests)` }
+            : {}),
+        },
+        telegram: tg === null ? { skipped: 'not configured' } : { sent: tg, ...telegramStatus() },
+        discord: dc === null ? { skipped: 'not configured' } : { sent: dc, ...discordStatus() },
+        live: trendAlertStatus(),
+      };
+      if (tg === false || dc === false) return fail(res, 502, 'A configured channel refused the message', result);
+      send(res, result, 'upstox');
+    } catch (e) {
+      fail(res, 502, String((e as Error).message));
+    }
+  };
+
+  router.get('/alerts/test', alertTest);
+  router.post('/alerts/test', alertTest);
 
   // ----------------------------------------------- POST /momentum/baseline/rebuild ----
   // ~416 upstream requests, so it answers immediately and builds behind the response

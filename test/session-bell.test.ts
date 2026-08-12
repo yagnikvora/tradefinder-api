@@ -19,8 +19,8 @@ import { parseEnv } from 'node:util';
 
 import {
   dueBell, GRACE_MIN, renderBell, type BellState,
-} from '../src/pullback/alerts/session-bell.js';
-import { bestOf, fitness, parseBatch, usable, type Quote } from '../src/pullback/alerts/quotes.js';
+} from '../src/alerts/session-bell.js';
+import { bestOf, fitness, parseBatch, usable, type Quote } from '../src/alerts/quotes.js';
 
 /* ------------------------------------------------------------------------ fixtures --- */
 
