@@ -18,7 +18,12 @@
 //   indicators/*.ts                  EMA, ATR, ADX, VWAP, swings, candles — all pure.
 //   data/*.ts                        universe, quotes, bars, and the repositories.
 //   backtest/backtest.engine.ts      the same services, walked over history.
-//   alerts/alert.engine.ts           the five events, with dedupe.
+//   alerts/alert.engine.ts           the five events, with dedupe. NOT FED BY THIS MODULE ANY
+//                                    MORE — the scan no longer raises alerts. The engine, both
+//                                    phone channels and the HTTP feed are intact and callable;
+//                                    see the "log, settle" section of the scanner engine.
+//   alerts/session-bell.ts           the 09:15 and 15:30 messages. A calendar event rather than a
+//                                    strategy one, which is why it does not go through the engine.
 //   config/*.ts                      every threshold, and the repair pass over a patch.
 //
 // THE PURITY IS THE POINT, not a stylistic preference. Every service above takes bars and a
@@ -62,6 +67,9 @@ export { selectOption, scoreLiquidity, atmIv } from './engine/option.service.js'
 export { evaluateSignal, worthWatching } from './engine/signal.service.js';
 export { backtest } from './backtest/backtest.engine.js';
 export { alerts, alertStatus, resetAlerts } from './alerts/alert.engine.js';
+export {
+  dueBell, quoteFor, renderBell, sessionBellStatus, sessionBellTick, resetSessionBell, type Bell,
+} from './alerts/session-bell.js';
 export { configRepository, StoredConfigRepository, sanitise, PULLBACK_KEYS } from './config/config.repository.js';
 export { defaultConfig, DEFAULT_CONFIG, DEFAULT_INDICES } from './config/defaults.js';
 export { signalRepository, summarise } from './data/signal.repository.js';

@@ -1,4 +1,4 @@
-// The cron jobs. Three of them, and the intervals are a rate-limit budget, not a taste.
+// The cron jobs. Four of them, and the intervals are a rate-limit budget, not a taste.
 //
 //   SCAN   every `refresh.scanMs` (default 30s), while the market is open. Two quote requests,
 //          plus up to `enrichLimit` option chains and the same number of bar resyncs — both of
@@ -17,6 +17,10 @@
 //   FLUSH  the signal log, on a slow tick, so a crash costs at most a minute of outcome
 //          tracking rather than the day's record of what fired.
 //
+//   BELL   the two session messages — good morning at 09:15, session closed at 15:30. No upstream
+//          requests at all, so it is off the budget entirely. `alerts/session-bell.ts` holds the
+//          window, the once-a-day record and the words.
+//
 // Scanning stops when the market closes. The bars are frozen for the day, so continuing to poll
 // would spend budget re-reading a board that cannot change — and the first scan after the open
 // needs that budget intact. ONE scan runs after the close, so the day's final board settles every
@@ -25,6 +29,7 @@
 import { tokenSet } from '../upstox.js';
 import { istDay, istMinutes, marketOpen, SESSION_CLOSE_MIN } from '../momentum/session.js';
 import { resetAlerts } from './alerts/alert.engine.js';
+import { sessionBellTick } from './alerts/session-bell.js';
 import { checkTelegram } from './alerts/telegram.js';
 import { checkDiscord } from './alerts/discord.js';
 import { configRepository } from './config/config.repository.js';
@@ -37,6 +42,15 @@ import { runScan } from './engine/scanner.engine.js';
 /** How long after the close the final settling scan runs. */
 const POST_CLOSE_MINUTES = 5;
 const FLUSH_MS = 60_000;
+/**
+ * How often the session bells are checked.
+ *
+ * Its own timer rather than a line inside `scanTick`, because that returns early without an
+ * Upstox token and the greeting does not need one — an API with an expired token should still
+ * say good morning, and would otherwise go quiet on exactly the day you most want to notice.
+ * Thirty seconds puts the message within half a minute of the bell.
+ */
+const BELL_MS = 30_000;
 
 let timers: NodeJS.Timeout[] = [];
 let scanning = false;
@@ -199,6 +213,7 @@ export async function startScheduler(): Promise<void> {
   every(cfg.refresh.scanMs, () => void scanTick());
   every(5 * 60_000, () => void seedTick());
   every(FLUSH_MS, () => void signalRepository.flush());
+  every(BELL_MS, () => void sessionBellTick());
 
   // Ask each phone channel whether it actually works, now rather than at 10:45. A configured
   // channel that cannot be reached is indistinguishable from a quiet market on `/pullback/status`
@@ -207,6 +222,11 @@ export async function startScheduler(): Promise<void> {
   // deleted webhook, a network that starts filtering) is reported rather than merely silent.
   void probeChannels();
   every(60 * 60_000, () => void probeChannels());
+
+  // Rung once on the way in as well as on the timer, so a process that restarts inside the ten
+  // minutes after a bell still delivers it. The persisted "sent today" record is what stops that
+  // from becoming a second copy.
+  void sessionBellTick();
 
   // Kick both immediately rather than waiting a full interval for the first board. The seed goes
   // first and is awaited, because a scan that runs before it has nothing to compute.

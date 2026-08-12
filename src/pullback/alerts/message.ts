@@ -45,6 +45,28 @@ export function istClock(ms: number): string {
   return `${String(h % 12 || 12).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
 }
 
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTHS = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+];
+
+/**
+ * "Wednesday, 12 August 2026" IST.
+ *
+ * Spelled out by hand rather than through `Intl`, for the same reason `istClock` shifts the epoch
+ * instead of converting a Date: this file must render identically on a laptop in IST, a container
+ * in UTC and a host with a trimmed ICU build. A greeting that names the wrong weekday is a small
+ * error that destroys confidence in every number underneath it.
+ */
+export function istDate(ms: number): string {
+  const d = new Date(ms + IST_OFFSET_MS);
+  return `${WEEKDAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+}
+
+/** "Monday" — the IST weekday on its own, for naming a day that is not today. */
+export const istWeekday = (ms: number): string => WEEKDAYS[new Date(ms + IST_OFFSET_MS).getUTCDay()];
+
 /**
  * What the option is worth if the stock reaches its stop, first-order in delta.
  *

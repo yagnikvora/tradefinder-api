@@ -45,8 +45,6 @@ import {
 import { snapshot, type Snapshot, type Tick } from '../data/quotes.js';
 import { universe, type Member, type Universe } from '../data/universe.js';
 import { signalRepository } from '../data/signal.repository.js';
-import { fromOutcome, fromRows, fromSignal } from '../alerts/alert.engine.js';
-import { primeTrendContext } from '../data/trend-context.js';
 import { readPullback } from './pullback.service.js';
 import { evaluateSignal, worthWatching, type SignalResult } from './signal.service.js';
 import { readTrend } from './trend.service.js';
@@ -430,15 +428,23 @@ export async function runScan(cfg: PullbackConfig, nowMs = Date.now()): Promise<
       );
     });
 
-  /* ---------------------------------------------------------- log, settle, alert --- */
+  /* ----------------------------------------------------------------- log, settle --- */
+  //
+  // THIS STRATEGY NO LONGER RAISES ALERTS. The scan used to fan its confirmations, phase changes
+  // and settled outcomes into `alerts/alert.engine.ts`, which pushed them to Telegram, Discord and
+  // the webhook. That was removed on purpose: the EMA pullback board is something to READ, and its
+  // events were not worth an interruption.
+  //
+  // The alert machinery itself is untouched and still wired up — the engine, both phone channels,
+  // the dedupe, the trend gate, `GET /pullback/alerts` and `POST /pullback/alerts/test` all work
+  // exactly as before. Nothing in this module feeds them any more, so the feed stays empty until
+  // some other strategy calls `fromRows` / `fromSignal` / `fromOutcome`. Restoring the old
+  // behaviour is re-adding those three calls below; nothing else was taken out.
+  //
+  // The signal LOG is not alerting and stays: `/pullback/history`, the win rate and the outcome
+  // tracking on the board all read from it.
 
   const today = istDay(nowMs);
-
-  // The momentum module's session reading, loaded once for the whole batch. Every alert raised
-  // below is gated on whether the stock is also having a one-sided day, and the alert path is
-  // synchronous — so this is read here rather than per row per timeframe. Costs one memoised
-  // board read and no upstream request; failures leave the gate reading "unknown".
-  await primeTrendContext(nowMs);
 
   for (const r of rows) {
     if (!r.signal) continue;
@@ -452,26 +458,19 @@ export async function runScan(cfg: PullbackConfig, nowMs = Date.now()): Promise<
     //
     // The row still CARRIES the signal — the board is an honest snapshot of the last bars that
     // exist, and its age reads as "9h 10m ago", which says what it is. It just does not enter the
-    // record and does not fire an alert.
+    // record.
     if (istDay(r.signal.firedAt) !== today) continue;
 
     const record = await signalRepository.record(r.signal, nowMs);
-    // The alert fires on the FIRST time this confirmation is recorded, which the repository's
-    // idempotence on `id` decides. Alerting on every scan that still sees the signal would send
-    // one notification per poll for the whole life of the setup.
-    if (record.outcome.state === 'Open' && record.firedAt === r.signal.firedAt) fromSignal(r.signal, cfg, nowMs);
     // The row carries the tracked outcome rather than the freshly-constructed one, so a signal
     // whose target has already been hit does not render as though it were still open.
     r.signal.outcome = record.outcome;
   }
 
+  // Targets and stops are still tracked on the live price — the board and the history need the
+  // settled outcome. It just is not announced anywhere now.
   const prices = new Map<string, number>(rows.map((r) => [r.symbol, r.price]));
-  for (const settled of await signalRepository.settle(prices, nowMs)) fromOutcome(settled, cfg, nowMs);
-
-  // Phase-transition alerts are suppressed outside a live session for the same reason. Before the
-  // open every row's phase is whatever it was at yesterday's close, so the first scan of the day
-  // would emit a fresh-pullback alert for every one of them.
-  if (snap.minute > 0) fromRows(rows, cfg, nowMs);
+  await signalRepository.settle(prices, nowMs);
 
   const logged = await signalRepository.forDay(today);
 
@@ -484,8 +483,8 @@ export async function runScan(cfg: PullbackConfig, nowMs = Date.now()): Promise<
     warnings.push(
       'No bar has closed today yet, so every reading on this board is from the previous session\'s ' +
       'final bars. Setups shown as confirmed were confirmed at yesterday\'s close — their age says so, ' +
-      'and none of them has been logged or alerted, because a confirmation from a session that has ' +
-      'ended is not an entry.',
+      'and none of them has been logged, because a confirmation from a session that has ended is ' +
+      'not an entry.',
     );
 
   const breaker = breakerState(CANDLE_ENDPOINT);

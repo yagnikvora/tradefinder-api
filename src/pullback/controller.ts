@@ -28,6 +28,7 @@ import {
   sendDiscord, discordConfigured, discordStatus, signalMessage as discordSignalMessage,
 } from './alerts/discord.js';
 import { sampleAlert } from './alerts/sample.js';
+import { renderBell, sessionBellStatus } from './alerts/session-bell.js';
 import { schedulerStatus } from './scheduler.js';
 import { backtest } from './backtest/backtest.engine.js';
 import { configRepository } from './config/config.repository.js';
@@ -261,6 +262,9 @@ export function pullbackRouter(): express.Router {
       // "the seed cannot build for another four minutes", and those look identical from outside.
       rateLimit: breakerState(CANDLE_ENDPOINT),
       alerts: alertStatus(),
+      // The 09:15 and 15:30 messages. Carries which of today's bells have already gone out, so a
+      // morning with no greeting can be told apart from a morning the process slept through.
+      sessionBell: await sessionBellStatus(),
       timeframes: cfg.timeframes,
       refresh: cfg.refresh,
     }, 'upstox');
@@ -286,12 +290,23 @@ export function pullbackRouter(): express.Router {
     let sampleBasis: string | null = null;
     let render: (html: boolean) => string;
 
-    if (String(req.query.sample ?? '') === 'signal') {
+    const sample = String(req.query.sample ?? '');
+    /** Every sample says so on its first line, so nothing sent from here can be read as real. */
+    const banner = (html: boolean, what: string) =>
+      html ? `🧪 <b>SAMPLE — ${what}</b>\n\n` : `🧪 **SAMPLE — ${what}**\n\n`;
+
+    if (sample === 'signal') {
       const { signal, trend, basis } = await sampleAlert();
       sampleBasis = basis;
       render = (html) =>
-        (html ? '🧪 <b>SAMPLE — not a live signal</b>\n\n' : '🧪 **SAMPLE — not a live signal**\n\n') +
+        banner(html, 'not a live signal') +
         (html ? telegramSignalMessage(signal, trend) : discordSignalMessage(signal, trend));
+    } else if (sample === 'open' || sample === 'close') {
+      // `?sample=open` and `?sample=close` render the session bells exactly as they will go out,
+      // today's date and today's quote included. Without this the only way to check either message
+      // is to wait for 09:15, and the only way to check an edit to one is to wait until tomorrow.
+      sampleBasis = sample === 'open' ? 'the 09:15 good-morning bell' : 'the 15:30 session-closed bell';
+      render = (html) => banner(html, 'not the real bell') + renderBell(sample, html);
     } else {
       const lines = (b: (s: string) => string) => [
         `✅ ${b('Trinetra alerts are wired up.')}`,

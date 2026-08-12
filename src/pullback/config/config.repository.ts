@@ -48,6 +48,8 @@ export const PULLBACK_KEYS = {
   seed: 'pullback_seed',
   signals: 'pullback_signals',
   snapshot: 'pullback_snapshot',
+  /** Which of today's session bells have already been sent. See `alerts/session-bell.ts`. */
+  sessionBell: 'pullback_session_bell',
 } as const;
 
 export type DeepPartial<T> = {
