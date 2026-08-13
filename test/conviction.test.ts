@@ -18,7 +18,7 @@ import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
-  computeConviction, convictionFactor, segmentStructure, spineVwapSlope,
+  computeConviction, convictionFactor, convictionSummary, segmentStructure, spineVwapSlope,
 } from '../src/momentum/services/conviction.service.js';
 import { buildSignal } from '../src/momentum/engine/signal.service.js';
 import { computePulse, pulseFactor } from '../src/momentum/services/pulse.service.js';
@@ -46,6 +46,16 @@ const baseline = (over: Partial<SymbolBaseline> = {}): SymbolBaseline => ({
   priorHigh: 105, priorLow: 95, prevHigh: 101, prevLow: 99, prevClose: 100,
   prevFuturesOi: null, dailyBars: 200, ...over,
 });
+
+/**
+ * A symbol the daily build never covered.
+ *
+ * Expressed as an ATR of zero rather than as an absent record because that is what the reading
+ * layer actually tests — `baseline?.atr && baseline.atr > 0 ? baseline.atr : null` — so a symbol
+ * missing from the map and a symbol whose ATR came back zero arrive at the same place, and this
+ * spelling survives being passed through a parameter that has a default.
+ */
+const noAtr = (): SymbolBaseline => baseline({ atr: 0, atrPct: 0 });
 
 interface Replay {
   final: ConvictionReading;
@@ -272,6 +282,44 @@ describe('trend phase machine', () => {
     assert.ok(firstForming > 0, 'the day must pass through Forming');
     assert.ok(firstConfirmed > firstForming, 'Confirmed must come after Forming, never instead of it');
     assert.equal(series[series.length - 1].phase, 'Confirmed');
+  });
+
+  // 2026-08-13. The process ran a window with no baseline at all, so every symbol's ATR was
+  // absent and `displacementAtr` came back null. The gate read null as "nothing disqualifying
+  // here" and let it through, the score fell back to the six shape components that need no ATR,
+  // and seventeen stocks confirmed in a single tick on VWAP adherence alone — three of them
+  // reading an identical 74. Every one of those alerts went out with no stop, no target, no
+  // contract and no lot, because the same missing ATR stops `buildPlan` dead.
+  //
+  // The path below is the strongest trend day in this file. With a baseline it confirms; without
+  // one it must not, because nothing here can tell the difference between this and INFY drifting
+  // 0.02% while pinned to one side of its VWAP.
+  it('offers no phase at all when there is no ATR to measure displacement against', () => {
+    const prices = walk(100, 103, FULL, 0.02);
+    const vwap = (i: number, p: number[]) => p[i] - 0.3;
+
+    const withBaseline = replay(prices, vwap).series;
+    assert.equal(withBaseline[withBaseline.length - 1].phase, 'Confirmed', 'the fixture must confirm normally');
+
+    const { series } = replay(prices, vwap, defaultConfig(), noAtr());
+    const final = series[series.length - 1];
+
+    assert.equal(final.displacementAtr, null, 'no baseline means no displacement reading');
+    assert.equal(final.deepestPullbackAtr, null, 'nor a pullback depth');
+    assert.ok(
+      series.every((r) => r.phase === 'None'),
+      `no phase may be offered on an unmeasurable day, reached ${[...new Set(series.map((r) => r.phase))].join(', ')}`,
+    );
+  });
+
+  // And the board has to say WHY it is silent. "Not one-sided" is a verdict about the day; this
+  // day was never read at all, and the two want opposite responses from whoever is looking.
+  it('names the missing baseline rather than calling the day not one-sided', () => {
+    const { series } = replay(walk(100, 103, FULL, 0.02), (i, p) => p[i] - 0.3, defaultConfig(), noAtr());
+    const summary = convictionSummary(series[series.length - 1]);
+
+    assert.match(summary.summary, /No ATR baseline/);
+    assert.equal(summary.summary.includes('Not one-sided'), false);
   });
 
   it('will not confirm before the configured minute of session, however good the shape', () => {

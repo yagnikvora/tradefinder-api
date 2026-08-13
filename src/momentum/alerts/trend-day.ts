@@ -62,11 +62,35 @@ import { sendTelegram, telegramConfigured } from '../../alerts/telegram.js';
  */
 const MAX_CONFIRM_AGE_MS = 10 * 60_000;
 
-/** Chains fetched per tick to price a contract for rows the shortlist missed. */
-const MAX_CHAIN_FETCHES = 6;
+/**
+ * Chains fetched per tick to price a contract for rows the shortlist missed.
+ *
+ * Sized for the stampede rather than for an average tick. Six covered the common case — a lone
+ * confirmation at 13:29 — and quietly starved the one that matters: the batch is sorted by
+ * conviction, so on a seventeen-stock 10:30 the top six got a contract and the remaining eleven
+ * got "pick the contract yourself". This is one request per symbol on the one or two ticks a day
+ * that carry confirmations, against the ~28 the enrichment tier already spends every minute, so
+ * covering a whole stampede is affordable and the ceiling is only here to bound a pathological day.
+ */
+const MAX_CHAIN_FETCHES = 20;
 
-/** Telegram rejects a message over 4096 characters, and a rejected batch is a silent miss. */
+/**
+ * Telegram rejects a message over 4096 characters, and a rejected batch is a silent miss. Discord
+ * embeds cap at the same figure, so one budget serves both with room for the markup.
+ */
 const MAX_MESSAGE_CHARS = 3600;
+
+/**
+ * How many messages one tick's confirmations may be split across.
+ *
+ * The batching rule above exists because eight notifications in one second is how a channel gets
+ * muted. Trimming was the first answer to that and it overshot: a stock past the character budget
+ * lost its plan, its contract, its lot and its cost — everything the message exists to carry — to
+ * save a buzz. Three is the compromise. A stampede worth three notifications is the single most
+ * informative moment of the trading day, and past three the remainder is still named rather than
+ * dropped in silence.
+ */
+const MAX_MESSAGES = 3;
 
 /* ------------------------------------------------------------------------ the gate --- */
 
@@ -90,6 +114,14 @@ interface AlertState {
   day: string;
   /** `SYMBOL|1` / `SYMBOL|-1` for everything already announced today. */
   announced: string[];
+  /**
+   * Whether today's "the baseline is missing, alerts are withheld" notice has gone out.
+   *
+   * Persisted for the same reason `announced` is: the scan runs every fifteen seconds, and a
+   * condition that lasts until somebody rebuilds the baseline would otherwise send that notice
+   * two hundred and forty times an hour.
+   */
+  suppressionNotice?: boolean;
 }
 
 const EMPTY: AlertState = { day: '', announced: [] };
@@ -102,7 +134,9 @@ const key = (symbol: string, dir: 1 | -1): string => `${symbol}|${dir}`;
  */
 async function load(day: string): Promise<AlertState> {
   const saved = await store.read<AlertState>(STORE_KEYS.trendAlerts);
-  return saved && saved.day === day ? { day, announced: saved.announced ?? [] } : { ...EMPTY, day };
+  return saved && saved.day === day
+    ? { day, announced: saved.announced ?? [], suppressionNotice: saved.suppressionNotice ?? false }
+    : { ...EMPTY, day };
 }
 
 /* ------------------------------------------------------------------- the selection --- */
@@ -168,8 +202,7 @@ export function newlyConfirmed(
  * contract null and the message still goes with the stock plan on it.
  */
 async function priceContracts(alerts: TrendDayAlert[], cfg: MomentumConfig, nowMs: number): Promise<void> {
-  const needing = alerts.filter((a) => !a.strike && a.plan).slice(0, MAX_CHAIN_FETCHES);
-  if (!needing.length) return;
+  if (!alerts.length) return;
 
   // The chain is addressed by the underlying's instrument key, which the row does not carry. The
   // universe is memoised for the day, so this resolves without an upstream request — and it is
@@ -177,12 +210,23 @@ async function priceContracts(alerts: TrendDayAlert[], cfg: MomentumConfig, nowM
   // options as for its future.
   const uni = await universe(nowMs);
 
+  // THE LOT IS NOT THE CHAIN'S TO GIVE, and filling it first is the difference between a message
+  // that can be acted on and one that cannot. It comes off the futures contract in the universe
+  // — no request, no ATR, no plan — but it used to be assigned inside the chain fetch below,
+  // which is skipped for any row without a plan. So on 2026-08-13 a missing ATR took the lot size
+  // and the position cost down with the stop and the target, none of which needed it.
+  for (const a of alerts) a.lotSize ??= uni.bySymbol.get(a.symbol)?.future?.lotSize ?? null;
+
+  // Selecting a strike genuinely does need the plan — the contract is ranked against the plan's
+  // target, and picking one without it would be naming a strike on no reasoning at all.
+  const needing = alerts.filter((a) => !a.strike && a.plan).slice(0, MAX_CHAIN_FETCHES);
+  if (!needing.length) return;
+
   await Promise.all(
     needing.map(async (a) => {
       try {
         const member = uni.bySymbol.get(a.symbol);
         if (!member) return;
-        a.lotSize ??= member.future?.lotSize ?? null;
         const chain = await stockChain(a.symbol, member.equityKey, nowMs);
         a.strike = selectStrike({
           chain,
@@ -294,7 +338,15 @@ function block(a: TrendDayAlert, m: Markup): string[] {
     );
     for (const w of s.warnings.slice(0, 2)) out.push(`       ⚠️ ${m.escape(w)}`);
   } else {
-    out.push(`    ${m.italic('No option chain for this stock this cycle — pick the contract yourself.')}`);
+    // No contract, but say what IS known. The lot is the piece a reader cannot look up in their
+    // head, and it comes off the future rather than off the chain — so a cycle with no chain
+    // still knows it, and printing it turns "pick the contract yourself" from a dead end into an
+    // instruction someone can follow at their broker.
+    out.push(
+      a.lotSize
+        ? `    ${m.italic(`No option chain this cycle — pick the contract yourself. Lot is ${a.lotSize}.`)}`
+        : `    ${m.italic('No option chain for this stock this cycle — pick the contract yourself.')}`,
+    );
   }
 
   // The honesty line. Confirmation is a claim about the DAY; it is not a claim that this second is
@@ -331,47 +383,89 @@ function riskPerLot(a: TrendDayAlert): number | null {
   return Math.round((s.entryCost - premiumAtStop) * s.lotSize);
 }
 
-/** The whole batch, in one channel's markup. */
-export function buildMessage(alerts: TrendDayAlert[], m: Markup, nowMs: number): string {
+/**
+ * The whole batch, in one channel's markup — as one message where it fits, and as up to
+ * `MAX_MESSAGES` where it does not.
+ *
+ * The first version of this trimmed to a single message and named whatever fell off the end. That
+ * is the right instinct at the wrong price: the names it kept were the strongest by conviction,
+ * but the ones it dropped lost their entry, stop, target, contract, lot and cost — the entire
+ * content of the alert — and a reader who then went to the board had to rebuild all of it by
+ * hand at the busiest moment of the session. Splitting spends one extra notification to keep
+ * every confirmation whole, and the cap is what stops a pathological morning becoming a wall.
+ */
+export function buildMessages(alerts: TrendDayAlert[], m: Markup, nowMs: number): string[] {
+  if (!alerts.length) return [];
+
   const one = alerts.length === 1;
-  const head = one
-    ? `${arrow(alerts[0].direction)} ${m.bold(`${m.escape(alerts[0].symbol)} — ${word(alerts[0].direction)} TREND DAY CONFIRMED`)}`
-    : `🔔 ${m.bold(`${alerts.length} TREND DAYS CONFIRMED`)}`;
+  const stamp = m.italic(`${istClock(nowMs)} IST · conviction is confirmed, held and one-sided`);
+  const foot = m.italic('Stops and targets are on the underlying. Nothing here is advice.');
 
-  const lines = [head, m.italic(`${istClock(nowMs)} IST · conviction is confirmed, held and one-sided`), ''];
+  // Blocks are rendered once and measured once. `block` is not free — it formats a dozen numbers
+  // per row — and the packing below would otherwise call it three times for every alert.
+  const blocks = alerts.map((a) => (one ? block(a, m).slice(1) : block(a, m)).join('\n'));
 
-  for (const a of alerts) {
-    // Single-stock messages have already named the symbol and direction in the heading.
-    lines.push(...(one ? block(a, m).slice(1) : block(a, m)), '');
-  }
+  const head = (part: number, parts: number): string => {
+    const title = one
+      ? `${arrow(alerts[0].direction)} ${m.bold(`${m.escape(alerts[0].symbol)} — ${word(alerts[0].direction)} TREND DAY CONFIRMED`)}`
+      : `🔔 ${m.bold(`${alerts.length} TREND DAYS CONFIRMED`)}`;
+    return parts > 1 ? `${title} ${m.italic(`(${part}/${parts})`)}` : title;
+  };
 
-  lines.push(m.italic('Stops and targets are on the underlying. Nothing here is advice.'));
+  // Pack greedily, in conviction order, against a budget that already accounts for the header,
+  // the timestamp and the footer this message will carry.
+  const pages: number[][] = [];
+  let page: number[] = [];
+  let size = 0;
+  const overhead = head(1, MAX_MESSAGES).length + stamp.length + foot.length + 8;
 
-  const text = lines.join('\n');
-  if (text.length <= MAX_MESSAGE_CHARS) return text;
-
-  // Over the wire limit. Trimmed from the END so the strongest confirmations — the batch is
-  // sorted by conviction — keep their full plan, rather than losing the whole message.
-  const kept: TrendDayAlert[] = [];
-  let size = head.length + 120;
-  for (const a of alerts) {
-    const chunk = block(a, m).join('\n').length + 1;
-    if (size + chunk > MAX_MESSAGE_CHARS) break;
-    kept.push(a);
+  for (let i = 0; i < blocks.length; i++) {
+    const chunk = blocks[i].length + 2;
+    // A block that cannot fit an empty page would loop forever; it goes on its own page and is
+    // left to the wire limit, which no single row has ever come close to.
+    if (page.length && size + chunk > MAX_MESSAGE_CHARS - overhead) {
+      pages.push(page);
+      if (pages.length === MAX_MESSAGES) {
+        page = [];
+        break;
+      }
+      page = [];
+      size = 0;
+    }
+    page.push(i);
     size += chunk;
   }
-  const dropped = alerts.slice(kept.length);
-  const tail = dropped.length
-    ? [m.italic(`+ ${dropped.length} more: ${dropped.map((d) => m.escape(d.symbol)).join(', ')} — on the Trend Day board.`)]
-    : [];
-  return [
-    head,
-    m.italic(`${istClock(nowMs)} IST · conviction is confirmed, held and one-sided`),
-    '',
-    ...kept.flatMap((a) => [...block(a, m), '']),
-    ...tail,
-  ].join('\n');
+  if (page.length) pages.push(page);
+
+  // Anything past the last page is still named. Reaching this means more than three messages'
+  // worth confirmed in one tick, which has not happened on a real board — but silence about it
+  // would be the same failure the trimming had.
+  const shown = pages.flat().length;
+  const dropped = alerts.slice(shown);
+
+  return pages.map((idx, p) => {
+    const last = p === pages.length - 1;
+    return [
+      head(p + 1, pages.length),
+      stamp,
+      '',
+      ...idx.flatMap((i) => [blocks[i], '']),
+      ...(last && dropped.length
+        ? [m.italic(`+ ${dropped.length} more: ${dropped.map((d) => m.escape(d.symbol)).join(', ')} — on the Trend Day board.`)]
+        : []),
+      ...(last ? [foot] : []),
+    ].join('\n');
+  });
 }
+
+/**
+ * The batch as a single message.
+ *
+ * Kept because a caller that can only send one string — and the tests, which assert on one — is
+ * better served by the first page than by joining pages that were split to fit a wire limit.
+ */
+export const buildMessage = (alerts: TrendDayAlert[], m: Markup, nowMs: number): string =>
+  buildMessages(alerts, m, nowMs)[0] ?? '';
 
 /* ---------------------------------------------------------------------- the preview --- */
 
@@ -543,6 +637,16 @@ let lastSentAt: number | null = null;
 let lastCount = 0;
 let lastError: string | null = null;
 let announcedToday = 0;
+/**
+ * Confirmations this process declined to announce because they could not be priced.
+ *
+ * A separate counter from `lastError` because these are not errors in the delivery sense — the
+ * channel is fine, the message would simply have been useless — and because a send that succeeds
+ * clears `lastError`, which would hide exactly the condition worth seeing. `announcedToday: 0`
+ * beside `withheldToday: 17` is the whole diagnosis in two numbers.
+ */
+let withheldToday = 0;
+let lastWithheld: string | null = null;
 
 /**
  * Called once per scan with the finished board. Never throws — an alert channel must not be able
@@ -561,6 +665,15 @@ export async function onScan(
   trendPlans: Map<string, TrendDayPlan>,
   cfg: MomentumConfig,
   nowMs: number,
+  /**
+   * Whether the scan had an ATR baseline at all.
+   *
+   * The alert cannot be built without one — every level in the message is a multiple of ATR — and
+   * the scan runs on its own fifteen-second timer while the baseline is still building, so this
+   * window is reached on every boot and after every restart. It used to announce straight through
+   * it. See `suppressionNotice`.
+   */
+  baselineReady: boolean,
 ): Promise<TrendDayAlert[]> {
   if (!enabled()) return [];
 
@@ -568,6 +681,16 @@ export async function onScan(
     const day = istDay(nowMs);
     const state = await load(day);
     const announced = new Set(state.announced);
+
+    // NO BASELINE, NO ALERT. Sending anyway is what produced the 2026-08-13 batch: seventeen
+    // confirmations with no stop, no target, no contract and no lot, each of them recorded as
+    // announced and therefore unrepeatable for the rest of the day. Withholding costs nothing —
+    // a confirmation that is real is still Confirmed when the baseline lands, and the freshness
+    // window is ten minutes — while sending costs the whole day's alerts on that symbol.
+    if (!baselineReady) {
+      await noticeOnce(state, nowMs);
+      return [];
+    }
 
     const fresh = newlyConfirmed(rows, announced, nowMs, minConviction());
     if (!fresh.length) return [];
@@ -595,33 +718,106 @@ export async function onScan(
           lotSize: built?.strike?.lotSize ?? r.signal?.strike?.lotSize ?? null,
         };
       })
-      // Strongest first, so a trimmed batch keeps the ones worth reading.
+      // Strongest first, so a split batch fills its first message with the ones worth reading.
       .sort((a, b) => b.conviction.score - a.conviction.score);
+
+    // A LAST GATE, on the one thing the message cannot do without.
+    //
+    // `baselineReady` above catches the whole baseline being absent; this catches the individual
+    // symbol the build could not cover, which is the same hole one stock wide and produces the
+    // identical unusable alert. The test is deliberately "no plan AND no ATR" rather than "no
+    // plan": a confirmed day that has stopped making new extremes also has no plan, and that one
+    // is the model declining to size a target rather than a gap in the data. It has real levels
+    // behind it, the message says so in its own words, and it is worth sending.
+    const usable = alerts.filter((a) => a.plan !== null || a.atrUsed !== null);
+    const withheld = alerts.filter((a) => !usable.includes(a));
+    // Reported on its own field rather than through `lastError`. A tick that withholds two rows
+    // and sends five would otherwise record the withholding and then have `deliver` clear it on
+    // a successful send, which is the same silence this whole change is about.
+    if (withheld.length) {
+      withheldToday += withheld.length;
+      lastWithheld = `no ATR for ${withheld.map((a) => a.symbol).join(', ')} — POST /momentum/baseline/rebuild`;
+    }
+    if (!usable.length) return [];
 
     // Recorded BEFORE the send, exactly as the session bells do it: a channel slower than the
     // scan interval would otherwise be handed the same batch again on the next tick, and a
     // duplicate stampede is a worse failure than one batch lost to a channel that was down.
-    state.announced = [...announced, ...alerts.map((a) => key(a.symbol, a.direction))];
+    //
+    // Only what is actually being sent is recorded. A withheld symbol stays unannounced, so the
+    // next tick that finds it still confirmed — and by then priced — announces it properly. The
+    // old code recorded the whole batch before filtering anything, which is why a symbol that
+    // went out blank at 10:30 could never go out again with levels at 10:31.
+    state.announced = [...announced, ...usable.map((a) => key(a.symbol, a.direction))];
     await store.write(STORE_KEYS.trendAlerts, state);
     announcedToday = state.announced.length;
 
-    await priceContracts(alerts, cfg, nowMs);
-    await deliver(alerts, nowMs);
-    return alerts;
+    await priceContracts(usable, cfg, nowMs);
+    await deliver(usable, nowMs);
+    return usable;
   } catch (e) {
     lastError = String((e as Error).message);
     return [];
   }
 }
 
-async function deliver(alerts: TrendDayAlert[], nowMs: number): Promise<void> {
+/**
+ * Tell the phone, once, that alerts are being withheld.
+ *
+ * The failure this exists for was silent for a whole session: the board carried its warning, the
+ * status endpoint carried it, and the only thing anybody looks at during market hours — the
+ * phone — carried alerts that appeared to be working. One message a day is the smallest thing
+ * that closes that gap, and the persisted flag is what keeps a fifteen-second scan from turning
+ * it into two hundred and forty.
+ */
+async function noticeOnce(state: AlertState, nowMs: number): Promise<void> {
+  if (state.suppressionNotice) return;
+  state.suppressionNotice = true;
+  await store.write(STORE_KEYS.trendAlerts, state);
+
+  const text = (m: Markup): string =>
+    [
+      `⚠️ ${m.bold('TREND DAY ALERTS SUPPRESSED')}`,
+      m.italic(`${istClock(nowMs)} IST`),
+      '',
+      m.escape(
+        `There is no ATR baseline for ${state.day}, so no stop, target, contract or lot can be sized. ` +
+          'Confirmations are being withheld rather than sent without levels.',
+      ),
+      '',
+      m.escape('POST /momentum/baseline/rebuild — then alerts resume on their own.'),
+      '',
+      m.italic('Sent once a day.'),
+    ].join('\n');
+
   const jobs: Promise<boolean>[] = [];
-  if (telegramConfigured()) jobs.push(sendTelegram(buildMessage(alerts, HTML, nowMs)));
-  if (discordConfigured()) jobs.push(sendDiscord(buildMessage(alerts, MARKDOWN, nowMs), alerts[0].direction));
-  if (!jobs.length) {
+  if (telegramConfigured()) jobs.push(sendTelegram(text(HTML)));
+  if (discordConfigured()) jobs.push(sendDiscord(text(MARKDOWN)));
+  await Promise.all(jobs);
+  lastError = `no ATR baseline for ${state.day} — trend-day alerts are suppressed`;
+}
+
+async function deliver(alerts: TrendDayAlert[], nowMs: number): Promise<void> {
+  if (!telegramConfigured() && !discordConfigured()) {
     lastError = 'no phone channel is configured';
     return;
   }
+
+  // Pages go out IN ORDER within a channel and the two channels go in parallel. Sequential
+  // within a channel because "(2/3)" arriving before "(1/3)" is a worse read than a second's
+  // extra latency, and parallel across them because the whole point of having two is that
+  // neither waits on the other's outage.
+  const send = async (pages: string[], one: (text: string) => Promise<boolean>): Promise<boolean> => {
+    let ok = true;
+    for (const page of pages) ok = (await one(page)) && ok;
+    return ok;
+  };
+
+  const jobs: Promise<boolean>[] = [];
+  if (telegramConfigured()) jobs.push(send(buildMessages(alerts, HTML, nowMs), sendTelegram));
+  if (discordConfigured())
+    jobs.push(send(buildMessages(alerts, MARKDOWN, nowMs), (t) => sendDiscord(t, alerts[0].direction)));
+
   const results = await Promise.all(jobs);
   lastError = results.every(Boolean) ? null : 'a configured channel refused the message';
   lastSentAt = nowMs;
@@ -637,6 +833,10 @@ export const trendAlertStatus = () => ({
   lastSentAt,
   lastCount,
   lastError,
+  // Non-zero here means the baseline has a hole in it and confirmations are being held back
+  // rather than sent blank. It is the field to watch on a morning that feels too quiet.
+  withheldToday,
+  lastWithheld,
 });
 
 /** Test seam. */
@@ -645,5 +845,7 @@ export const resetTrendAlerts = async (): Promise<void> => {
   lastCount = 0;
   lastError = null;
   announcedToday = 0;
+  withheldToday = 0;
+  lastWithheld = null;
   await store.write(STORE_KEYS.trendAlerts, { ...EMPTY });
 };

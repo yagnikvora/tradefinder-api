@@ -268,8 +268,20 @@ export function computeConviction(
   // direction, which parks the row at `None` and keeps it out of every trend view, while the
   // score itself is left alone so the reason stays visible on the detail page rather than
   // being flattened to zero.
+  // UNMEASURABLE IS NOT PASSED. `displacementAtr` is null when this symbol has no ATR in the
+  // baseline, and an earlier version read that as "no evidence against", which let the gate
+  // through by default. That is exactly backwards for a NECESSARY condition, and the cost was
+  // not theoretical: on 2026-08-13 the process ran a window with no baseline at all, so every
+  // row's displacement read null, the gate passed for all of them, and the score fell back to a
+  // mix of the six shape components that do not need ATR — VWAP adherence, crossings, efficiency,
+  // range position, slope, structure. Seventeen stocks confirmed in one tick on adherence alone,
+  // three of them reading an identical 74, and every one of those alerts went out with no stop,
+  // no target and no contract because the same missing ATR stops `buildPlan` dead.
+  //
+  // So a displacement that cannot be measured is treated as a displacement that has not been
+  // proven. The row parks at `None` until the baseline is there, which is the honest state.
   const tooSmall =
-    displacementAtr !== null && Math.abs(displacementAtr) < c.phase.minDisplacementAtr;
+    displacementAtr === null || Math.abs(displacementAtr) < c.phase.minDisplacementAtr;
   const phaseDir = tooSmall ? null : dir;
 
   // ---- the phase machine ----
@@ -443,6 +455,10 @@ function sentence(r: ConvictionReading): string {
   if (r.vwapCrossings !== null) parts.push(`${r.vwapCrossings} crossing${r.vwapCrossings === 1 ? '' : 's'}`);
   if (r.deepestPullbackAtr !== null) parts.push(`deepest dip ${r.deepestPullbackAtr.toFixed(2)} ATR`);
 
+  // "Not one-sided" is a verdict, and it must not be handed out for a reading that was never
+  // taken. A symbol with no ATR in the baseline has no displacement figure, so the phase machine
+  // is holding it at `None` for want of evidence rather than because the day is choppy — and the
+  // two want completely different responses from whoever is reading the board.
   const head =
     r.phase === 'Confirmed'
       ? `Confirmed ${r.direction.toLowerCase()} trend day`
@@ -450,7 +466,9 @@ function sentence(r: ConvictionReading): string {
         ? `${r.direction} trend day forming`
         : r.phase === 'Faded'
           ? `Faded trend day (peaked ${r.peak.toFixed(0)})`
-          : 'Not one-sided';
+          : r.displacementAtr === null
+            ? 'No ATR baseline — displacement cannot be measured, so no trend-day claim is made'
+            : 'Not one-sided';
 
   return parts.length ? `${head} — ${parts.join(', ')}` : head;
 }

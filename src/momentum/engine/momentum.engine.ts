@@ -650,7 +650,12 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   // in the session file. Without this an evening page load could re-announce the day. Awaited so
   // a failure is caught by `runScan`'s own caller rather than becoming an unhandled rejection —
   // `onScan` never throws, and its own channels are fire-and-forget inside it.
-  if (open) await onScan(rows, trendPlans, cfg, nowMs);
+  //
+  // The baseline's presence goes with it. Every level in that message is a multiple of ATR, and
+  // ATR comes only from here — so a scan that ran during the morning build, or after a restart
+  // that found no baseline on disk, can produce Confirmed rows it cannot price. The alert decides
+  // what to do about that; what this call has to do is stop pretending the question never arose.
+  if (open) await onScan(rows, trendPlans, cfg, nowMs, baseline !== null);
 
   // A restart mid-session leaves the price ring empty, and the timing layer is dark until it
   // refills. That is a real state and is said out loud rather than looking like "nothing is

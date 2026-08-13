@@ -228,9 +228,16 @@ export async function startScheduler(): Promise<void> {
   // from becoming a second copy.
   void sessionBellTick();
 
-  // Kick both immediately rather than waiting a full interval for the first board.
-  void baselineThenSeed();
-  void scanTick();
+  // Kick both immediately rather than waiting a full interval for the first board — but the scan
+  // CHASES the baseline rather than racing it.
+  //
+  // These two used to be fired side by side, unawaited. On a boot with no stored baseline that
+  // put a full scan — conviction, phase machine, trend-day alert and all — several minutes ahead
+  // of the ATRs it needs, which is the window the 2026-08-13 blank alerts came out of. The
+  // interval timer still fires during a long build and those boards are still served (a board
+  // with no RVOL is worth more than no board), but the FIRST one now waits, and the alert has its
+  // own baseline gate for the rest.
+  void baselineThenSeed().finally(() => void scanTick());
 }
 
 export function stopScheduler(): void {

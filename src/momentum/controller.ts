@@ -15,7 +15,7 @@
 import express, { type Request, type Response } from 'express';
 import type { MomentumBoard, MomentumRow } from './types.js';
 import { configRepository } from './config/config.repository.js';
-import { buildMessage, previewAlerts, trendAlertStatus } from './alerts/trend-day.js';
+import { buildMessages, previewAlerts, trendAlertStatus } from './alerts/trend-day.js';
 import { HTML, MARKDOWN } from '../alerts/markup.js';
 import { previewBell, sessionBellStatus } from '../alerts/session-bell.js';
 import { sendTelegram, telegramConfigured, telegramStatus } from '../alerts/telegram.js';
@@ -387,12 +387,27 @@ export function momentumRouter(): express.Router {
           ? '🧪 <b>SAMPLE — not a live confirmation</b>\n\n'
           : '🧪 **SAMPLE — not a live confirmation**\n\n';
 
+      // A batch too big for one message is split rather than trimmed, so the preview has to send
+      // every page — a test that only ever delivers page one would prove the layout and hide the
+      // thing most worth checking before 10:30, which is how a three-message stampede reads.
+      const sendPages = async (
+        pages: string[],
+        one: (text: string, i: number) => Promise<boolean>,
+      ): Promise<boolean> => {
+        let ok = true;
+        for (let i = 0; i < pages.length; i++) ok = (await one(pages[i], i)) && ok;
+        return ok;
+      };
+
+      const html = buildMessages(alerts, HTML, board.asOf);
+      const md = buildMessages(alerts, MARKDOWN, board.asOf);
+
       const [tg, dc] = await Promise.all([
         telegramConfigured()
-          ? sendTelegram(banner(true) + buildMessage(alerts, HTML, board.asOf))
+          ? sendPages(html, (text, i) => sendTelegram((i === 0 ? banner(true) : '') + text))
           : Promise.resolve(null),
         discordConfigured()
-          ? sendDiscord(banner(false) + buildMessage(alerts, MARKDOWN, board.asOf), alerts[0].direction)
+          ? sendPages(md, (text, i) => sendDiscord((i === 0 ? banner(false) : '') + text, alerts[0].direction))
           : Promise.resolve(null),
       ]);
 
@@ -409,6 +424,9 @@ export function momentumRouter(): express.Router {
         sample: basis,
         board: { source, asOf: board.asOf, trendConfirmed: board.trendConfirmed, ...(note ? { note } : {}) },
         symbols: alerts.map((a) => a.symbol),
+        // How many notifications this batch actually costs. The split is capped, so this is also
+        // the answer to "did anything fall off the end" without opening the phone.
+        pages: html.length || md.length,
         // The two absences worth knowing about, named rather than left to be noticed on the phone.
         missing: {
           plan: alerts.filter((a) => !a.plan).map((a) => a.symbol),

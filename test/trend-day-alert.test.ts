@@ -16,7 +16,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { buildMessage, newlyConfirmed, type TrendDayAlert } from '../src/momentum/alerts/trend-day.js';
+import { buildMessage, buildMessages, newlyConfirmed, type TrendDayAlert } from '../src/momentum/alerts/trend-day.js';
 import { HTML, MARKDOWN } from '../src/alerts/markup.js';
 import type { ConvictionSummary, MomentumRow, SignalPlan, StrikeChoice } from '../src/momentum/types.js';
 
@@ -212,10 +212,52 @@ describe('trend-day alert: the message', () => {
   // moment of the day into complete silence.
   it('stays inside the wire limit when everything confirms at once', () => {
     const many = Array.from({ length: 40 }, (_, i) => alert({ symbol: `SYMBOL${i}` }));
-    const msg = buildMessage(many, HTML, NOW);
-    assert.ok(msg.length < 4096, `message was ${msg.length} chars`);
-    // And it says what it left out rather than silently truncating.
-    assert.match(msg, /more:/);
+    for (const page of buildMessages(many, HTML, NOW))
+      assert.ok(page.length < 4096, `page was ${page.length} chars`);
+  });
+
+  it('keeps a batch that fits to a single message', () => {
+    const pages = buildMessages([alert(), alert({ symbol: 'MAXHEALTH' })], HTML, NOW);
+    assert.equal(pages.length, 1);
+    // No part counter on a message that has no other part.
+    assert.equal(pages[0].includes('(1/1)'), false);
+  });
+
+  // THE REGRESSION THIS FILE EXISTS FOR, second half. The batch used to be trimmed to one message
+  // and everything past the budget lost its entry, stop, target, contract, lot and cost — it kept
+  // only its name. Splitting is what makes "17 confirmed" mean seventeen tradable messages.
+  it('splits an oversized batch rather than stripping its plans', () => {
+    const many = Array.from({ length: 12 }, (_, i) => alert({ symbol: `SYMBOL${i}` }));
+    const pages = buildMessages(many, HTML, NOW);
+    assert.ok(pages.length > 1, 'expected more than one page');
+    for (const s of many) assert.ok(pages.some((p) => p.includes(s.symbol)), `${s.symbol} was dropped`);
+    // Every symbol that appears keeps the whole plan, not just its name.
+    assert.equal(pages.join('').match(/Target <b>/g)?.length, 12);
+  });
+
+  it('numbers the parts so they read in order', () => {
+    const many = Array.from({ length: 12 }, (_, i) => alert({ symbol: `SYMBOL${i}` }));
+    const pages = buildMessages(many, HTML, NOW);
+    pages.forEach((p, i) => assert.match(p, new RegExp(`\\(${i + 1}/${pages.length}\\)`)));
+  });
+
+  // The cap. Past three messages a stampede stops being informative and starts being a wall, so
+  // the remainder is named — the old behaviour, now applied only where it is the lesser evil.
+  it('caps the split and names whatever still did not fit', () => {
+    const many = Array.from({ length: 40 }, (_, i) => alert({ symbol: `SYMBOL${i}` }));
+    const pages = buildMessages(many, HTML, NOW);
+    assert.equal(pages.length, 3);
+    assert.match(pages[2], /more:/);
+    // Only the last page carries the tail and the disclaimer.
+    assert.equal(pages[0].includes('more:'), false);
+  });
+
+  // The lot comes off the futures contract, not the chain, so a cycle that could not price a
+  // contract still knows it — and it is the one number a reader cannot work out in their head.
+  it('still gives the lot size when there is no chain', () => {
+    const msg = buildMessage([alert({ strike: null, lotSize: 750 })], HTML, NOW);
+    assert.match(msg, /No option chain this cycle/);
+    assert.match(msg, /Lot is 750/);
   });
 
   it('renders Discord Markdown rather than HTML', () => {
