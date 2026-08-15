@@ -24,6 +24,18 @@ import { gunzipSync } from 'node:zlib';
 import { INDEX_QUOTE_KEY, INDEX_MEMBERS } from './indices.js';
 import { SECTOR_BASKETS } from './sectors.js';
 import { call } from './upstox.js';
+// The candle breaker lives under momentum/ because that is where it was first needed, but it
+// is a leaf module with no imports of its own and the budget it guards is per-ENDPOINT, not
+// per-feature. Two callers share `/v3/historical-candle`: this file's `dailyBars` and the
+// momentum baseline. Until both went through the same breaker they could not see each other,
+// and the R.Factor rebuild below would quietly spend the whole 30-minute budget that the
+// morning ATR build then needed. See the note on `dailyBars`.
+// Imported from `throttle.js` rather than `candles.js` — candles.ts reaches session.ts, which
+// re-exports from services.ts, which imports THIS file. throttle.ts imports nothing at all, so
+// taking the constant from there keeps the graph acyclic.
+import {
+  assertNotThrottled, CANDLE_ENDPOINT, noteRefusal, noteSuccess,
+} from './momentum/data/throttle.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MASTER_CACHE = path.join(__dirname, '..', '.cache', 'instruments.json');
@@ -321,6 +333,36 @@ export async function quotesFor(symbols: string[], marketOpen = false): Promise<
 export type DailyBar = [number, number, number, number, number, number];
 
 /**
+ * Run a `/v3/historical-candle` call under the shared endpoint breaker.
+ *
+ * Deliberately the same shape as `withRetry` in `momentum/data/candles.ts` — three attempts,
+ * jittered exponential backoff, only 429 and 5xx retried — because the two are spending the
+ * same budget and backing off at different rates would just hand the budget to whichever was
+ * greedier. It is duplicated rather than shared for the import-cycle reason noted at the top
+ * of this file; the breaker state itself IS shared, which is the part that matters.
+ */
+async function withCandleRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  let wait = 400;
+  for (let i = 0; ; i++) {
+    // Throws immediately once the breaker is open, without touching the network. This is what
+    // stops a 213-symbol R.Factor rebuild from firing 213 doomed requests into a spent quota.
+    assertNotThrottled(CANDLE_ENDPOINT);
+    try {
+      const v = await fn();
+      noteSuccess(CANDLE_ENDPOINT);
+      return v;
+    } catch (e) {
+      const status = (e as { status?: number }).status ?? 0;
+      if (status === 429) noteRefusal(CANDLE_ENDPOINT);
+      const retryable = status === 429 || (status >= 500 && status < 600);
+      if (!retryable || i >= attempts - 1) throw e;
+      await new Promise((r) => setTimeout(r, wait + Math.random() * wait));
+      wait *= 2;
+    }
+  }
+}
+
+/**
  * Daily bars for one symbol — the R.Factor baseline's raw material.
  *
  * One request per symbol, where NSE's Bhavcopy gave every symbol for one day per request.
@@ -332,8 +374,21 @@ export async function dailyBars(symbol: string, from: string, to: string): Promi
   const { equity } = await instruments();
   const key = equity[symbol];
   if (!key) return [];
-  const raw = await call<{ candles?: Array<[string, ...number[]]> }>(
-    `/v3/historical-candle/${encodeURIComponent(key)}/days/1/${to}/${from}`,
+
+  // THIS GOES THROUGH THE BREAKER, and it did not used to. `/v3/historical-candle` has one
+  // 2000-per-30-minute budget shared by every caller, and there are two: the R.Factor rebuild
+  // in volume.ts (~213 requests, fired whenever the dashboard asks for Market Pulse) and the
+  // morning ATR baseline (~416). Without a shared breaker neither could see the other, so the
+  // R.Factor rebuild would spend the budget and the ATR build — the polite one, which backs
+  // off — lost every time. That is why `.cache/momentum/baseline.json` never once existed.
+  //
+  // Refusals are recorded so the breaker actually learns from them, and 429/5xx get the same
+  // bounded retry the momentum candle helpers use. A 400 or 404 is a permanent answer and is
+  // not retried; retrying it only spends more of the budget confirming it.
+  const raw = await withCandleRetry(() =>
+    call<{ candles?: Array<[string, ...number[]]> }>(
+      `/v3/historical-candle/${encodeURIComponent(key)}/days/1/${to}/${from}`,
+    ),
   );
   return (raw?.candles ?? [])
     .map((c) => [

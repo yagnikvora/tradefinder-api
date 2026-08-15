@@ -566,8 +566,23 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   } else if (baselineResult.stale) {
     warnings.push(`Baseline is from ${baseline.day}, not ${istDay(nowMs)} — RVOL and ATR are measured against a stale profile.`);
   }
-  const failedBaselines = Object.keys(baseline?.failures ?? {}).length;
-  if (failedBaselines > 0) warnings.push(`${failedBaselines} symbols have no baseline (Upstox would not serve their history).`);
+  // COUNTED ON WHAT A SYMBOL ACTUALLY HAS, not on what today's build failed to fetch. Those were
+  // the same number until readings started being carried forward from the previous baseline: a
+  // symbol Upstox refused this morning is in `failures` AND holds a perfectly usable ATR from
+  // yesterday, and reporting it as having "no baseline" sent a reader to fix something that was
+  // working. The two states want different responses, so they are two different warnings.
+  const missing = baseline
+    ? uni.members.filter((m) => !baseline.symbols[m.symbol]).length
+    : 0;
+  if (missing > 0)
+    warnings.push(`${missing} symbols have no baseline (Upstox would not serve their history).`);
+
+  const carried = baseline ? Object.values(baseline.symbols).filter((s) => s.carriedFrom).length : 0;
+  if (carried > 0)
+    warnings.push(
+      `${carried} symbols are on a carried-forward baseline — today's build could not reach them, ` +
+      'so their RVOL and ATR come from an earlier session. Rebuild with a clean request budget to refresh them.',
+    );
 
   // Fold this reading into the session state before anything reads it, so the VWAP slope,
   // the opening range and the price ring all include the current tick.

@@ -45,6 +45,14 @@ const PROFILE_SESSIONS = 20;
 /** A profile built on fewer than this many sessions is not a baseline worth dividing by. */
 const MIN_PROFILE_SESSIONS = 5;
 const MIN_DAILY_BARS = 30;
+/**
+ * How stale a carried-forward reading may be before it is dropped instead.
+ *
+ * Seven calendar days is about five sessions. Past that the previous-session levels riding along
+ * with the ATR are far enough from reality to mislead the trend-structure factor, and silence is
+ * the better answer. See the carry-forward in `buildBaseline`.
+ */
+const MAX_CARRY_DAYS = 7;
 
 export interface SymbolBaseline {
   symbol: string;
@@ -80,6 +88,17 @@ export interface SymbolBaseline {
   /** Previous session's closing open interest on the near future. Null when unresolved. */
   prevFuturesOi: number | null;
   dailyBars: number;
+  /**
+   * The day this reading was actually built, when it was carried over from an earlier baseline
+   * rather than rebuilt today. Absent on a fresh reading.
+   *
+   * A symbol Upstox refuses today would otherwise lose its ATR outright, and the trend-day alert
+   * withholds any confirmation it cannot price — so one rate-limited request at 08:00 costs that
+   * stock its alerts for the whole session. A one- or two-day-old ATR is a far better answer: it
+   * is the same trade the module already makes when it serves a wholly stale baseline rather
+   * than none, applied per symbol instead of all-or-nothing.
+   */
+  carriedFrom?: string;
 }
 
 export interface Baseline {
@@ -88,6 +107,13 @@ export interface Baseline {
   symbols: Record<string, SymbolBaseline>;
   /** Symbols the build could not cover, with the reason. Surfaces as a board warning. */
   failures: Record<string, string>;
+  /**
+   * How many readings came from an earlier baseline because today's build could not reach them.
+   *
+   * Reported rather than inferred so "205 symbols" cannot quietly mean "40 built and 165 three
+   * days old". Undefined on a baseline written before this field existed.
+   */
+  carried?: number;
 }
 
 /* ------------------------------------------------------------------------ maths --- */
@@ -293,6 +319,49 @@ async function buildSymbol(
   };
 }
 
+/**
+ * Fill the gaps in today's build from the previous baseline. Mutates `symbols` and reports what
+ * it did — pure otherwise, so the whole rule is testable without a clock, a network or a disk.
+ *
+ * WHY THIS EXISTS. A partial build is the normal outcome; Upstox refuses a handful of symbols on
+ * any given morning. Each of those used to lose its ATR outright, and the trend-day alert reads
+ * "no ATR" as "cannot be priced" and withholds the confirmation for the whole session. On
+ * 2026-08-15 that was 68 symbols of 208, every one a 429 rather than anything wrong with the
+ * stock. A volume profile is a 20-session median and an ATR a 14-day average, so yesterday's
+ * reading is a good answer where today has none.
+ *
+ * WHY IT IS BOUNDED. The same record also carries `prevClose`, `prevHigh` and `prevLow` — the
+ * PREVIOUS SESSION's levels, which are simply wrong once a session has passed. Trend structure
+ * compares today's high against `prevHigh`, so an old reading would report higher highs that
+ * never happened. A few days of drift buys a real alert instead of silence; a fortnight of it
+ * invents one, so anything past `MAX_CARRY_DAYS` is dropped rather than carried.
+ *
+ * `carriedFrom` is preserved rather than restamped, so a reading cannot launder its own age by
+ * being carried forward one day at a time.
+ */
+export function carryForward(
+  symbols: Record<string, SymbolBaseline>,
+  previous: Baseline | null,
+  today: string,
+): { carried: number; tooOld: number } {
+  let carried = 0;
+  let tooOld = 0;
+  if (!previous?.symbols) return { carried, tooOld };
+
+  const oldest = isoDaysBefore(MAX_CARRY_DAYS, today);
+  for (const [symbol, old] of Object.entries(previous.symbols)) {
+    if (symbols[symbol]) continue; // today's own build wins, always
+    const from = old.carriedFrom ?? previous.day;
+    if (from < oldest) {
+      tooOld++;
+      continue;
+    }
+    symbols[symbol] = { ...old, carriedFrom: from };
+    carried++;
+  }
+  return { carried, tooOld };
+}
+
 let memory: Baseline | null = null;
 let building: Promise<Baseline> | null = null;
 
@@ -340,19 +409,51 @@ export async function buildBaseline(
     }
   });
 
-  const next: Baseline = { day: today, builtAt: nowMs, symbols, failures };
+  // CARRY FORWARD WHAT TODAY COULD NOT REACH.
+  //
+  // A partial build is the normal outcome — Upstox refuses a handful of symbols on any given
+  // morning — and until now each of those lost its ATR entirely, which the trend-day alert reads
+  // as "cannot be priced" and withholds for the whole session. On 2026-08-15 that was 68 of 208
+  // symbols, every one of them a 429 rather than anything wrong with the stock.
+  //
+  // A volume profile is a 20-session median and an ATR is a 14-day average; neither moves
+  // meaningfully overnight, so yesterday's reading is a good answer where today has none. The
+  // reading is tagged with the day it was built so nothing downstream has to guess, and the
+  // symbol stays listed in `failures` because the build genuinely did fail for it.
+  const previous = await store.read<Baseline>(STORE_KEYS.baseline);
+  const { carried, tooOld } = carryForward(symbols, previous, today);
+  if (tooOld)
+    console.warn(
+      `[momentum] baseline: dropped ${tooOld} readings older than ${MAX_CARRY_DAYS} days — ` +
+        'their previous-session levels can no longer be trusted. Rebuild with a clean request budget.',
+    );
 
-  if (Object.keys(symbols).length < uni.members.length * 0.5) {
-    // Keeping yesterday's baseline beats overwriting it with a throttled fragment: RVOL
-    // against a day-old volume profile is slightly stale, RVOL against 8 symbols is gone.
-    const disk = await store.read<Baseline>(STORE_KEYS.baseline);
-    if (disk) {
-      memory = disk;
-      return disk;
-    }
+  const built = Object.keys(symbols).length - carried;
+  const next: Baseline = { day: today, builtAt: nowMs, symbols, failures, carried };
+  if (carried)
+    console.log(`[momentum] baseline: built ${built}, carried ${carried} forward from ${previous?.day}`);
+
+  // THE COVERAGE GATE ONLY GUARDS THE CASE IT WAS WRITTEN FOR.
+  //
+  // It exists to stop a throttled fragment overwriting a good baseline. With the carry-forward
+  // above that can no longer happen: every symbol in `previous` is also in `next`, either rebuilt
+  // today or carried, so `next` is by construction never less complete than what it replaces.
+  // Applying the old 50% floor here actively destroyed work — a build that reached 100 symbols
+  // and carried 40 was discarded in favour of the 140 it had just merged from.
+  //
+  // What still has to be refused is a build that learned NOTHING, because writing that would
+  // restamp yesterday's data with today's date and make a stale baseline read as current.
+  if (built === 0 && previous) {
+    memory = previous;
+    return previous;
+  }
+
+  // No previous baseline to fall back on, and too little to be worth dividing by. This is the
+  // genuine "nothing to serve" case and is still an error.
+  if (!previous && built < uni.members.length * 0.5) {
     const throttled = throttledFor(CANDLE_ENDPOINT, Date.now());
     throw new Error(
-      `momentum baseline covered only ${Object.keys(symbols).length}/${uni.members.length} symbols` +
+      `momentum baseline covered only ${built}/${uni.members.length} symbols` +
       (throttled > 0
         ? ` — the Upstox candle endpoint is rate limited for another ${Math.ceil(throttled / 1000)}s. ` +
           'A full build is ~416 requests against a 2000-per-30-minute ceiling, so it can only run a few times an hour.'

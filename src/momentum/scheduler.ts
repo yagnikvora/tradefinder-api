@@ -61,6 +61,19 @@ const BELL_MS = 30_000;
 let timers: NodeJS.Timeout[] = [];
 let scanning = false;
 let lastBaselineDay = '';
+/**
+ * When the next baseline attempt may run, and how many have failed today.
+ *
+ * The old code cleared `lastBaselineDay` on failure and let the 5-minute tick try again, which
+ * is ~416 requests every 5 minutes — about 3,700 per 30 minutes against a 2,000 ceiling. Once
+ * the first attempt failed the retries alone guaranteed the quota stayed spent, so it could
+ * never recover. Backing off geometrically means a failure costs one more attempt soon and then
+ * progressively fewer, which is what leaves budget for the attempt that can actually succeed.
+ */
+let baselineRetryAt = 0;
+let baselineAttempts = 0;
+/** Upstox's own window. No point retrying a spent candle quota sooner than this. */
+const BASELINE_BACKOFF_MS = [5 * 60_000, 15 * 60_000, 30 * 60_000, 60 * 60_000];
 let lastSeedDay = '';
 let lastPostCloseDay = '';
 let lastError: { at: number; message: string } | null = null;
@@ -72,6 +85,12 @@ export interface SchedulerStatus {
   lastError: { at: number; message: string } | null;
   baselineDay: string | null;
   baselineSymbols: number;
+  /**
+   * Of `baselineSymbols`, how many are readings carried over from an earlier day because today's
+   * build could not reach them. Non-zero is normal; climbing day after day means the morning
+   * build keeps losing its request budget and the ATRs behind the alerts are drifting stale.
+   */
+  baselineCarried: number;
   tokenConfigured: boolean;
   seed: SeedOutcome;
 }
@@ -113,6 +132,10 @@ async function baselineTick(nowMs = Date.now()): Promise<void> {
     return;
   }
 
+  // A failed attempt sets a floor on the next one. Without it the 5-minute tick spends more
+  // request budget than the endpoint refills, and the build can never succeed again that day.
+  if (nowMs < baselineRetryAt) return;
+
   lastBaselineDay = today; // set first, so a long build is not started twice
   try {
     // The expiry roll and any newly-listed F&O name land with the new day's master.
@@ -121,9 +144,19 @@ async function baselineTick(nowMs = Date.now()): Promise<void> {
       { atrPeriod: cfg.thresholds.atrExpansion.period, trendLookback: cfg.thresholds.trendStructure.lookbackSessions },
       nowMs,
     );
+    baselineAttempts = 0;
+    baselineRetryAt = 0;
   } catch (e) {
-    lastBaselineDay = ''; // failed — let the next tick retry
-    lastError = { at: nowMs, message: `baseline build failed: ${String((e as Error).message)}` };
+    lastBaselineDay = ''; // failed — let a later tick retry, once the back-off has elapsed
+    const wait = BASELINE_BACKOFF_MS[Math.min(baselineAttempts, BASELINE_BACKOFF_MS.length - 1)];
+    baselineAttempts++;
+    baselineRetryAt = nowMs + wait;
+    lastError = {
+      at: nowMs,
+      message:
+        `baseline build failed (attempt ${baselineAttempts}, next in ${Math.round(wait / 60_000)}m): ` +
+        String((e as Error).message),
+    };
   }
 }
 
@@ -240,6 +273,17 @@ export async function startScheduler(): Promise<void> {
   void baselineThenSeed().finally(() => void scanTick());
 }
 
+/**
+ * Record a baseline failure raised outside the scheduler's own tick.
+ *
+ * The manual rebuild route runs `ensureBaseline` directly, so its failures never reached the
+ * `lastError` that `/momentum/status` reports. Exported so that route can report through the
+ * same field rather than growing a second one nobody thinks to read.
+ */
+export function noteBaselineFailure(message: string, nowMs = Date.now()): void {
+  lastError = { at: nowMs, message };
+}
+
 export function stopScheduler(): void {
   for (const t of timers) clearInterval(t);
   timers = [];
@@ -253,6 +297,7 @@ export async function schedulerStatus(): Promise<SchedulerStatus> {
     lastError,
     baselineDay: b.baseline?.day ?? null,
     baselineSymbols: Object.keys(b.baseline?.symbols ?? {}).length,
+    baselineCarried: b.baseline?.carried ?? 0,
     tokenConfigured: tokenSet(),
     // Surfaced because "no trend days today" and "this process never rebuilt the session"
     // produce an identical empty board and want opposite responses.

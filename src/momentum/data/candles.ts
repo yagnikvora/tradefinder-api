@@ -21,7 +21,12 @@
 
 import { call } from '../../upstox.js';
 import { candleDay, candleMinute } from '../session.js';
-import { assertNotThrottled, noteRefusal, noteSuccess } from './throttle.js';
+import { assertNotThrottled, CANDLE_ENDPOINT, noteRefusal, noteSuccess } from './throttle.js';
+
+// Re-exported so the many callers that import it from here keep working. The definition moved
+// to throttle.ts because equity.ts needs it too and cannot import this file without closing a
+// cycle — see the note there.
+export { CANDLE_ENDPOINT };
 
 /** [ISO stamp with IST offset, open, high, low, close, volume, open interest]. */
 export type RawCandle = [string, number, number, number, number, number, number];
@@ -59,9 +64,6 @@ function toCandle(c: RawCandle): Candle {
 
 const oldestFirst = (rows: RawCandle[]): Candle[] =>
   rows.map(toCandle).sort((a, b) => a.stamp.localeCompare(b.stamp));
-
-/** The breaker key. One budget per Upstox endpoint, so one breaker per endpoint. */
-export const CANDLE_ENDPOINT = 'historical-candle';
 
 /**
  * Retry a refused request, with backoff — and give up quickly when the quota is gone.

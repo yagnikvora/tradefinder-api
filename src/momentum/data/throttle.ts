@@ -18,6 +18,16 @@
 // network, until the window has passed. The caller sees a clear error and keeps the
 // baseline it already had, which is a far better outcome than an empty one.
 
+/**
+ * The breaker key for `/v3/historical-candle`. One budget per Upstox endpoint, so one breaker.
+ *
+ * Defined HERE rather than beside the candle helpers because two modules in different layers
+ * spend this same budget — `momentum/data/candles.ts` and `equity.ts`'s `dailyBars` — and
+ * importing it from either of those into the other closes an import cycle. This file imports
+ * nothing, so it is the one place both can reach.
+ */
+export const CANDLE_ENDPOINT = 'historical-candle';
+
 /** Refusals inside the window before the breaker opens. */
 const TRIP_AFTER = 12;
 /** How long the breaker stays open. Upstox's window is 30 minutes; this re-probes sooner. */

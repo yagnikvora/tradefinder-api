@@ -26,7 +26,7 @@ import { ensureBaseline, getBaseline } from './data/baseline.js';
 import { CANDLE_ENDPOINT } from './data/candles.js';
 import { breakerState } from './data/throttle.js';
 import { historyRepository } from './data/history.repository.js';
-import { scanOnce, schedulerStatus } from './scheduler.js';
+import { noteBaselineFailure, scanOnce, schedulerStatus } from './scheduler.js';
 import { seedSession } from './data/session-seed.js';
 import { cache, single } from './cache.js';
 import { applySignalFilters, isValidationError, parseBoardQuery, parseConfigPatch, parseSymbol } from './dto.js';
@@ -315,11 +315,19 @@ export function momentumRouter(): express.Router {
       // The 09:15 and 15:30 bells. Carries which of today's have gone out, so a morning with no
       // greeting can be told apart from a morning the process slept through.
       sessionBell: await sessionBellStatus(),
+      // `failures` alone stopped being the useful number once readings started being carried
+      // forward: a symbol today's build could not fetch is counted there AND still holds a
+      // usable ATR from an earlier one. `carried` and `builtToday` split it into the two facts
+      // worth acting on — how much of this baseline is actually today's work, and how much is
+      // riding on an older session and wants a rebuild with a clean request budget.
       baseline: baseline.baseline
         ? {
             day: baseline.baseline.day,
             stale: baseline.stale,
             symbols: Object.keys(baseline.baseline.symbols).length,
+            builtToday:
+              Object.keys(baseline.baseline.symbols).length - (baseline.baseline.carried ?? 0),
+            carried: baseline.baseline.carried ?? 0,
             failures: Object.keys(baseline.baseline.failures).length,
           }
         : null,
@@ -468,7 +476,14 @@ export function momentumRouter(): express.Router {
     void ensureBaseline({
       atrPeriod: cfg.thresholds.atrExpansion.period,
       trendLookback: cfg.thresholds.trendStructure.lookbackSessions,
-    }).catch(() => {});
+    }).catch((e) => {
+      // RECORDED, NOT SWALLOWED. This used to be `.catch(() => {})`, which meant a rebuild that
+      // failed left `lastError: null` on /momentum/status — indistinguishable from one that had
+      // never been asked for. Diagnosing a build that dies on its first request was impossible
+      // from the API alone; you had to run the CLI tool to see the 429.
+      noteBaselineFailure(`manual rebuild failed: ${String((e as Error).message)}`);
+      console.error(`[momentum] manual baseline rebuild failed: ${String((e as Error).message)}`);
+    });
     send(res, { started: true, note: 'building — poll GET /momentum/status for progress' }, 'upstox');
   });
 

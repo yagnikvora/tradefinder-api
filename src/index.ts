@@ -184,9 +184,17 @@ app.get('/health', (_q, res) => res.json({ ok: true }));
 
 // Diagnostics: how many trading days of volume history we've backfilled for RVOL.
 app.get('/health/volume', async (_q, res) => {
-  const { historyDepth, avgDailyVolumes } = await import('./volume.js');
+  const { historyDepth, avgDailyVolumes, volumeBaselineStatus } = await import('./volume.js');
   const avg = await avgDailyVolumes();
-  res.json({ ok: true, historyDays: await historyDepth(), symbolsWithAvg: Object.keys(avg).length });
+  res.json({
+    ok: true,
+    historyDays: await historyDepth(),
+    symbolsWithAvg: Object.keys(avg).length,
+    // This rebuild shares the `/v3/historical-candle` budget with the morning ATR baseline, and
+    // used to spend it silently. `lastFailure` is the field to read when the momentum baseline
+    // reports a 429 it cannot explain.
+    baseline: volumeBaselineStatus(),
+  });
 });
 
 
