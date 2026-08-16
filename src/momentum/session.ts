@@ -30,6 +30,38 @@ export const istMinutes = (nowMs: number = Date.now()): number => {
 /** Today in IST as YYYY-MM-DD. Not the host's date — at 03:00 IST those differ. */
 export const istDay = (nowMs: number = Date.now()): string => ist(nowMs).toISOString().slice(0, 10);
 
+/** Day of week in IST. 0 = Sunday. */
+export const istDow = (nowMs: number = Date.now()): number => ist(nowMs).getUTCDay();
+
+let holidayRaw: string | null = null;
+let holidaySet = new Set<string>();
+
+/**
+ * `MARKET_HOLIDAYS`, parsed once per distinct value of the variable.
+ *
+ * Lives here rather than in the alerts module that first needed it, because "is the exchange
+ * open today" is not a question about notifications — the session seed asks it too, and asking
+ * it twice from two parsers is how the two start disagreeing.
+ */
+export function marketHolidays(): Set<string> {
+  const raw = process.env.MARKET_HOLIDAYS ?? '';
+  if (raw !== holidayRaw) {
+    holidayRaw = raw;
+    holidaySet = new Set(raw.split(',').map((s) => s.trim()).filter(Boolean));
+  }
+  return holidaySet;
+}
+
+/**
+ * Does the exchange trade on this date at all?
+ *
+ * Distinct from `marketOpen`, which is about the clock. This is about the calendar, and it is
+ * the question anything that FETCHES A SESSION has to ask first: there is no session to fetch
+ * on a Sunday, and asking for one costs a request per symbol to be told so.
+ */
+export const isTradingDay = (nowMs: number = Date.now()): boolean =>
+  istDow(nowMs) !== 0 && istDow(nowMs) !== 6 && !marketHolidays().has(istDay(nowMs));
+
 /**
  * How far into the session we are, 0…375.
  *

@@ -24,7 +24,7 @@ import { runScan } from './engine/momentum.engine.js';
 import { snapshotRepository, ageLabel } from './data/snapshot.repository.js';
 import { ensureBaseline, getBaseline } from './data/baseline.js';
 import { CANDLE_ENDPOINT } from './data/candles.js';
-import { breakerState } from './data/throttle.js';
+import { breakerState, paceState } from './data/throttle.js';
 import { historyRepository } from './data/history.repository.js';
 import { noteBaselineFailure, scanOnce, schedulerStatus } from './scheduler.js';
 import { seedSession } from './data/session-seed.js';
@@ -305,6 +305,10 @@ export function momentumRouter(): express.Router {
       // building" and "the baseline cannot build for another four minutes", and those look
       // identical from the outside.
       rateLimit: breakerState(CANDLE_ENDPOINT),
+      // What the governor has actually let through lately. `lastMinute` sitting at the cap is a
+      // build being paced correctly; the breaker being open with `lastMinute` near zero is a
+      // budget spent by a PREVIOUS process, which no amount of local pacing can see.
+      pace: paceState(CANDLE_ENDPOINT),
       configVersion: cfg.version,
       configUpdatedAt: cfg.updatedAt,
       shortlistSize: cfg.universe.shortlistSize,
@@ -471,11 +475,16 @@ export function momentumRouter(): express.Router {
   // ----------------------------------------------- POST /momentum/baseline/rebuild ----
   // ~416 upstream requests, so it answers immediately and builds behind the response
   // rather than holding a connection open for the couple of minutes it takes.
-  router.post('/baseline/rebuild', async (_req, res) => {
+  router.post('/baseline/rebuild', async (req, res) => {
     const cfg = await configRepository.get();
+    // Resumes by default — a repeat call spends its budget on the symbols the last pass never
+    // reached rather than re-fetching the ones it did. `?full=1` forces every symbol, which is
+    // what a corporate action wants and what a merely-incomplete baseline does not.
+    const full = String(req.query.full ?? '') !== '' && String(req.query.full) !== '0';
     void ensureBaseline({
       atrPeriod: cfg.thresholds.atrExpansion.period,
       trendLookback: cfg.thresholds.trendStructure.lookbackSessions,
+      full,
     }).catch((e) => {
       // RECORDED, NOT SWALLOWED. This used to be `.catch(() => {})`, which meant a rebuild that
       // failed left `lastError: null` on /momentum/status — indistinguishable from one that had
@@ -484,7 +493,17 @@ export function momentumRouter(): express.Router {
       noteBaselineFailure(`manual rebuild failed: ${String((e as Error).message)}`);
       console.error(`[momentum] manual baseline rebuild failed: ${String((e as Error).message)}`);
     });
-    send(res, { started: true, note: 'building — poll GET /momentum/status for progress' }, 'upstox');
+    send(
+      res,
+      {
+        started: true,
+        mode: full ? 'full' : 'resume',
+        note: full
+          ? 'rebuilding every symbol — poll GET /momentum/status for progress'
+          : 'building the symbols that have no reading yet — poll GET /momentum/status, and call again if any remain',
+      },
+      'upstox',
+    );
   });
 
   // --------------------------------------------------------- POST /momentum/seed ----

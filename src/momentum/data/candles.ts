@@ -21,7 +21,7 @@
 
 import { call } from '../../upstox.js';
 import { candleDay, candleMinute } from '../session.js';
-import { assertNotThrottled, CANDLE_ENDPOINT, noteRefusal, noteSuccess } from './throttle.js';
+import { acquire, assertNotThrottled, CANDLE_ENDPOINT, noteRefusal, noteSuccess } from './throttle.js';
 
 // Re-exported so the many callers that import it from here keep working. The definition moved
 // to throttle.ts because equity.ts needs it too and cannot import this file without closing a
@@ -82,6 +82,10 @@ async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   let wait = 400;
   for (let i = 0; ; i++) {
     assertNotThrottled(CANDLE_ENDPOINT);
+    // Paced before it is sent, not merely counted after it is refused. Upstox allows 500 a
+    // minute on this endpoint and `inBatches` offers several thousand, so without this the
+    // build earns its own 429s inside the first minute however much 30-minute budget is left.
+    await acquire(CANDLE_ENDPOINT);
     try {
       const v = await fn();
       noteSuccess(CANDLE_ENDPOINT);

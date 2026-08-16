@@ -51,7 +51,7 @@ import { CANDLE_ENDPOINT, inBatches, todaySession, type Candle } from './candles
 import { throttledFor } from './throttle.js';
 import { universe } from './universe.js';
 import { computeConviction } from '../services/conviction.service.js';
-import { istDay, minuteOfSession } from '../session.js';
+import { istDay, isTradingDay, minuteOfSession } from '../session.js';
 import { flushSessionState, observe, resetSymbolSession, sessionState } from './session-state.js';
 import type { MomentumConfig } from '../types.js';
 import type { MomentumQuote } from './quotes.js';
@@ -80,6 +80,8 @@ export interface SeedOutcome {
   empty: number;
   failures: Record<string, string>;
   running: boolean;
+  /** Why nothing ran, when nothing ran for a reason worth reading on `/momentum/status`. */
+  note?: string;
 }
 
 let last: SeedOutcome = { day: null, at: 0, seeded: 0, skipped: 0, empty: 0, failures: {}, running: false };
@@ -223,6 +225,21 @@ export async function seedSession(
     // for every symbol — 208 requests to learn nothing.
     if (minuteOfSession(nowMs) <= 0) {
       result.running = false;
+      return result;
+    }
+
+    // NOR ON A DAY THE EXCHANGE NEVER OPENED. The guard above only covers the hours before an
+    // open that is going to happen; on a Saturday, a Sunday or a holiday `minuteOfSession`
+    // reads as a completed session and every symbol was fetched to be told it has no candles.
+    //
+    // That cost more than the requests. On Sunday 2026-08-16 the boot seed spent the minute
+    // budget on 208 symbols of nothing, tripped the breaker, and the baseline rebuild that
+    // actually needed those requests was refused for the next five minutes — then the seed
+    // cleared its own stamp and did it again. A weekend has no session to rebuild; saying so
+    // costs nothing and leaves the whole budget to the build that has real work.
+    if (!isTradingDay(nowMs)) {
+      result.running = false;
+      result.note = `${day} is not a trading day — there is no session to rebuild`;
       return result;
     }
 

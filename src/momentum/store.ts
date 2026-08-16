@@ -77,4 +77,9 @@ export const STORE_KEYS = {
    * bell that re-fires once on the first morning after the change is the whole cost of that.
    */
   sessionBell: 'session_bell',
+  /**
+   * Daily OHLC bars per symbol, so the baseline stops re-downloading 270 unchanged bars a
+   * symbol on every build. See `data/daily-cache.ts` for what it does and does not save.
+   */
+  dailyBars: 'daily_bars',
 } as const;

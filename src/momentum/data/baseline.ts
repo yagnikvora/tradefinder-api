@@ -21,7 +21,10 @@
 // ignores it, which is the entire point of using a robust statistic for a baseline other
 // numbers are divided by.
 
-import { dailyBars } from '../../equity.js';
+import {
+  dailyBarsCached, emptyStats, loadDailyCache, saveDailyCache,
+  type DailyCache, type DailyFetchStats,
+} from './daily-cache.js';
 import { store, STORE_KEYS } from '../store.js';
 import { istDay, isoDaysBefore, SESSION_MINUTES } from '../session.js';
 import { CANDLE_ENDPOINT, historical, inBatches, minuteHistoryByDay, minuteRangeStart, type Candle } from './candles.js';
@@ -251,12 +254,18 @@ async function buildSymbol(
   atrPeriod: number,
   trendLookback: number,
   niftyCloses: number[],
+  daily2: { cache: DailyCache; stats: DailyFetchStats; full: boolean },
 ): Promise<SymbolBaseline> {
   const yesterday = isoDaysBefore(1, today);
 
   const [byDay, daily, futDaily] = await Promise.all([
     minuteHistoryByDay(equityKey, minuteRangeStart(yesterday), yesterday),
-    dailyBars(symbol, isoDaysBefore(DAILY_LOOKBACK_DAYS, today), today),
+    // Through the cache. 270 of these ~271 bars were already on this disk; see daily-cache.ts
+    // for exactly which calls this removes and which it does not.
+    dailyBarsCached(
+      symbol, isoDaysBefore(DAILY_LOOKBACK_DAYS, today), today,
+      daily2.cache, daily2.stats, daily2.full,
+    ),
     // Only the last few sessions: all this needs is the previous close's open interest, and
     // a 400-day futures history spans contracts that no longer exist.
     futuresKey ? historical(futuresKey, 'days', 1, isoDaysBefore(10, today), today) : Promise.resolve([]),
@@ -374,7 +383,17 @@ let building: Promise<Baseline> | null = null;
  * with an empty one — the same rule `volume.ts` applies to the R.Factor baseline.
  */
 export async function buildBaseline(
-  opts: { atrPeriod: number; trendLookback: number } = { atrPeriod: 14, trendLookback: 20 },
+  opts: {
+    atrPeriod: number;
+    trendLookback: number;
+    /**
+     * Rebuild every symbol, including the ones already built today.
+     *
+     * Off by default — see the resume note below. Worth passing after a corporate action, or
+     * when a reading is suspected wrong rather than merely missing.
+     */
+    full?: boolean;
+  } = { atrPeriod: 14, trendLookback: 20 },
   nowMs = Date.now(),
 ): Promise<Baseline> {
   const today = istDay(nowMs);
@@ -386,7 +405,44 @@ export async function buildBaseline(
   const symbols: Record<string, SymbolBaseline> = {};
   const failures: Record<string, string> = {};
 
+  // RESUME WHERE THE LAST ATTEMPT DIED.
+  //
+  // The universe is walked in a fixed order, so a build that exhausts the request budget always
+  // dies at the same place — and re-running it spent the whole budget AGAIN on the symbols it had
+  // already done, then stopped at the same symbol. On 2026-08-16 that pinned coverage at 140 of
+  // 208 with the missing 68 a perfect alphabetical tail from NTPC to ZYDUSLIFE: RELIANCE, SBIN,
+  // TCS, TATASTEEL and POWERGRID among them. No number of retries could ever have reached them,
+  // because every retry began at 360ONE.
+  //
+  // So a symbol already BUILT today is skipped and its reading kept. Retries become cumulative:
+  // each pass spends its budget on ground the previous pass never covered, and two or three
+  // passes finish a universe that one pass cannot.
+  //
+  // Only genuinely-built readings qualify. A carried-forward one is yesterday's, and the whole
+  // point of the next attempt is to replace it with today's — skipping those would freeze the
+  // carry in place until it aged out.
+  // Loaded once and written once. Every symbol reads and updates the same object; 208 separate
+  // writes of a multi-megabyte file would cost more than the requests this saves.
+  const dailyCache = await loadDailyCache();
+  const dailyStats = emptyStats();
+
+  const previous = await store.read<Baseline>(STORE_KEYS.baseline);
+  const resumable =
+    !opts.full && previous?.day === today
+      ? Object.entries(previous.symbols).filter(([, b]) => !b.carriedFrom)
+      : [];
+  for (const [symbol, b] of resumable) symbols[symbol] = b;
+  if (resumable.length)
+    console.log(
+      `[momentum] baseline: resuming — ${resumable.length} symbols already built today are kept, ` +
+        `${uni.members.length - resumable.length} to attempt`,
+    );
+
   await inBatches(uni.members, BATCH, async (m) => {
+    // Already have today's own reading for this one. Costs nothing and, more to the point,
+    // leaves the budget for a symbol that has none.
+    if (symbols[m.symbol]) return;
+
     // Once the breaker is open every remaining symbol would fail identically. Skipping
     // them keeps the build honest about why it stopped and, more to the point, stops it
     // spending the next window's budget too.
@@ -398,6 +454,7 @@ export async function buildBaseline(
       const b = await buildSymbol(
         m.symbol, m.equityKey, m.future?.instrumentKey ?? null,
         today, opts.atrPeriod, opts.trendLookback, niftyCloses,
+        { cache: dailyCache, stats: dailyStats, full: !!opts.full },
       );
       if (b.profileSessions < MIN_PROFILE_SESSIONS && b.dailyBars < MIN_DAILY_BARS) {
         failures[m.symbol] = `only ${b.profileSessions} intraday sessions and ${b.dailyBars} daily bars`;
@@ -420,7 +477,26 @@ export async function buildBaseline(
   // meaningfully overnight, so yesterday's reading is a good answer where today has none. The
   // reading is tagged with the day it was built so nothing downstream has to guess, and the
   // symbol stays listed in `failures` because the build genuinely did fail for it.
-  const previous = await store.read<Baseline>(STORE_KEYS.baseline);
+  // Written once, after every symbol has had its turn. Persisted even when the build itself is
+  // about to be refused: the bars fetched before the budget ran out are still bars, and throwing
+  // them away would make the next attempt pay for them again — which is the exact waste this
+  // cache exists to end.
+  await saveDailyCache(dailyCache).catch(() => {});
+  if (dailyStats.readjusted.length)
+    console.warn(
+      `[momentum] daily bars: ${dailyStats.readjusted.length} series refetched in full after a ` +
+        `price re-adjustment (${dailyStats.readjusted.slice(0, 8).join(', ')}) — a split or a bonus issue.`,
+    );
+  console.log(
+    `[momentum] daily bars: ${dailyStats.hits} from cache (no request), ` +
+      `${dailyStats.deltas} topped up, ${dailyStats.fulls} fetched in full`,
+  );
+
+  // Counted before the carry, so "how much did THIS pass add" is answerable. On a resumed build
+  // that is the only number worth watching: it says whether another pass is worth running, or
+  // whether the budget is spent and the remainder has to wait for the window to roll.
+  const gained = Object.keys(symbols).length - resumable.length;
+
   const { carried, tooOld } = carryForward(symbols, previous, today);
   if (tooOld)
     console.warn(
@@ -430,8 +506,15 @@ export async function buildBaseline(
 
   const built = Object.keys(symbols).length - carried;
   const next: Baseline = { day: today, builtAt: nowMs, symbols, failures, carried };
-  if (carried)
-    console.log(`[momentum] baseline: built ${built}, carried ${carried} forward from ${previous?.day}`);
+  const missing = uni.members.length - Object.keys(symbols).length;
+  console.log(
+    `[momentum] baseline: ${built}/${uni.members.length} built` +
+      (resumable.length ? ` (${gained} new this pass, ${resumable.length} kept)` : '') +
+      (carried ? `, ${carried} carried from ${previous?.day}` : '') +
+      (missing
+        ? ` — ${missing} still have no ATR; run POST /momentum/baseline/rebuild again to resume`
+        : ' — full coverage'),
+  );
 
   // THE COVERAGE GATE ONLY GUARDS THE CASE IT WAS WRITTEN FOR.
   //
@@ -487,7 +570,10 @@ export async function getBaseline(nowMs = Date.now()): Promise<{ baseline: Basel
 }
 
 /** Kick a rebuild, collapsing concurrent callers onto one run. */
-export function ensureBaseline(opts: { atrPeriod: number; trendLookback: number }, nowMs = Date.now()): Promise<Baseline> {
+export function ensureBaseline(
+  opts: { atrPeriod: number; trendLookback: number; full?: boolean },
+  nowMs = Date.now(),
+): Promise<Baseline> {
   if (!building) building = buildBaseline(opts, nowMs).finally(() => { building = null; });
   return building;
 }

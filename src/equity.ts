@@ -34,7 +34,7 @@ import { call } from './upstox.js';
 // re-exports from services.ts, which imports THIS file. throttle.ts imports nothing at all, so
 // taking the constant from there keeps the graph acyclic.
 import {
-  assertNotThrottled, CANDLE_ENDPOINT, noteRefusal, noteSuccess,
+  acquire, assertNotThrottled, CANDLE_ENDPOINT, noteRefusal, noteSuccess,
 } from './momentum/data/throttle.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -347,6 +347,10 @@ async function withCandleRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T
     // Throws immediately once the breaker is open, without touching the network. This is what
     // stops a 213-symbol R.Factor rebuild from firing 213 doomed requests into a spent quota.
     assertNotThrottled(CANDLE_ENDPOINT);
+    // The same governor the momentum candles go through, and it has to be the same one: this
+    // endpoint has a single per-user budget, so two callers pacing themselves independently
+    // would still add up to double the published rate.
+    await acquire(CANDLE_ENDPOINT);
     try {
       const v = await fn();
       noteSuccess(CANDLE_ENDPOINT);

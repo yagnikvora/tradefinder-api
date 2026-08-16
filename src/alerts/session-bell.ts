@@ -39,7 +39,9 @@
 // pullback-specific; the only thing it needs from the rest of the app is the session clock and a
 // place on disk to remember what it has already sent.
 
-import { istDay, istMinutes, SESSION_CLOSE_MIN, SESSION_OPEN_MIN } from '../momentum/session.js';
+import {
+  istDay, istMinutes, marketHolidays, SESSION_CLOSE_MIN, SESSION_OPEN_MIN,
+} from '../momentum/session.js';
 import { store, STORE_KEYS } from '../momentum/store.js';
 import { HTML, istClock, istDate, istWeekday, MARKDOWN, type Markup } from './markup.js';
 import { discordConfigured, sendDiscord } from './discord.js';
@@ -214,18 +216,15 @@ export async function previewBell(bell: Bell, nowMs = Date.now()): Promise<{ htm
 /** `off` disables both bells. Anything else — including unset — leaves them on. */
 const enabled = (): boolean => (process.env.SESSION_BELL ?? '').trim().toLowerCase() !== 'off';
 
-let holidayRaw: string | null = null;
-let holidaySet = new Set<string>();
-
-/** Parsed once per distinct value of the variable, so the tick is not re-splitting a string. */
-function holidays(): Set<string> {
-  const raw = process.env.MARKET_HOLIDAYS ?? '';
-  if (raw !== holidayRaw) {
-    holidayRaw = raw;
-    holidaySet = new Set(raw.split(',').map((s) => s.trim()).filter(Boolean));
-  }
-  return holidaySet;
-}
+/**
+ * The shared calendar.
+ *
+ * This parser used to live here, because the bells were the first thing that needed to know
+ * about holidays. The session seed needs the same answer — a Sunday has no session to rebuild —
+ * and two parsers of one environment variable is one more than can be kept in agreement, so it
+ * moved to `momentum/session.ts` beside the rest of the IST clock.
+ */
+const holidays = marketHolidays;
 
 export interface BellState {
   openSentDay: string | null;
