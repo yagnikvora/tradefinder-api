@@ -135,10 +135,29 @@ describe('trend-day alert: the message', () => {
 
   it('carries the shape behind the verdict, not just the score', () => {
     const msg = buildMessage([alert()], HTML, NOW);
-    assert.match(msg, /conviction <b>73<\/b>/);
+    assert.match(msg, /<b>CONVICTION 73<\/b>/);
     assert.match(msg, /96% below VWAP/);
     assert.match(msg, /2 crossings/);
     assert.match(msg, /deepest dip 0\.31 ATR/);
+  });
+
+  /**
+   * Conviction survives the single-alert path, which drops the block's first line.
+   *
+   * `buildMessages` slices line one off when the batch is one stock, because the message header
+   * already names it — so anything moved onto that line disappears from exactly the messages that
+   * carry a lone confirmation, which is most of them outside the 10:30 stampede. That is a silent
+   * loss: the message still renders, still has entry, stop and target, and simply stops showing
+   * the number the alert's own floor gates on.
+   */
+  it('shows conviction whether the batch is one stock or several', () => {
+    const one = buildMessage([alert()], HTML, NOW);
+    assert.match(one, /<b>CONVICTION 73<\/b>/, 'single-alert message kept it');
+
+    const many = buildMessage([alert(), { ...alert(), symbol: 'INFY' }], HTML, NOW);
+    assert.match(many, /<b>CONVICTION 73<\/b>/, 'batched message kept it');
+    // Once per stock, not once per message.
+    assert.equal((many.match(/<b>CONVICTION 73<\/b>/g) ?? []).length, 2);
   });
 
   it('carries the stop, the target and the reward-to-risk', () => {

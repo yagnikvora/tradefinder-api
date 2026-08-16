@@ -284,7 +284,24 @@ async function buildSymbol(
   // the second-from-last bar on a trading day and the last one otherwise. Keyed off the
   // stamp rather than assumed, because assuming it is how a live board ends up comparing
   // today's high against itself and reporting a higher high for every stock on the list.
-  const lastStamp = daily.length ? new Date(daily[daily.length - 1][0] * 1000).toISOString().slice(0, 10) : '';
+  //
+  // READ IN IST, and that is the whole correctness of it. A daily bar is stamped at IST midnight
+  // — "2026-08-14T00:00:00+05:30" — which is 18:30 UTC on the 13th, so `toISOString()` on the
+  // epoch returns the PREVIOUS calendar day for every bar there has ever been. `todayIncluded`
+  // was therefore always false, and the guard this line exists to be simply never fired:
+  //
+  //   a rebuild during a live session took today's own partial bar as `previous`, so `prevHigh`
+  //   was today's high and trend structure compared the session against itself — precisely the
+  //   "higher high for every stock on the list" the comment above warns about.
+  //
+  //   a replay of a past day inherited the same fault: building as of 2026-08-14 still handed
+  //   back the 14th's own close as `prevClose`, so the point-in-time baseline was not point-in-
+  //   time at all. RECLTD closed 335 that day against a 346.50 close the day before, and the
+  //   replay measured the whole session's `changePct` against 335 — reading a stock that fell
+  //   3.3% as up 2.4% at 09:19, which is why the ignition feed graded below chance.
+  //
+  // `istDay` does the +5:30 shift, which is the same reading the rest of the module uses.
+  const lastStamp = daily.length ? istDay(daily[daily.length - 1][0] * 1000) : '';
   const todayIncluded = lastStamp === today;
   const priorBars = todayIncluded ? bars.slice(0, -1) : bars;
   const previous = priorBars[priorBars.length - 1] ?? prev;
@@ -393,6 +410,31 @@ export async function buildBaseline(
      * when a reading is suspected wrong rather than merely missing.
      */
     full?: boolean;
+    /**
+     * Build a POINT-IN-TIME baseline and touch nothing else. For replaying a past session.
+     *
+     * A backtest of 2026-08-14 needs the baseline as it stood that MORNING — `prevClose` being
+     * Thursday's close, `prevHigh`/`prevLow` Thursday's levels. Passing a `nowMs` on the replay
+     * day already produces that: `buildSymbol` sees `lastStamp === today`, drops the last bar and
+     * takes the one before it.
+     *
+     * What it does NOT do on its own is stay out of the way, and each of the three couplings
+     * below silently re-contaminates the result with data from after the day being replayed:
+     *
+     *   the WRITE     would overwrite the live baseline with a week-old one.
+     *   the CARRY     merges every symbol from the stored baseline — built later — straight back
+     *                 in, so the levels the replay was trying to avoid return by another door.
+     *   `memory`      would leave the process serving the historical baseline to the live board.
+     *
+     * This flag severs all three. The returned object is the caller's alone.
+     *
+     * It is the difference between a measurement and a mistake: the 2026-08-14 ignition replay
+     * was run without it, so every quote's `changePct` was computed against FRIDAY'S OWN CLOSE.
+     * RECLTD fell 344 → 335 across that session and the replay read it at 09:19 as +2.4% and
+     * bullish, which is why the feed scored 15% — worse than a coin flip on symmetric stops, and
+     * the signature of a direction that is inverted rather than merely weak.
+     */
+    isolated?: boolean;
   } = { atrPeriod: 14, trendLookback: 20 },
   nowMs = Date.now(),
 ): Promise<Baseline> {
@@ -426,7 +468,9 @@ export async function buildBaseline(
   const dailyCache = await loadDailyCache();
   const dailyStats = emptyStats();
 
-  const previous = await store.read<Baseline>(STORE_KEYS.baseline);
+  // `null` under `isolated`, which is what disables BOTH the resume below and the carry-forward
+  // further down in one place — every path that could pull post-replay data in reads this.
+  const previous = opts.isolated ? null : await store.read<Baseline>(STORE_KEYS.baseline);
   const resumable =
     !opts.full && previous?.day === today
       ? Object.entries(previous.symbols).filter(([, b]) => !b.carriedFrom)
@@ -530,6 +574,11 @@ export async function buildBaseline(
     memory = previous;
     return previous;
   }
+
+  // An isolated build belongs to its caller and to nobody else — not the disk, not the process
+  // cache. Returned before the coverage gate too: a replay wants whatever was reachable, and
+  // failing the whole run because a past session covered 49% would just hide the measurement.
+  if (opts.isolated) return next;
 
   // No previous baseline to fall back on, and too little to be worth dividing by. This is the
   // genuine "nothing to serve" case and is still an error.

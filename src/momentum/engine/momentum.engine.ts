@@ -68,6 +68,7 @@ import {
   computeConviction, convictionFactor, convictionSummary,
 } from '../services/conviction.service.js';
 import { onScan } from '../alerts/trend-day.js';
+import { onScan as onIgnition } from '../alerts/ignition.js';
 import type { ConvictionReading } from '../types.js';
 import { buildSignal, buildTrendDayPlan, gateTradeType, type SignalInputs } from './signal.service.js';
 import { institutionalActivity, scoreRow } from './score.service.js';
@@ -671,6 +672,16 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   // that found no baseline on disk, can produce Confirmed rows it cannot price. The alert decides
   // what to do about that; what this call has to do is stop pretending the question never arose.
   if (open) await onScan(rows, trendPlans, cfg, nowMs, baseline !== null);
+
+  // And anything whose move has just STARTED. Separate call rather than a branch inside the one
+  // above, because the two answer different questions off the same board: `onScan` fires on the
+  // conviction layer confirming a DAY — which cannot happen before minute 75 — and this fires on
+  // the timing layer offering an ENTRY, which is live from the first few minutes of the session.
+  // Replayed against 2026-08-14 that gap was the difference between IDEA at 13.67 and at 14.08.
+  //
+  // Same gating and same ordering: market open only, baseline required, awaited so a failure
+  // surfaces here rather than as an unhandled rejection. It is off unless IGNITION_ALERTS=on.
+  if (open) await onIgnition(rows, cfg, nowMs, baseline !== null);
 
   // A restart mid-session leaves the price ring empty, and the timing layer is dark until it
   // refills. That is a real state and is said out loud rather than looking like "nothing is

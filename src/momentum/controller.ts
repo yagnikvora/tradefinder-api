@@ -16,6 +16,7 @@ import express, { type Request, type Response } from 'express';
 import type { MomentumBoard, MomentumRow } from './types.js';
 import { configRepository } from './config/config.repository.js';
 import { buildMessages, previewAlerts, trendAlertStatus } from './alerts/trend-day.js';
+import { ignitionAlertStatus } from './alerts/ignition.js';
 import { HTML, MARKDOWN } from '../alerts/markup.js';
 import { previewBell, sessionBellStatus } from '../alerts/session-bell.js';
 import { sendTelegram, telegramConfigured, telegramStatus } from '../alerts/telegram.js';
@@ -316,6 +317,11 @@ export function momentumRouter(): express.Router {
       // The trend-day confirmation alerts. `announcedToday` stuck at 0 through an afternoon of
       // confirmed rows is the symptom to watch for — it separates a quiet tape from a dead channel.
       trendAlerts: trendAlertStatus(),
+      // The early-entry alert. Reported beside the trend-day one because the pair is the whole
+      // story: `trendAlerts` fires on a day being proven and cannot do so before 10:30, this one
+      // fires on a move starting. `enabled: false` here with a quiet morning is the answer to
+      // "why did I only hear about that stock after it had already run".
+      ignitionAlerts: ignitionAlertStatus(),
       // The 09:15 and 15:30 bells. Carries which of today's have gone out, so a morning with no
       // greeting can be told apart from a morning the process slept through.
       sessionBell: await sessionBellStatus(),

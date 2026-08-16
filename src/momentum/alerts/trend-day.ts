@@ -103,7 +103,7 @@ const enabled = (): boolean => (process.env.TREND_DAY_ALERTS ?? '').trim().toLow
  * the ones with genuine one-sidedness behind them — and drops the likes of a 47 that reached
  * `Confirmed` early and has been decaying inside the fade hysteresis ever since.
  */
-const minConviction = (): number => {
+export const minConviction = (): number => {
   const raw = Number(process.env.TREND_DAY_ALERT_MIN_CONVICTION);
   return Number.isFinite(raw) && raw >= 0 && raw <= 100 ? raw : 65;
 };
@@ -275,17 +275,30 @@ function block(a: TrendDayAlert, m: Markup): string[] {
     `${arrow(a.direction)} ${m.bold(m.escape(a.symbol))}  ${px(a.price)}  ${pct(a.changePct)}`,
   ];
 
+  // CONVICTION GETS ITS OWN LINE, because it is the number that decides whether the rest of the
+  // message is worth reading — it is what the alert's own floor gates on — and it used to be the
+  // first of five similar-looking figures on one line, where a reader scanning a 10:30 batch had
+  // to pick it out from adherence, crossings, dip depth and hold time.
+  //
+  // A line of its own rather than the headline above: `buildMessages` drops a block's FIRST line
+  // when the batch is a single stock, because the message header already names it. Putting
+  // conviction there would have silently removed it from exactly the messages that carry one
+  // confirmation — which is most of them outside the 10:30 stampede.
+  out.push(`    🎯 ${m.bold(`CONVICTION ${c.score.toFixed(0)}`)}`);
+
   // The shape behind the verdict. Without it "conviction 73" is a number the reader has to trust;
   // with it, they can disagree — which is the whole reason the conviction layer reports its
-  // sub-reads rather than just its score.
+  // sub-reads rather than just its score. Conviction itself is on the line above now, so what
+  // remains here is only the evidence for it.
   const shape = [
-    `conviction ${m.bold(c.score.toFixed(0))}`,
     c.vwapAdherence !== null ? `${(c.vwapAdherence * 100).toFixed(0)}% ${a.direction === 1 ? 'above' : 'below'} VWAP` : null,
     c.vwapCrossings !== null ? `${c.vwapCrossings} crossing${c.vwapCrossings === 1 ? '' : 's'}` : null,
     c.deepestPullbackAtr !== null ? `deepest dip ${c.deepestPullbackAtr.toFixed(2)} ATR` : null,
     c.heldMin !== null ? `held ${c.heldMin.toFixed(0)}m` : null,
   ].filter(Boolean).join(' · ');
-  out.push(`    ${shape}`);
+  // Guarded, because every entry above is nullable: on a row with no conviction sub-reads this
+  // used to push a line containing four spaces, which renders as a blank gap under the score.
+  if (shape) out.push(`    ${shape}`);
 
   if (a.plan) {
     const p = a.plan;

@@ -69,6 +69,12 @@ export const STORE_KEYS = {
   /** Which trend-day confirmations have already been announced today. See alerts/trend-day.js. */
   trendAlerts: 'trend_alerts',
   /**
+   * Which ignitions have already been announced today. Its own key rather than a field on
+   * `trendAlerts` because the two alerts have independent lifecycles — one can be switched off
+   * without silencing the other — and a shared record would couple them.
+   */
+  ignitionAlerts: 'ignition_alerts',
+  /**
    * Which of today's session bells have been sent, and the quotes used lately.
    *
    * Lives in this key set rather than its own store because the bells are not a momentum feature —
