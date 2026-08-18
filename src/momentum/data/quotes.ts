@@ -20,8 +20,37 @@
 // Outside market hours the book is empty (`depth` all zeros, `total_buy_quantity` 0). That
 // is a real state, not an error: `hasBook` says so and the liquidity factor reweights
 // around it rather than scoring every stock as illiquid at 4pm.
+//
+// THE LIVE FEED NOW SERVES THIS TIER, AND REST IS THE FALLBACK.
+//
+// Every field above is on the Market Data Feed V3, verified against the REST answer before
+// the switch was made (`tools/ws-spike.ts`): `atp` is `average_price` to the last paisa,
+// `vtt` is `volume`, the `1d` OHLC candle is `ohlc`, and LTPC carries the previous close.
+// A reading that is already in memory when the scan starts is the entire point — the timing
+// layer could never report a trigger sooner than the poll that detected it, and the poll was
+// fifteen seconds wide.
+//
+// TWO FIELDS DO NOT SURVIVE THE CROSSING, and both were checked before they were given up:
+//
+//   order counts    the feed's depth `Quote` is bidQ/bidP/askQ/askP and nothing else. So
+//                   `bidOrders`/`askOrders` are 0 on a feed-sourced reading and the liquidity
+//                   factor's `orderImbalance` reports `null` — which it already did for every
+//                   seeded symbol, and which `mix()` reweights around. It is the one genuine
+//                   loss in the migration.
+//
+//   oi_day_high/low no feed equivalent, so they are ACCUMULATED instead: the feed streams
+//                   `oi` continuously and the store watches its extremes. Finer-grained than
+//                   the REST snapshot was, with the caveat that the range spans from connect
+//                   rather than from 09:15.
+//
+// The fallback is not decoration. `feedUsable` demands an open socket, fresh packets and
+// near-total coverage; anything less and the cycle is served by the three REST calls exactly
+// as before. A degraded feed that kept answering would be far worse than a slow one, because
+// a stock that stopped ticking reads as a stock that stopped moving.
 
 import { call } from '../../upstox.js';
+import { feedTick, feedUsable, subscribeKeys, type FeedTick } from '../../feed/client.js';
+import { marketOpen } from '../session.js';
 import { universe } from './universe.js';
 
 /** Upstox takes 500 keys; 200 keeps the URL comfortably short and still costs 3 calls. */
@@ -137,6 +166,62 @@ function normalise(name: string, key: string, q: RawQuote): MomentumQuote | null
   };
 }
 
+/**
+ * The same reading, built from a streamed tick instead of a REST row.
+ *
+ * Deliberately a separate function rather than a shim that fakes a `RawQuote`: the two
+ * sources differ in exactly three places — order counts, the OI day range, and the timestamp
+ * — and a shim would have hidden all three behind plausible zeros. Here they are visible.
+ */
+export function fromTick(name: string, key: string, t: FeedTick): MomentumQuote | null {
+  const ltp = t.ltp;
+  if (ltp <= 0) return null;
+
+  const prevClose = t.cp;
+  const netChange = +(ltp - prevClose).toFixed(2);
+
+  const buy = t.depth.filter((l) => l.bidP > 0);
+  const sell = t.depth.filter((l) => l.askP > 0);
+  const bid = buy[0]?.bidP ?? 0;
+  const ask = sell[0]?.askP ?? 0;
+  const hasBook = bid > 0 && ask > 0 && ask >= bid;
+
+  let depthValue = 0;
+  for (const l of t.depth) depthValue += l.bidP * l.bidQ + l.askP * l.askQ;
+
+  return {
+    symbol: name,
+    instrumentKey: key,
+    ltp,
+    prevClose,
+    netChange,
+    changePct: prevClose > 0 ? +((netChange / prevClose) * 100).toFixed(3) : 0,
+    open: t.dayOpen || prevClose,
+    high: t.dayHigh || ltp,
+    low: t.dayLow || ltp,
+    volume: t.vtt,
+    vwap: t.atp,
+    turnoverCr: +((t.atp * t.vtt) / 1e7).toFixed(3),
+    openInterest: t.oi,
+    oiDayHigh: t.oiHigh,
+    oiDayLow: t.oiLow,
+    totalBuyQty: t.tbq,
+    totalSellQty: t.tsq,
+    bid,
+    ask,
+    bidQty: buy[0]?.bidQ ?? 0,
+    askQty: sell[0]?.askQ ?? 0,
+    // Not on the feed at any depth level. Zero here means "unmeasurable", and
+    // `liquidity.service.ts` already reports `orderImbalance: null` when both are zero.
+    bidOrders: 0,
+    askOrders: 0,
+    depthCr: +(depthValue / 1e7).toFixed(4),
+    hasBook,
+    // Upstox's own stamp when the packet carried one, else when we received it.
+    at: t.feedTs || t.at,
+  };
+}
+
 export interface QuoteSnapshot {
   at: number;
   /** Stock symbol -> its equity quote. */
@@ -148,6 +233,8 @@ export interface QuoteSnapshot {
   nifty: MomentumQuote | null;
   niftyFuture: MomentumQuote | null;
   vix: MomentumQuote | null;
+  /** Where this reading came from. Surfaced on `/momentum/status`. */
+  source: 'feed' | 'rest';
 }
 
 /**
@@ -180,27 +267,47 @@ export async function quoteSnapshot(nowMs = Date.now()): Promise<QuoteSnapshot> 
     nifty: null,
     niftyFuture: null,
     vix: null,
+    source: 'rest',
   };
 
   const keys = [...route.keys()];
-  for (let i = 0; i < keys.length; i += CHUNK) {
-    const slice = keys.slice(i, i + CHUNK);
-    const data = await call<Record<string, RawQuote>>(
-      `/v2/market-quote/quotes?instrument_key=${encodeURIComponent(slice.join(','))}`,
-    );
-    for (const raw of Object.values(data ?? {})) {
-      const key = String(raw.instrument_token ?? '');
+
+  const file = (key: string, q: MomentumQuote | null) => {
+    const dest = route.get(key);
+    if (!dest || !q) return;
+    switch (dest.bucket) {
+      case 'equity': snap.equity.set(dest.name, q); break;
+      case 'futures': snap.futures.set(dest.name, q); break;
+      case 'sector': snap.sectors.set(dest.name, q); break;
+      case 'nifty': snap.nifty = q; break;
+      case 'niftyFut': snap.niftyFuture = q; break;
+      case 'vix': snap.vix = q; break;
+    }
+  };
+
+  // Asked for every cycle, not once at startup. The call is a no-op for anything already
+  // subscribed, so an expiry roll — a new futures contract entering the universe — is picked
+  // up here without anything having to notice that the roll happened.
+  subscribeKeys(keys);
+
+  if (feedUsable(keys, marketOpen(nowMs), nowMs)) {
+    for (const key of keys) {
+      const t = feedTick(key);
       const dest = route.get(key);
-      if (!dest) continue;
-      const q = normalise(dest.name, key, raw);
-      if (!q) continue;
-      switch (dest.bucket) {
-        case 'equity': snap.equity.set(dest.name, q); break;
-        case 'futures': snap.futures.set(dest.name, q); break;
-        case 'sector': snap.sectors.set(dest.name, q); break;
-        case 'nifty': snap.nifty = q; break;
-        case 'niftyFut': snap.niftyFuture = q; break;
-        case 'vix': snap.vix = q; break;
+      if (t && dest) file(key, fromTick(dest.name, key, t));
+    }
+    snap.source = 'feed';
+  } else {
+    for (let i = 0; i < keys.length; i += CHUNK) {
+      const slice = keys.slice(i, i + CHUNK);
+      const data = await call<Record<string, RawQuote>>(
+        `/v2/market-quote/quotes?instrument_key=${encodeURIComponent(slice.join(','))}`,
+      );
+      for (const raw of Object.values(data ?? {})) {
+        // Mapped home by `instrument_token`, which echoes the key that was requested. Never
+        // by `symbol`: an index answers with the literal string "NA".
+        const key = String(raw.instrument_token ?? '');
+        file(key, normalise(route.get(key)?.name ?? '', key, raw));
       }
     }
   }
@@ -208,7 +315,9 @@ export async function quoteSnapshot(nowMs = Date.now()): Promise<QuoteSnapshot> 
   // A half-priced universe renders as a plausible but wrong board — the same failure mode
   // `equity.ts` guards. Refuse it so the caller re-serves the last good one.
   if (snap.equity.size < uni.members.length * 0.7)
-    throw new Error(`partial universe: Upstox priced ${snap.equity.size}/${uni.members.length} shares`);
+    throw new Error(
+      `partial universe: Upstox priced ${snap.equity.size}/${uni.members.length} shares (via ${snap.source})`,
+    );
 
   return snap;
 }

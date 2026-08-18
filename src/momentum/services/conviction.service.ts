@@ -78,7 +78,8 @@ import { clamp, curve, mix, outcome, unavailable, type MixComponent } from './sc
 const round = (v: number, d = 3): number => +v.toFixed(d);
 
 const EMPTY: ConvictionReading = {
-  ready: false, score: 0, phase: 'None', direction: 'Neutral', heldMin: null, confirmedAt: null, peak: 0,
+  ready: false, score: 0, phase: 'None', direction: 'Neutral', heldMin: null, confirmedAt: null,
+  convictionAtConfirm: null, peak: 0,
   displacementAtr: null,
   vwapAdherence: null, vwapCrossings: null, sessionEfficiency: null, rangePosition: null,
   deepestPullbackAtr: null, vwapSlopePctPerMin: null, structureCount: null,
@@ -298,6 +299,7 @@ export function computeConviction(
     direction,
     heldMin: track ? round((nowMs - track.since) / 60_000, 1) : null,
     confirmedAt: track?.confirmedAt ?? null,
+    convictionAtConfirm: track?.convictionAtConfirm ?? null,
     peak: track?.peak ?? score,
     displacementAtr,
     vwapAdherence,
@@ -433,6 +435,7 @@ export function convictionSummary(r: ConvictionReading): ConvictionSummary {
     direction: r.direction,
     heldMin: r.heldMin,
     confirmedAt: r.confirmedAt,
+    convictionAtConfirm: r.convictionAtConfirm,
     peak: r.peak,
     vwapAdherence: r.vwapAdherence,
     vwapCrossings: r.vwapCrossings,

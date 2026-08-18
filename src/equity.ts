@@ -24,6 +24,7 @@ import { gunzipSync } from 'node:zlib';
 import { INDEX_QUOTE_KEY, INDEX_MEMBERS } from './indices.js';
 import { SECTOR_BASKETS } from './sectors.js';
 import { call } from './upstox.js';
+import { feedTick, feedUsable, subscribeKeys } from './feed/client.js';
 // The candle breaker lives under momentum/ because that is where it was first needed, but it
 // is a leaf module with no imports of its own and the budget it guards is per-ENDPOINT, not
 // per-feature. Two callers share `/v3/historical-candle`: this file's `dailyBars` and the
@@ -293,6 +294,39 @@ export async function allQuotes(marketOpen = false): Promise<Map<string, EquityQ
     const keys = [...wanted.values()];
 
     const out = new Map<string, EquityQuote>();
+
+    // The live feed serves this the same way it serves the scanner's tier — see
+    // `feed/client.ts`. Everything `EquityQuote` needs is on it: LTPC gives the price and the
+    // previous close, the `1d` OHLC candle gives open/high/low, `vtt` is the volume and
+    // `atp × vtt` is the turnover. Indices report no volume or average price, but REST
+    // answered `null` for both on an index too, so nothing changes for them.
+    subscribeKeys(keys);
+    if (feedUsable(keys, marketOpen)) {
+      for (const [sym, key] of wanted) {
+        const t = feedTick(key);
+        if (!t || t.ltp <= 0) continue;
+        const prevClose = t.cp;
+        out.set(sym, {
+          Symbol: sym,
+          ltp: t.ltp,
+          prevClose,
+          pChange: prevClose > 0 ? +(((t.ltp - prevClose) / prevClose) * 100).toFixed(2) : 0,
+          open: t.dayOpen || prevClose,
+          dayHigh: t.dayHigh || t.ltp,
+          dayLow: t.dayLow || t.ltp,
+          volume: t.vtt,
+          turnover: +((t.atp * t.vtt) / 1e7).toFixed(2), // ₹ -> ₹Cr
+        });
+      }
+      if (out.size >= wanted.size * 0.7) {
+        quoteCache = { at: Date.now(), v: out };
+        return out;
+      }
+      // Under the floor the feed is not serving this board — fall through to REST rather
+      // than cache a thin one, which is the same judgement the guard below makes.
+      out.clear();
+    }
+
     for (let i = 0; i < keys.length; i += MAX_KEYS) {
       const slice = keys.slice(i, i + MAX_KEYS);
       const data = await call<Record<string, RawQuote>>(

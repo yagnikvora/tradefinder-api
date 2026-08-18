@@ -12,6 +12,8 @@
     "check-flux": "tsx tools/flux-validate.ts",
     "check-upstox": "tsx tools/upstox-validate.ts",
     "check-momentum": "tsx tools/momentum-validate.ts",
+    "spike-ws": "tsx tools/ws-spike.ts",
+    "check-feed": "tsx tools/feed-check.ts",
     "replay-trend": "tsx tools/trend-replay.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },

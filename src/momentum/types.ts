@@ -188,6 +188,17 @@ export interface ConvictionReading {
    * and the only remaining record of when the day was called is this field.
    */
   confirmedAt: number | null;
+  /**
+   * The conviction score at the instant of confirmation. Null if it never confirmed, and null
+   * for a confirmation carried over from a state file written before this was recorded.
+   *
+   * The companion to `confirmedAt`, and the reason both are worth having: the time says WHEN
+   * the day was called and this says HOW STRONGLY. Distinct from `peak`, which is the best the
+   * row ever read and is normally reached long after the call — so a row confirmed at 83 that
+   * peaked at 96 was an early call that paid, and one confirmed at 83 that peaked at 84 was
+   * marginal the whole way.
+   */
+  convictionAtConfirm: number | null;
   /** Highest conviction reached today, so a faded row still says how good it once was. */
   peak: number;
 
@@ -250,6 +261,8 @@ export interface ConvictionSummary {
   heldMin: number | null;
   /** When the row was promoted to Confirmed today, epoch ms. Null if it never was. */
   confirmedAt: number | null;
+  /** The conviction score at that instant — how strong the call was when it was made. */
+  convictionAtConfirm: number | null;
   peak: number;
   vwapAdherence: number | null;
   vwapCrossings: number | null;

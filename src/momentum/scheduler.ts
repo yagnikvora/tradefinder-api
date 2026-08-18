@@ -39,6 +39,7 @@ import { sessionBellTick } from '../alerts/session-bell.js';
 import { checkTelegram } from '../alerts/telegram.js';
 import { checkDiscord } from '../alerts/discord.js';
 import { tokenSet } from '../upstox.js';
+import { feedStatus, startFeed, stopFeed, type FeedStatus } from '../feed/client.js';
 
 /** How long after the close the final settling scan runs. */
 const POST_CLOSE_MINUTES = 5;
@@ -93,6 +94,14 @@ export interface SchedulerStatus {
   baselineCarried: number;
   tokenConfigured: boolean;
   seed: SeedOutcome;
+  /**
+   * The live feed.
+   *
+   * Worth reporting even though a dead feed is not an outage: the scan silently falls back to
+   * REST, so the only symptom of a feed that never connects is that the alerts are as late as
+   * they used to be — which is invisible unless something says so here.
+   */
+  feed: FeedStatus;
 }
 
 /**
@@ -224,6 +233,13 @@ export async function startScheduler(): Promise<void> {
   if (timers.length) return;
   const cfg = await configRepository.get();
 
+  // Opened before the first scan and left open all day. Connecting is not gated on market
+  // hours: the feed sends a snapshot on connect, so an evening restart still comes up with a
+  // priced board, and a process that is already connected at 09:15 has the open rather than
+  // spending its first cycle establishing a socket. Nothing is subscribed until a caller asks
+  // — `quoteSnapshot` does that on every cycle, which is also how an expiry roll lands.
+  if (tokenSet()) startFeed();
+
   // `unref` so these never hold the process open on their own: a CLI that imports this
   // module should still exit when its work is done.
   const every = (ms: number, fn: () => void) => {
@@ -287,6 +303,9 @@ export function noteBaselineFailure(message: string, nowMs = Date.now()): void {
 export function stopScheduler(): void {
   for (const t of timers) clearInterval(t);
   timers = [];
+  // Without this a test that mounts the module and tears it down leaves a socket reconnecting
+  // in the background, and the process never exits.
+  stopFeed();
 }
 
 export async function schedulerStatus(): Promise<SchedulerStatus> {
@@ -302,5 +321,6 @@ export async function schedulerStatus(): Promise<SchedulerStatus> {
     // Surfaced because "no trend days today" and "this process never rebuilt the session"
     // produce an identical empty board and want opposite responses.
     seed: seedStatus(),
+    feed: feedStatus(),
   };
 }

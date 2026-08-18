@@ -611,7 +611,8 @@ function illustrative(nowMs: number, i = 0): TrendDayAlert {
     changePct: d.chg,
     conviction: {
       ready: true, score: d.conv, phase: 'Confirmed', direction: dirWord, heldMin: d.held,
-      confirmedAt: nowMs, peak: d.conv + 2, vwapAdherence: d.adherence, vwapCrossings: d.crossings,
+      confirmedAt: nowMs, convictionAtConfirm: d.conv, peak: d.conv + 2,
+      vwapAdherence: d.adherence, vwapCrossings: d.crossings,
       sessionEfficiency: 0.51, rangePosition: 0.92, deepestPullbackAtr: d.dip,
       partial: false, summary: `Confirmed ${dirWord.toLowerCase()} trend day`,
     } as ConvictionSummary,

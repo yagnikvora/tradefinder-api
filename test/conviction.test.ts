@@ -284,6 +284,57 @@ describe('trend phase machine', () => {
     assert.equal(series[series.length - 1].phase, 'Confirmed');
   });
 
+  it('records the conviction reading at the instant of confirmation', () => {
+    const prices = walk(100, 103, FULL, 0.02);
+    const { series } = replay(prices, (i, p) => p[i] - 0.3);
+
+    const i = series.findIndex((r) => r.phase === 'Confirmed');
+    assert.ok(i > 0, 'the fixture must reach Confirmed');
+
+    const at = series[i].convictionAtConfirm;
+    assert.ok(at !== null, 'a confirmed row must carry the score it was confirmed on');
+    assert.ok(
+      Math.abs(at - series[i].score) < 0.1,
+      `recorded ${at} but the reading scored ${series[i].score}`,
+    );
+
+    // Null right up to the promotion — there is no call to describe before one is made.
+    assert.ok(series.slice(0, i).every((r) => r.convictionAtConfirm === null));
+  });
+
+  // The one that would break if this were recomputed per cycle rather than captured once.
+  // `setPhase` returns early when the phase is unchanged, so a row that stays Confirmed for
+  // four hours keeps the score it was confirmed ON — not whatever it happens to read now.
+  it('freezes that reading while the score keeps moving', () => {
+    const prices = walk(100, 103, FULL, 0.02);
+    const { series } = replay(prices, (i, p) => p[i] - 0.3);
+
+    const i = series.findIndex((r) => r.phase === 'Confirmed');
+    const at = series[i].convictionAtConfirm;
+    const after = series.slice(i);
+
+    assert.ok(after.every((r) => r.convictionAtConfirm === at), 'the confirmation score must not drift');
+    // And it is a different fact from `peak`, which keeps climbing after the call.
+    const last = series[series.length - 1];
+    assert.ok(last.peak >= (at ?? 0), 'peak is the best of the day, so it cannot be below the call');
+  });
+
+  it('keeps the confirmation score after the row fades', () => {
+    const cfg = defaultConfig();
+    const prices = [...walk(100, 103, FULL - 30, 0.02), ...walk(103, 99.5, 30, 0.02)];
+    const { series } = replay(prices, (i, p) => Math.max(...p.slice(0, i + 1)) + 0.1, cfg);
+
+    const i = series.findIndex((r) => r.phase === 'Confirmed');
+    if (i < 0) return; // this fixture is about the carry-over, not about forcing a confirmation
+    const at = series[i].convictionAtConfirm;
+
+    const faded = series.slice(i).filter((r) => r.phase === 'Faded');
+    assert.ok(
+      faded.every((r) => r.convictionAtConfirm === at),
+      'once demoted, this and confirmedAt are the only record of when and how the day was called',
+    );
+  });
+
   // 2026-08-13. The process ran a window with no baseline at all, so every symbol's ATR was
   // absent and `displacementAtr` came back null. The gate read null as "nothing disqualifying
   // here" and let it through, the score fell back to the six shape components that need no ATR,

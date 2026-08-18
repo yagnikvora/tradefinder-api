@@ -202,6 +202,16 @@ export interface TrendTrack {
   /** When this stock first read as Forming in the current direction. */
   formingSince: number | null;
   confirmedAt: number | null;
+  /**
+   * The conviction reading at the instant of confirmation. Null until it happens.
+   *
+   * Deliberately NOT `peak`, which is the highest score of the whole day and is usually
+   * reached well after the call — often near the close, when the move is finished. This is
+   * how strong the case was AT THE MOMENT the day was called, which is the only version of
+   * the number anyone could have acted on. Read together with `peak` it says whether a
+   * confirmation was marginal and then vindicated, or strong from the start.
+   */
+  convictionAtConfirm: number | null;
   /** Highest conviction reached today, kept so a faded row can say what it once was. */
   peak: number;
   /** When conviction first fell below the fade threshold. Null while it is above. */
@@ -555,10 +565,14 @@ export function advanceTrend(
   if (!t) {
     t = sym.trend = {
       phase: 'None', direction: null, since: nowMs, formingSince: null,
-      confirmedAt: null, peak: 0, belowSince: null,
+      confirmedAt: null, convictionAtConfirm: null, peak: 0, belowSince: null,
     };
     dirty = true;
   }
+  // A state file written before this field existed still has a `confirmedAt`. Null is the
+  // honest answer for those — the score at that moment was never recorded and cannot be
+  // recovered — rather than back-filling today's score onto this morning's confirmation.
+  t.convictionAtConfirm ??= null;
 
   // Ineligibility is expressed as a failing score rather than as a separate branch, so it
   // inherits the fade hysteresis for free and there is only one demotion path to reason about.
@@ -570,7 +584,13 @@ export function advanceTrend(
     t!.phase = phase;
     t!.direction = dir;
     t!.since = nowMs;
-    if (phase === 'Confirmed') t!.confirmedAt = nowMs;
+    if (phase === 'Confirmed') {
+      t!.confirmedAt = nowMs;
+      // Captured here rather than by the caller, because this is the only place that knows a
+      // promotion actually happened — `setPhase` returns early when the phase is unchanged, so
+      // a row that stays Confirmed for four hours keeps the score it was confirmed ON.
+      t!.convictionAtConfirm = +effective.toFixed(1);
+    }
     if (phase !== 'Forming' && phase !== 'Confirmed') t!.formingSince = null;
     dirty = true;
   };
