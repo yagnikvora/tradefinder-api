@@ -69,6 +69,7 @@ import {
 } from '../services/conviction.service.js';
 import { onScan } from '../alerts/trend-day.js';
 import { onScan as onIgnition } from '../alerts/ignition.js';
+import { onScan as onDisplacement, type DisplacementInput } from '../alerts/displacement.js';
 import type { ConvictionReading } from '../types.js';
 import { buildSignal, buildTrendDayPlan, gateTradeType, type SignalInputs } from './signal.service.js';
 import { institutionalActivity, scoreRow } from './score.service.js';
@@ -682,6 +683,30 @@ export async function runScan(cfg: MomentumConfig, nowMs = Date.now()): Promise<
   // Same gating and same ordering: market open only, baseline required, awaited so a failure
   // surfaces here rather than as an unhandled rejection. It is off unless IGNITION_ALERTS=on.
   if (open) await onIgnition(rows, cfg, nowMs, baseline !== null);
+
+  // And the third channel, which fires in the first half hour or not at all.
+  //
+  // Built from `staged` rather than from `rows` because the readings it needs — the session open
+  // and the day's running extremes — are on the quote and not on the public row type, and
+  // widening `MomentumRow` to decorate one alert would change the board's API for the sake of
+  // this call. Same source objects the board is built from, so the two cannot disagree.
+  //
+  // Not filtered by `coverage` the way `rows` is: this rule reads volume, range and ATR only, all
+  // of which are present or absent as a unit, and a stock whose OPTION-FLOW factor failed is not
+  // a stock whose morning range is unknown. The alert's own gates reject anything unmeasurable.
+  if (open) {
+    const displacementInputs: DisplacementInput[] = staged.map((s) => ({
+      symbol: s.member.symbol,
+      equityKey: s.member.equityKey,
+      quote: s.quote,
+      atr: s.baseline?.atr ?? null,
+      avgDailyValueCr: s.baseline?.avgDailyValueCr ?? null,
+      rvol: s.rvol,
+      lotSize: s.member.future?.lotSize ?? null,
+      baselineCarriedFrom: s.baseline?.carriedFrom ?? null,
+    }));
+    await onDisplacement(displacementInputs, cfg, nowMs, baseline !== null);
+  }
 
   // A restart mid-session leaves the price ring empty, and the timing layer is dark until it
   // refills. That is a real state and is said out loud rather than looking like "nothing is

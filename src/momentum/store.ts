@@ -75,6 +75,13 @@ export const STORE_KEYS = {
    */
   ignitionAlerts: 'ignition_alerts',
   /**
+   * Which first-hour displacement signals have been announced today. See alerts/displacement.js.
+   *
+   * Its own key for the same reason `ignitionAlerts` has one: the three channels are switched on
+   * and off independently, and a shared record would mean disabling one could silence another.
+   */
+  displacementAlerts: 'displacement_alerts',
+  /**
    * Which of today's session bells have been sent, and the quotes used lately.
    *
    * Lives in this key set rather than its own store because the bells are not a momentum feature —
