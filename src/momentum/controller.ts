@@ -18,6 +18,10 @@ import { configRepository } from './config/config.repository.js';
 import { buildMessages, previewAlerts, trendAlertStatus } from './alerts/trend-day.js';
 import { ignitionAlertStatus } from './alerts/ignition.js';
 import { displacementAlertStatus } from './alerts/displacement.js';
+import {
+  journalBoot, journalPatch, journalRange, journalSettleDue, journalStatus, type JournalChannel,
+} from './journal/journal.js';
+import { databaseUrl, getPool, probe } from './journal/postgres.js';
 import { HTML, MARKDOWN } from '../alerts/markup.js';
 import { previewBell, sessionBellStatus } from '../alerts/session-bell.js';
 import { sendTelegram, telegramConfigured, telegramStatus } from '../alerts/telegram.js';
@@ -32,7 +36,7 @@ import { noteBaselineFailure, scanOnce, schedulerStatus } from './scheduler.js';
 import { seedSession } from './data/session-seed.js';
 import { cache, single } from './cache.js';
 import { applySignalFilters, isValidationError, parseBoardQuery, parseConfigPatch, parseSymbol } from './dto.js';
-import { marketOpen } from './session.js';
+import { istDay, marketOpen } from './session.js';
 import { tokenSet } from '../upstox.js';
 
 const BOARD_KEY = 'momentum:board';
@@ -40,6 +44,17 @@ const BOARD_KEY = 'momentum:board';
 const CLOSED_TTL_MS = 10 * 60_000;
 
 type Source = 'upstox' | 'stale';
+
+/** An IST date, or the fallback. Anything unparseable is the fallback rather than an error. */
+const parseDay = (v: unknown, fallback: string): string =>
+  typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : fallback;
+
+const CHANNELS = new Set(['displacement', 'trend-day', 'ignition']);
+/** `null` for "all", `false` for "that is not a channel". */
+const parseChannel = (v: unknown): JournalChannel | null | false => {
+  if (v === undefined || v === '' || v === 'all') return null;
+  return typeof v === 'string' && CHANNELS.has(v) ? (v as JournalChannel) : false;
+};
 
 const send = <T>(res: Response, data: T, source: Source, note?: string) =>
   res.json({ payload: { data }, status: 'SUCCESS', source, ...(note ? { note } : {}) });
@@ -328,6 +343,9 @@ export function momentumRouter(): express.Router {
       // normal state and says nothing about health. `lastScanMinute` is what separates a
       // channel that looked and found nothing from one that never ran.
       displacementAlerts: displacementAlertStatus(),
+      // The trade journal. `today.unsettled` above zero after 15:20 is the field that matters:
+      // it means positions were opened and their exits have not been priced from candles yet.
+      journal: await journalStatus(),
       // The 09:15 and 15:30 bells. Carries which of today's have gone out, so a morning with no
       // greeting can be told apart from a morning the process slept through.
       sessionBell: await sessionBellStatus(),
@@ -548,6 +566,102 @@ export function momentumRouter(): express.Router {
     await scanOnce();
     const { board, source, note } = await currentBoard();
     send(res, { asOf: board.asOf, scored: board.scored, shortlisted: board.shortlisted }, source, note);
+  });
+
+  // ------------------------------------------------- GET /momentum/journal ------------
+  //
+  // Declared BEFORE `/:symbol`, or Express matches "journal" as a stock symbol.
+  //
+  // `from`/`to` are IST session dates. Both default to today, which is the reading this exists
+  // for — the day, at night, after the market has settled it.
+  router.get('/journal', async (req: Request, res: Response) => {
+    try {
+      const today = istDay();
+      const from = parseDay(req.query.from, today);
+      const to = parseDay(req.query.to, from);
+      if (to < from) return fail(res, 400, '`to` is before `from`');
+      const channel = parseChannel(req.query.channel);
+      if (channel === false) return fail(res, 400, 'channel must be displacement, trend-day or ignition');
+      // Once per process, and here as well as in the scheduler so `npm run viewer` — which has no
+      // scheduler — still pushes any local history the database has not seen.
+      await journalBoot();
+      const view = await journalRange(from, to, channel);
+      // Journal rows are read off disk and are complete whether or not Upstox is reachable, so
+      // the envelope's source says where the PRICES came from, not where the rows did.
+      send(res, view, 'upstox');
+    } catch (e) {
+      fail(res, 500, String((e as Error).message));
+    }
+  });
+
+  // ---------------------------------------- PATCH /momentum/journal/:id ---------------
+  //
+  // Replace the auto-recorded prices with the fill actually received. An edited row is flagged
+  // and settlement stops touching it — see the note in journal.ts.
+  router.patch('/journal/:id', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const money = (v: unknown): number | undefined => {
+      if (v === undefined || v === null || v === '') return undefined;
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0 || n > 1e7) throw new Error('price must be between 0 and 10,000,000');
+      return n;
+    };
+    try {
+      const t = await journalPatch(String(req.params.id), {
+        entryPremium: money(body.entryPremium),
+        exitPremium: money(body.exitPremium),
+        lots: body.lots === undefined ? undefined : Number(body.lots),
+        note: body.note === undefined ? undefined : String(body.note),
+        reset: body.reset === true,
+      });
+      if (!t) return fail(res, 404, `no journal trade with id ${req.params.id}`);
+      send(res, t, 'upstox');
+    } catch (e) {
+      fail(res, 400, String((e as Error).message));
+    }
+  });
+
+  // ------------------------------------------ GET /momentum/journal/sync -------------
+  //
+  // Proves the shared store end to end: connect, create the table, write a row, read it back,
+  // delete it, count what is stored. The same steps `npm run check-neon` runs, exposed over HTTP
+  // so the page can offer a button rather than asking anyone to open a terminal.
+  //
+  // Never returns the connection string. The host and database name are echoed because "am I
+  // pointed at the right project" is a real question; the credentials in it are not an answer.
+  router.get('/journal/sync', async (_req, res) => {
+    const url = databaseUrl();
+    if (!url)
+      return send(res, {
+        configured: false,
+        note: 'DATABASE_URL is not set — the journal is on local disk only, on this machine.',
+        steps: [],
+      }, 'upstox');
+    let host = 'unparseable DATABASE_URL';
+    try { const u = new URL(url); host = `${u.hostname}${u.pathname}`; } catch { /* keep the label */ }
+    try {
+      const steps = await probe(getPool());
+      const ok = steps.every((s) => s.ok);
+      send(res, { configured: true, host, ok, steps }, 'upstox',
+        ok ? undefined : 'the shared store is not usable — see the failing step');
+    } catch (e) {
+      send(res, { configured: true, host, ok: false, steps: [{ step: 'connect', ok: false, detail: String((e as Error).message) }] }, 'upstox');
+    }
+  });
+
+  // --------------------------------------- POST /momentum/journal/settle -------------
+  //
+  // Force the settlement pass. The scheduler runs it every two minutes anyway; this is for a
+  // process that has just been started to catch up a backlog without waiting.
+  router.post('/journal/settle', async (_req, res) => {
+    if (!tokenSet())
+      return fail(res, 503, 'UPSTOX_ACCESS_TOKEN is not set — settlement reads the contract’s own candles');
+    try {
+      const settled = await journalSettleDue();
+      send(res, { settled }, 'upstox', settled ? undefined : 'nothing was outstanding');
+    } catch (e) {
+      fail(res, 502, String((e as Error).message));
+    }
   });
 
   // -------------------------------------------------------- GET /momentum/:symbol ----

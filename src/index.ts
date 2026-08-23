@@ -26,7 +26,17 @@ app.use(cors());
 // The scheduler is off without a token: its jobs would otherwise fail every 30 seconds on a
 // clone that has not been configured, filling the log with the same error. Note the session bells
 // are the exception inside it — they need no token and ring regardless.
-mountMomentum(app, { path: '/momentum', scheduler: process.env.MOMENTUM_SCHEDULER !== 'off' });
+//
+// VIEWER MODE. `npm run viewer` passes --viewer and turns the scheduler off, which is how the
+// reading machine runs: it serves the trade journal out of the shared database and never scans.
+// Without it, an API booted at 22:00 finds a baseline that is not today's and immediately spends
+// ~416 candle requests rebuilding one nobody is going to look at.
+const viewer = process.argv.includes('--viewer');
+mountMomentum(app, {
+  path: '/momentum',
+  scheduler: !viewer && process.env.MOMENTUM_SCHEDULER !== 'off',
+});
+if (viewer) console.log('viewer mode — scheduler off, serving stored records only');
 
 // In-memory cache so we don't hammer NSE. Every avoidable upstream hit is another
 // chance to be tarpitted and drop to a fallback, so the window widens once the market

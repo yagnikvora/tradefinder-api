@@ -8,6 +8,8 @@ dist/
 # .env.example is the template.
 .env
 .env.local
+# The office copy — a full set of live credentials, same rule as .env itself.
+.env.office
 
 # Timestamped copies made before editing .env. These are FULL COPIES of the real file,
 # credentials and all, and one of them (.env.backup-20260808-213723) was committed and pushed
@@ -22,3 +24,14 @@ dist/
 # an artefact rather than source, and it is vendor market data that should not be redistributed
 # through a repository. The SCRIPTS in research/ are source and are committed; only the pull is not.
 research/data/
+
+# The 15%/30% risk study — kept on the machine that ran it, not in the repository.
+#
+# An exception to the line above, and it is worth saying why rather than leaving the two rules
+# looking like they contradict each other. The `study*.mjs` scripts are committed because they
+# are how the shipped displacement rule was derived, and anyone reading that rule needs them.
+# These seventeen are a one-off answer to a single question — whether a 15% stop and a 30% target
+# can work on this strategy — and the answer (no: -2.9% of premium a trade, because the round
+# trip plus a day of decay is already 8.5%) lives in the alert channel's own comments and in
+# JOURNAL_TP_PCT / JOURNAL_SL_PCT. The scripts are the working, not the result.
+research/risk-*.mjs

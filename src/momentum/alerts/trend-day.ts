@@ -37,11 +37,12 @@
 // how far off the day's extreme price currently is and lets that be read rather than implying the
 // confirmation price is the entry.
 
-import { istDay } from '../session.js';
+import { istDay, minuteOfSession } from '../session.js';
 import { store, STORE_KEYS } from '../store.js';
 import { stockChain } from '../data/option-chain.js';
 import { universe } from '../data/universe.js';
 import { selectStrike } from '../services/strike.service.js';
+import { recordEntries } from '../journal/journal.js';
 import { latestTrendPlans, type TrendDayPlan } from '../engine/momentum.engine.js';
 import type {
   ConvictionSummary, MomentumConfig, MomentumRow, SignalPlan, StrikeChoice,
@@ -768,6 +769,20 @@ export async function onScan(
 
     await priceContracts(usable, cfg, nowMs);
     await deliver(usable, nowMs);
+    await recordEntries('trend-day', usable.map((a) => ({
+      symbol: a.symbol,
+      direction: a.direction,
+      spot: a.price,
+      minute: minuteOfSession(nowMs),
+      lotSize: a.lotSize,
+      strike: a.strike,
+      readings: {
+        conviction: a.conviction?.score ?? null,
+        changePct: a.changePct,
+        atrUsed: a.atrUsed,
+        minutesSinceExtreme: a.minutesSinceExtreme,
+      },
+    })), nowMs);
     return usable;
   } catch (e) {
     lastError = String((e as Error).message);

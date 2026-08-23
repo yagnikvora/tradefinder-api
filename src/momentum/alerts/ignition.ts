@@ -35,7 +35,8 @@
 // dedupe on disk, the freshness window, the "no ATR, no alert" gate. Those were all written
 // against real failures on this channel and re-deriving them here would be re-earning them.
 
-import { istDay } from '../session.js';
+import { istDay, minuteOfSession } from '../session.js';
+import { recordEntries } from '../journal/journal.js';
 import { store, STORE_KEYS } from '../store.js';
 import type {
   FactorKey, MomentumConfig, MomentumRow, SignalPlan, StrikeChoice, TriggerKind,
@@ -327,6 +328,22 @@ export async function onScan(
     announcedToday = state.announced.length;
 
     await deliver(sending, dropped, nowMs);
+    await recordEntries('ignition', sending.map((a) => ({
+      symbol: a.symbol,
+      direction: a.direction,
+      spot: a.price,
+      minute: minuteOfSession(nowMs),
+      lotSize: a.lotSize,
+      strike: a.strike,
+      readings: {
+        entryQuality: a.entryQuality,
+        changePct: a.changePct,
+        atrUsed: a.atrUsed,
+        rvol: a.rvol,
+        convictionScore: a.convictionScore,
+      },
+      note: a.triggerKind,
+    })), nowMs);
     return sending;
   } catch (e) {
     lastError = String((e as Error).message);

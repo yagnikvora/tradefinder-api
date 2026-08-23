@@ -35,6 +35,7 @@ import { flushSessionState } from './data/session-state.js';
 import { seedSession, seedStatus, type SeedOutcome } from './data/session-seed.js';
 import { resetUniverse } from './data/universe.js';
 import { istDay, istMinutes, marketOpen, SESSION_CLOSE_MIN } from './session.js';
+import { journalBoot, journalSettleDue, journalTick } from './journal/journal.js';
 import { sessionBellTick } from '../alerts/session-bell.js';
 import { checkTelegram } from '../alerts/telegram.js';
 import { checkDiscord } from '../alerts/discord.js';
@@ -260,6 +261,28 @@ export async function startScheduler(): Promise<void> {
   every(cfg.refresh.quoteMs, () => void scanTick());
   every(5 * 60_000, () => void baselineThenSeed());
   every(BELL_MS, () => void sessionBellTick());
+
+  // THE TRADE JOURNAL. Two jobs and they are deliberately not one.
+  //
+  // The mark runs on the scan interval and costs nothing — the option's own instrument key is on
+  // the WebSocket feed, so a position is watched for free. It exists so the page has a live
+  // number, not so it can decide the day.
+  //
+  // The settle runs every two minutes and is what actually writes the record: it fetches each
+  // contract's 1-minute candles and grades the path. Its cadence is slow because it is a REST
+  // call per open contract per day, and it is a CATCH-UP job as well as a closing one — a
+  // process that was asleep all afternoon settles the day correctly on its next tick, and one
+  // that was off for a week settles every day it missed. That is the whole reason the exit is
+  // derived from candles rather than from the marks it collected.
+  every(cfg.refresh.quoteMs, () => void journalTick().catch((e) => {
+    lastError = { at: Date.now(), message: `journal mark: ${String((e as Error).message)}` };
+  }));
+  every(2 * 60_000, () => void journalSettleDue().catch((e) => {
+    lastError = { at: Date.now(), message: `journal settle: ${String((e as Error).message)}` };
+  }));
+  // Once on boot: push any local history the shared store has never seen — which is what
+  // backfills the day a database is first configured — then close off anything left open.
+  void journalBoot().then(() => journalSettleDue()).catch(() => {});
 
   // Ask each phone channel whether it actually works, now rather than at 10:30. A configured
   // channel that cannot be reached is indistinguishable from a quiet market on `/momentum/status`

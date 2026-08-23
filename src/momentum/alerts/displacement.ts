@@ -61,6 +61,7 @@ import { universe } from '../data/universe.js';
 import { selectStrike } from '../services/strike.service.js';
 import type { MomentumConfig, StrikeChoice } from '../types.js';
 import type { MomentumQuote } from '../data/quotes.js';
+import { recordEntries } from '../journal/journal.js';
 import { HTML, istClock, MARKDOWN, type Markup } from '../../alerts/markup.js';
 import { discordConfigured, sendDiscord } from '../../alerts/discord.js';
 import { sendTelegram, telegramConfigured } from '../../alerts/telegram.js';
@@ -404,6 +405,20 @@ export async function onScan(
 
     const strikes = await priceContracts(picked, cfg, nowMs);
     await deliver(picked, strikes, nowMs);
+    // After the send, never before it. The journal is bookkeeping and must not be able to delay
+    // or fail the one thing on this path that matters.
+    await recordEntries('displacement', picked.map((c) => ({
+      symbol: c.symbol,
+      direction: c.direction,
+      spot: c.entry,
+      minute: c.minute,
+      lotSize: c.lotSize,
+      strike: strikes.get(c.symbol) ?? null,
+      readings: {
+        rvol: c.rvol, rangeAtr: c.rangeAtr, moveAtr: c.moveAtr,
+        offExtremeAtr: c.offExtremeAtr, atr: c.atr, turnoverCr: c.turnoverCr, changePct: c.changePct,
+      },
+    })), nowMs);
     return picked;
   } catch (e) {
     lastError = String((e as Error).message);
