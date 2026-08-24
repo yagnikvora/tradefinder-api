@@ -51,6 +51,15 @@ export interface JournalTrade {
   /** Best and worst excursion, as a fraction of the entry premium. */
   mfePct: number | null;
   maePct: number | null;
+  /**
+   * Minute of session each excursion was set, 0 = 09:15. Null when that extreme is still 0 — see
+   * `gradePath`, which will not name a minute for an excursion that never happened.
+   *
+   * Optional because rows written before this field existed do not carry it, and a settled trade
+   * is never re-graded: the page must render "—" for those rather than showing 09:15.
+   */
+  mfeMinute?: number | null;
+  maeMinute?: number | null;
   /** Bid-ask at entry, as a percentage of the mid. The friction the charges figure excludes. */
   spreadPctAtEntry: number | null;
   amountUsed: number | null;

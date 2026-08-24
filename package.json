@@ -13,6 +13,7 @@
     "check-upstox": "tsx tools/upstox-validate.ts",
     "check-momentum": "tsx tools/momentum-validate.ts",
     "check-neon": "tsx tools/neon-validate.ts",
+    "seed-journal": "tsx tools/journal-seed.ts",
     "start:prod": "node dist/index.js",
     "spike-ws": "tsx tools/ws-spike.ts",
     "check-feed": "tsx tools/feed-check.ts",

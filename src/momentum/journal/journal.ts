@@ -258,8 +258,10 @@ export async function journalTick(nowMs = Date.now()): Promise<void> {
     if (out > 0) {
       const pct = (out - t.entry.premium) / t.entry.premium;
       t.mark = { at: nowMs, premium: +out.toFixed(2), pct: +pct.toFixed(4) };
-      t.mfePct = t.mfePct === null ? pct : Math.max(t.mfePct, pct);
-      t.maePct = t.maePct === null ? pct : Math.min(t.maePct, pct);
+      // The minute is recorded only when the extreme actually moves, so it always names the tick
+      // that set it rather than the tick that last looked.
+      if (t.mfePct === null || pct > t.mfePct) { t.mfePct = pct; t.mfeMinute = minute; }
+      if (t.maePct === null || pct < t.maePct) { t.maePct = pct; t.maeMinute = minute; }
       t.updatedAt = nowMs;
       changed.push(t);
 
@@ -302,19 +304,32 @@ export function gradePath(
   tp: number,
   sl: number,
   lastMinute: number,
-): { pct: number; out: 'target' | 'stop' | 'close'; minute: number; mfe: number; mae: number } {
+): {
+  pct: number; out: 'target' | 'stop' | 'close'; minute: number;
+  mfe: number; mae: number;
+  /**
+   * The minute each extreme was set, or null while that extreme is still 0.
+   *
+   * Null rather than the entry minute on purpose: `mfe` and `mae` both start at 0 and are only
+   * ever moved by a bar that beat them, so a trade that never traded above its entry has an `mfe`
+   * of exactly 0 that belongs to no minute at all. Reporting the entry minute there would invent a
+   * moment when the position was at its best, which is the one thing this column must not do.
+   */
+  mfeMinute: number | null; maeMinute: number | null;
+} {
   let mfe = 0, mae = 0, lastClose = paid, lastMin = fromMinute;
+  let mfeMinute: number | null = null, maeMinute: number | null = null;
   for (const b of bars) {
     if (b.minute <= fromMinute || b.minute > lastMinute) continue;
     const down = (b.low - paid) / paid;
     const up = (b.high - paid) / paid;
-    if (down < mae) mae = down;
-    if (up > mfe) mfe = up;
+    if (down < mae) { mae = down; maeMinute = b.minute; }
+    if (up > mfe) { mfe = up; mfeMinute = b.minute; }
     lastClose = b.close; lastMin = b.minute;
-    if (down <= -sl) return { pct: -sl, out: 'stop', minute: b.minute, mfe, mae };
-    if (up >= tp) return { pct: tp, out: 'target', minute: b.minute, mfe, mae };
+    if (down <= -sl) return { pct: -sl, out: 'stop', minute: b.minute, mfe, mae, mfeMinute, maeMinute };
+    if (up >= tp) return { pct: tp, out: 'target', minute: b.minute, mfe, mae, mfeMinute, maeMinute };
   }
-  return { pct: (lastClose - paid) / paid, out: 'close', minute: lastMin, mfe, mae };
+  return { pct: (lastClose - paid) / paid, out: 'close', minute: lastMin, mfe, mae, mfeMinute, maeMinute };
 }
 
 /**
@@ -376,6 +391,8 @@ export async function settleDay(day: string, nowMs = Date.now()): Promise<number
     };
     t.mfePct = +r.mfe.toFixed(4);
     t.maePct = +r.mae.toFixed(4);
+    t.mfeMinute = r.mfeMinute;
+    t.maeMinute = r.maeMinute;
     t.shadow = SHADOW.map((s): JournalShadow => {
       const w = gradePath(bars, t.entry.premium, t.entry.minute, s.tp, s.sl, cfg.squareOffMin);
       return { name: s.name, pct: +w.pct.toFixed(4), out: w.out, minute: w.minute };
