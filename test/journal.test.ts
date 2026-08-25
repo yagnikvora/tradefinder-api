@@ -13,7 +13,8 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { gradePath, journalConfig, SHADOW } from '../src/momentum/journal/journal.js';
+import { gradePath, journalConfig, sessionBars, SHADOW } from '../src/momentum/journal/journal.js';
+import type { UpstoxCandle } from '../src/upstox.js';
 
 /** A minute bar on the option's own premium. */
 const bar = (minute: number, low: number, high: number, close = (low + high) / 2) =>
@@ -150,5 +151,44 @@ describe('journal · config', () => {
       if (before === undefined) delete process.env.JOURNAL;
       else process.env.JOURNAL = before;
     }
+  });
+});
+
+describe('journal · sessionBars', () => {
+  /** A candle exactly as `sessionCandles` returns one: element 0 is epoch SECONDS. */
+  const candle = (iso: string, high: number, low: number, close: number): UpstoxCandle =>
+    [Math.floor(Date.parse(iso) / 1000), close, high, low, close, 0, 0];
+
+  it('reads the candle epoch as seconds, not milliseconds', () => {
+    // The bug this pins: `istMinutes` takes milliseconds, so passing the raw epoch read a 2026
+    // candle as January 1970 and put every bar at minute ~768 — past the square-off, so
+    // `gradePath` discarded the entire session and booked a flat exit on every settled trade.
+    const bars = sessionBars([
+      candle('2026-08-25T09:15:00+05:30', 1, 1, 1),
+      candle('2026-08-25T09:40:00+05:30', 1, 1, 1),
+      candle('2026-08-25T15:15:00+05:30', 1, 1, 1),
+    ]);
+    assert.deepEqual(bars.map((b) => b.minute), [0, 25, 360]);
+  });
+
+  it('gives gradePath a path it can actually grade', () => {
+    // Entered at 09:40 for 20; the contract doubles by 11:00. That is +100%, past the +80% target.
+    const bars = sessionBars([
+      candle('2026-08-25T09:40:00+05:30', 20, 20, 20),
+      candle('2026-08-25T11:00:00+05:30', 40, 39, 40),
+    ]);
+    const r = gradePath(bars, 20, 25, 0.80, 0.50, 360);
+    assert.equal(r.out, 'target');
+    assert.equal(r.pct, 0.80);
+    // Under the bug every bar was filtered out and this came back as a flat 'close' at minute 25.
+    assert.notEqual(r.minute, 25);
+  });
+
+  it('sorts bars the API returned out of order', () => {
+    const bars = sessionBars([
+      candle('2026-08-25T11:00:00+05:30', 1, 1, 1),
+      candle('2026-08-25T09:30:00+05:30', 1, 1, 1),
+    ]);
+    assert.deepEqual(bars.map((b) => b.minute), [15, 105]);
   });
 });

@@ -363,12 +363,93 @@ function compareCaps(rows: JournalTrade[], caps: number[]): void {
   console.log('  ret/peak = net over the whole window against that peak deployment. NOT annualised.\n');
 }
 
+/* ------------------------------------------------------------------ square-off compare --- */
+
+/** One trade reduced to what a re-grade needs: the path, what was paid, and the size. */
+interface Priced {
+  day: string;
+  symbol: string;
+  bars: OptionBar[];
+  paid: number;
+  entryMinute: number;
+  size: number;
+}
+
+/**
+ * What a different `JOURNAL_SQUARE_OFF_MIN` would have done to the same trades.
+ *
+ * The cutoff cannot change WHICH signals fire — every entry is inside the 09:27-10:00 window and
+ * decided long before any of these times — so this is a pure re-grade of one fixed set of trades
+ * against one fixed set of candles. That makes it a far cleaner comparison than the per-day cap,
+ * where the alternatives take different trades entirely.
+ *
+ * A position that already hit its target or its stop is untouched by a later cutoff. Only two
+ * groups move: trades still open at the earlier time, which get its price instead of the later
+ * one, and trades that would have reached a level BETWEEN the two times, which the earlier cutoff
+ * closes before they get there.
+ */
+function compareSquareOff(priced: Priced[], cutoffs: number[]): void {
+  const cfg = journalConfig();
+  const inr = (n: number): string => (n < 0 ? '-Rs ' : 'Rs ') + Math.round(Math.abs(n)).toLocaleString('en-IN');
+
+  const at = (cutoff: number) => priced.map((p) => {
+    const g = gradePath(p.bars, p.paid, p.entryMinute, cfg.tpPct, cfg.slPct, cutoff);
+    const gross = (p.paid * (1 + g.pct) - p.paid) * p.size;
+    return { net: gross - cfg.chargePerLot * cfg.lots, out: g.out, sym: p.symbol, day: p.day };
+  });
+
+  const base = at(cfg.squareOffMin);
+  const baseNet = base.reduce((a, x) => a + x.net, 0);
+
+  console.log('\n  === SQUARE-OFF TIME compared, same trades and same candles ===\n');
+  console.log('  time    minute  target  stop  squared      net       vs 15:15   win%');
+  console.log('  ' + '-'.repeat(74));
+
+  for (const cutoff of cutoffs) {
+    const r = at(cutoff);
+    const net = r.reduce((a, x) => a + x.net, 0);
+    const wins = r.filter((x) => x.net > 0).length;
+    console.log(
+      `  ${clock(cutoff)}   ${String(cutoff).padStart(5)}  ` +
+      `${String(r.filter((x) => x.out === 'target').length).padStart(6)}  ` +
+      `${String(r.filter((x) => x.out === 'stop').length).padStart(4)}  ` +
+      `${String(r.filter((x) => x.out === 'close').length).padStart(7)}  ` +
+      `${inr(net).padStart(11)}  ${(cutoff === cfg.squareOffMin ? '—' : inr(net - baseNet)).padStart(11)}  ` +
+      `${((100 * wins) / r.length).toFixed(1).padStart(5)}`,
+    );
+  }
+  console.log('  ' + '-'.repeat(74));
+
+  // Which trades actually move, so the difference is attributable rather than just a total.
+  const early = cutoffs.filter((c) => c !== cfg.squareOffMin).sort((a, b) => a - b)[0];
+  if (early === undefined) return;
+  const alt = at(early);
+  const moved = base
+    .map((b, i) => ({ sym: b.sym, day: b.day, was: b.net, now: alt[i].net, wasOut: b.out, nowOut: alt[i].out }))
+    .filter((x) => Math.abs(x.now - x.was) > 1)
+    .sort((a, b) => (b.now - b.was) - (a.now - a.was));
+
+  console.log(`\n  ${moved.length} of ${priced.length} trades change between ${clock(early)} and ${clock(cfg.squareOffMin)}.`);
+  if (moved.length) {
+    console.log(`\n  biggest improvements from squaring off at ${clock(early)}:`);
+    for (const m of moved.slice(0, 5)) {
+      console.log(`    ${m.day}  ${m.sym.padEnd(12)} ${inr(m.was).padStart(10)} (${m.wasOut}) -> ${inr(m.now).padStart(10)} (${m.nowOut})`);
+    }
+    console.log(`\n  biggest costs:`);
+    for (const m of moved.slice(-5).reverse()) {
+      console.log(`    ${m.day}  ${m.sym.padEnd(12)} ${inr(m.was).padStart(10)} (${m.wasOut}) -> ${inr(m.now).padStart(10)} (${m.nowOut})`);
+    }
+  }
+  console.log();
+}
+
 /* ------------------------------------------------------------------------------ main --- */
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.includes('--clear')) { await removeBackfilled(); return; }
   const comparing = argv.includes('--compare');
+  const squaringOff = argv.includes('--squareoff');
   // Replayed at the widest cap so the narrower ones can be sliced out of the same result.
   if (comparing) process.env.DISPLACEMENT_MAX_PER_DAY = '4';
 
@@ -421,6 +502,9 @@ async function main(): Promise<void> {
 
   // 2. Price each one against its contract's real candles.
   const rows: JournalTrade[] = [];
+  // The candle path of every priced trade, kept so `--squareoff` can re-grade without spending a
+  // second round of Upstox requests to fetch the identical bars again.
+  const priced: Priced[] = [];
   let noContract = 0, noCandles = 0;
 
   for (let i = 0; i < signals.length; i += BATCH) {
@@ -450,6 +534,8 @@ async function main(): Promise<void> {
         const w = gradePath(bars, paid, at.minute, s.tp, s.sl, cfg.squareOffMin);
         return { name: s.name, pct: round(w.pct, 4), out: w.out, minute: w.minute };
       });
+
+      priced.push({ day, symbol: c.symbol, bars, paid, entryMinute: at.minute, size });
 
       const entryAt = atOf(day, at.minute);
       const t: JournalTrade = {
@@ -519,6 +605,13 @@ async function main(): Promise<void> {
   console.log(`  vs control    the -7.4% buy-and-hold floor is what this has to beat\n`);
 
   if (comparing) { compareCaps(rows, [4, 3, 2]); return; }
+  if (squaringOff) {
+    // Default sweep is 13:00, 14:00, 14:30, 15:00 and the configured 15:15, as minutes from the
+    // 09:15 open. `--squareoff 285,360` narrows it, which also focuses the per-trade movers list.
+    const asked = (arg('--squareoff') ?? '').split(',').map((x) => Number(x.trim())).filter((x) => Number.isFinite(x) && x > 0);
+    compareSquareOff(priced, asked.length ? asked : [225, 285, 315, 345, journalConfig().squareOffMin]);
+    return;
+  }
   if (dry) { console.log('  --dry, nothing written.\n'); return; }
 
   // Through `journalRepository()` rather than straight to disk, so a configured Neon gets these in

@@ -38,7 +38,7 @@
 
 import { istDay, istMinutes, SESSION_CLOSE_MIN, SESSION_OPEN_MIN } from '../session.js';
 import { feedTick, subscribeKeys } from '../../feed/client.js';
-import { sessionCandles } from '../../upstox.js';
+import { sessionCandles, type UpstoxCandle } from '../../upstox.js';
 import {
   FileJournalRepository, MirrorJournalRepository,
   type JournalRepository, type JournalSyncStatus,
@@ -333,6 +333,32 @@ export function gradePath(
 }
 
 /**
+ * Upstox candles to the minute-of-session bars `gradePath` grades.
+ *
+ * EXTRACTED SO IT CAN BE TESTED, because the one line in it was wrong for the life of the module
+ * and nothing caught it. `c[0]` is epoch SECONDS — `UpstoxCandle` documents that, and `isoToEpoch`
+ * divides by 1000 — while `istMinutes` takes MILLISECONDS. Passing the raw value read a 2026
+ * candle as 21 January 1970 and put every bar of every session at minute ~768. `gradePath` drops
+ * anything past the square-off minute, so every bar was discarded and it returned its empty-path
+ * answer: an exit equal to the entry, at the entry minute, with zero excursion. Every settled
+ * trade therefore booked exactly minus the charges, and looked like a real flat day.
+ *
+ * It survived because the settlement path had never run on a real trade: the journal was empty
+ * until a backfill filled it, and backfilled rows arrive already settled. The first live signal to
+ * reach settlement (AUBANK, 2026-08-25) exposed it immediately.
+ */
+export function sessionBars(
+  raw: UpstoxCandle[],
+): Array<{ minute: number; high: number; low: number; close: number }> {
+  return raw
+    .map((c) => ({
+      minute: Math.max(0, istMinutes(c[0] * 1000) - SESSION_OPEN_MIN),
+      high: c[2], low: c[3], close: c[4],
+    }))
+    .sort((a, b) => a.minute - b.minute);
+}
+
+/**
  * Fetch each open contract's own candles and write the authoritative exit.
  *
  * Runs after the square-off minute, and on boot for any earlier day left unsettled — which is
@@ -353,11 +379,7 @@ export async function settleDay(day: string, nowMs = Date.now()): Promise<number
     const key = t.contract!.instrumentKey;
     if (fetched.has(key)) continue;
     try {
-      const raw = await sessionCandles(key, day, today, 'minutes', 1);
-      fetched.set(key, raw.map((c) => ({
-        minute: Math.max(0, istMinutes(c[0]) - SESSION_OPEN_MIN),
-        high: c[2], low: c[3], close: c[4],
-      })).sort((a, b) => a.minute - b.minute));
+      fetched.set(key, sessionBars(await sessionCandles(key, day, today, 'minutes', 1)));
     } catch {
       fetched.set(key, []);
     }
