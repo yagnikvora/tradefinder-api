@@ -36,6 +36,8 @@ import { seedSession, seedStatus, type SeedOutcome } from './data/session-seed.j
 import { resetUniverse } from './data/universe.js';
 import { istDay, istMinutes, marketOpen, SESSION_CLOSE_MIN } from './session.js';
 import { journalBoot, journalSettleDue, journalTick } from './journal/journal.js';
+import { flushCandidateLog } from './alerts/displacement.js';
+import { archiveNearMisses } from './journal/near-miss.js';
 import { sessionBellTick } from '../alerts/session-bell.js';
 import { checkTelegram } from '../alerts/telegram.js';
 import { checkDiscord } from '../alerts/discord.js';
@@ -280,6 +282,16 @@ export async function startScheduler(): Promise<void> {
   every(2 * 60_000, () => void journalSettleDue().catch((e) => {
     lastError = { at: Date.now(), message: `journal settle: ${String((e as Error).message)}` };
   }));
+  // The candidate log, written once the displacement window has closed. On the same slow timer as
+  // the settle because it is the same kind of job — idempotent, catches up after a restart, and of
+  // no consequence if a tick is missed.
+  every(2 * 60_000, () => void flushCandidateLog().catch(() => {}));
+
+  // Once an hour after the window: price the qualifiers the cap turned away, while their contracts
+  // still exist. This is the only job here with a genuine deadline — an option series expires in
+  // about four weeks and its candles become unfetchable the moment it does, so a near miss not
+  // archived inside that window can never be priced. Idempotent, so an hourly retry costs nothing.
+  every(60 * 60_000, () => void archiveNearMisses(istDay(Date.now())).catch(() => {}));
   // Once on boot: push any local history the shared store has never seen — which is what
   // backfills the day a database is first configured — then close off anything left open.
   void journalBoot().then(() => journalSettleDue()).catch(() => {});

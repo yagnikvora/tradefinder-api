@@ -56,6 +56,62 @@ CREATE INDEX IF NOT EXISTS momentum_journal_day_idx ON momentum_journal (day DES
 CREATE INDEX IF NOT EXISTS momentum_journal_day_channel_idx ON momentum_journal (day, channel);
 CREATE INDEX IF NOT EXISTS momentum_journal_unsettled_idx ON momentum_journal (settled, day)
     WHERE settled = false;
+
+-- The traded contract's own minute path, kept because it is PERISHABLE and the journal is not.
+--
+-- Upstox answers UDAPI100011 "Invalid Instrument key" for any contract whose series has expired.
+-- On 2026-08-27 that made every July and August option in this journal unfetchable, and an
+-- exit-rule study across 61 settled trades became impossible — the trades were still there, but
+-- the evidence needed to ask a NEW question of them was gone. A row here is about 8 KB, so three
+-- months of signals is single-digit megabytes: the cheapest insurance in this project.
+--
+-- The bars column is [[minute, high, low, close], ...] for the WHOLE session, not merely from the
+-- entry minute, so a later study can move the ENTRY as well as the exit.
+CREATE TABLE IF NOT EXISTS momentum_option_path (
+    day             DATE         NOT NULL,
+    instrument_key  TEXT         NOT NULL,
+    symbol          TEXT         NOT NULL,
+    strike          NUMERIC,
+    opt_type        TEXT,
+    expiry          DATE,
+    lot_size        INTEGER,
+    -- 'traded' is the contract the alert actually bought. Room for 'neighbour' later, so a
+    -- strike-selection study does not need a second table.
+    role            TEXT         NOT NULL DEFAULT 'traded',
+    bars            JSONB        NOT NULL,
+    saved_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    PRIMARY KEY (day, instrument_key)
+);
+
+CREATE INDEX IF NOT EXISTS momentum_option_path_day_idx ON momentum_option_path (day DESC);
+CREATE INDEX IF NOT EXISTS momentum_option_path_symbol_idx ON momentum_option_path (symbol, day DESC);
+
+-- What the rule CONSIDERED each morning, including everything it refused.
+--
+-- Without this, raising DISPLACEMENT_MIN_RVOL from 5 to 8 is untestable after the fact: the RVOL
+-- of the symbols that did not fire was never written down. The ticks column holds the gate metrics
+-- minute by minute for symbols in contention, and those metrics embed the LIVE baseline — the
+-- part that genuinely cannot be reconstructed later, because the baseline is rebuilt and
+-- overwritten every morning while equity candles stay fetchable for months.
+--
+-- taken/taken_minute are what make a capacity study possible: which candidates the per-day cap
+-- turned away, and at what time it filled.
+CREATE TABLE IF NOT EXISTS momentum_candidate (
+    day           DATE         NOT NULL,
+    channel       TEXT         NOT NULL,
+    symbol        TEXT         NOT NULL,
+    taken         BOOLEAN      NOT NULL DEFAULT false,
+    taken_minute  INTEGER,
+    first_minute  INTEGER      NOT NULL,
+    last_minute   INTEGER      NOT NULL,
+    peak_rvol     NUMERIC,
+    ticks         JSONB        NOT NULL,
+    saved_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    PRIMARY KEY (day, channel, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS momentum_candidate_day_idx ON momentum_candidate (day DESC);
+CREATE INDEX IF NOT EXISTS momentum_candidate_taken_idx ON momentum_candidate (day, taken);
 `;
 
 /* ------------------------------------------------------------------------- the driver --- */
@@ -269,6 +325,96 @@ export class PostgresJournalRepository implements JournalRepository {
  * operator or a log line ever handling the connection string. Returns the steps it got through so
  * a failure names the one that broke rather than reporting "database error".
  */
+/** One contract's session, as the archive stores it. */
+export interface OptionPathRow {
+  day: string;
+  instrumentKey: string;
+  symbol: string;
+  strike: number | null;
+  optType: string | null;
+  expiry: string | null;
+  lotSize: number | null;
+  role: string;
+  bars: Array<[number, number, number, number]>;
+}
+
+/**
+ * Save contract paths, skipping any already stored.
+ *
+ * `ON CONFLICT DO NOTHING` rather than an upsert on purpose: a finished session's candles do not
+ * change, so the first copy written is the right one, and a re-settle must not be able to
+ * overwrite a good path with an empty answer from a since-expired key.
+ */
+export async function savePaths(db: Queryable, rows: OptionPathRow[]): Promise<number> {
+  if (!rows.length) return 0;
+  let n = 0;
+  for (const r of rows) {
+    const { rowCount } = await run(
+      db,
+      `INSERT INTO momentum_option_path
+         (day, instrument_key, symbol, strike, opt_type, expiry, lot_size, role, bars)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+       ON CONFLICT (day, instrument_key) DO NOTHING`,
+      [r.day, r.instrumentKey, r.symbol, r.strike, r.optType, r.expiry, r.lotSize, r.role,
+        JSON.stringify(r.bars)],
+    );
+    n += rowCount ?? 0;
+  }
+  return n;
+}
+
+/** One symbol's morning, as the candidate log stores it. */
+export interface CandidateRow {
+  day: string;
+  channel: string;
+  symbol: string;
+  taken: boolean;
+  takenMinute: number | null;
+  firstMinute: number;
+  lastMinute: number;
+  peakRvol: number;
+  ticks: Array<[number, number, number, number, number, number, number, 1 | -1]>;
+}
+
+/**
+ * Save the day's candidates.
+ *
+ * Upsert rather than DO NOTHING, unlike the path archive: a session can legitimately be re-flushed
+ * — a restart mid-morning, or a manual re-run — and the later write is the more complete one,
+ * because `taken` is only correct once the window has closed.
+ */
+export async function saveCandidates(db: Queryable, rows: CandidateRow[]): Promise<number> {
+  if (!rows.length) return 0;
+  let n = 0;
+  for (const r of rows) {
+    const { rowCount } = await run(
+      db,
+      `INSERT INTO momentum_candidate
+         (day, channel, symbol, taken, taken_minute, first_minute, last_minute, peak_rvol, ticks)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+       ON CONFLICT (day, channel, symbol) DO UPDATE SET
+         taken = EXCLUDED.taken, taken_minute = EXCLUDED.taken_minute,
+         first_minute = EXCLUDED.first_minute, last_minute = EXCLUDED.last_minute,
+         peak_rvol = EXCLUDED.peak_rvol, ticks = EXCLUDED.ticks, saved_at = now()`,
+      [r.day, r.channel, r.symbol, r.taken, r.takenMinute, r.firstMinute, r.lastMinute,
+        r.peakRvol, JSON.stringify(r.ticks)],
+    );
+    n += rowCount ?? 0;
+  }
+  return n;
+}
+
+/** What the archive holds, for the status endpoint and the tools. */
+export async function pathStats(db: Queryable): Promise<{ paths: number; days: number; from: string | null; to: string | null }> {
+  const { rows } = await run<{ n: string; d: string; lo: string | null; hi: string | null } & QueryResultRow>(
+    db,
+    `SELECT count(*)::text AS n, count(DISTINCT day)::text AS d,
+            min(day)::text AS lo, max(day)::text AS hi FROM momentum_option_path`,
+  );
+  const r = rows[0];
+  return { paths: Number(r?.n ?? 0), days: Number(r?.d ?? 0), from: r?.lo ?? null, to: r?.hi ?? null };
+}
+
 export async function probe(db: Queryable): Promise<{ step: string; ok: boolean; detail?: string }[]> {
   const steps: { step: string; ok: boolean; detail?: string }[] = [];
   const mark = async (step: string, fn: () => Promise<string | void>) => {

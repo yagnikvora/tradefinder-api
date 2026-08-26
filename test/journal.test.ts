@@ -13,7 +13,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { gradePath, journalConfig, sessionBars, SHADOW } from '../src/momentum/journal/journal.js';
+import { gradePath, gradeRule, journalConfig, sessionBars, SHADOW } from '../src/momentum/journal/journal.js';
 import type { UpstoxCandle } from '../src/upstox.js';
 
 /** A minute bar on the option's own premium. */
@@ -190,5 +190,64 @@ describe('journal · sessionBars', () => {
       candle('2026-08-25T09:30:00+05:30', 1, 1, 1),
     ]);
     assert.deepEqual(bars.map((b) => b.minute), [15, 105]);
+  });
+});
+
+// `gradeRule` grades the exits whose STOP MOVES — breakeven and trailing. It exists because a
+// fixed pair cannot express the failure the record actually shows: a position up 25% at 11:00 that
+// is handed to the square-off at a loss. The tests below pin the one detail that decides whether
+// its answers are believable rather than fantasy — a trail must lag the peak by a bar.
+describe('journal · gradeRule (moving stops)', () => {
+  const RULE_TRAIL = { name: 't', tp: 0.80, sl: 0.50, armAt: 0.20, trail: 0.15 } as const;
+  const RULE_BE = { name: 'be', tp: 0.80, sl: 0.50, armAt: 0.20, trail: 'breakeven' as const };
+
+  it('does not trail from a peak set by the same bar', () => {
+    // One bar runs to +40% and back to +10%. A trail of 15 points off THIS bar's own high would
+    // exit at +25%; the real trail had not moved yet when the low printed, so it must not fire.
+    const r = gradeRule([bar(20, PAID * 1.10, PAID * 1.40)], PAID, FROM, RULE_TRAIL, LAST);
+    assert.equal(r.out, 'close', 'a bar must not be stopped on a trail derived from its own high');
+  });
+
+  it('trails from the previous bar peak once armed', () => {
+    // Bar 20 peaks at +40%, so from bar 40 the trail sits at +25%. Bar 40 dips to +20%.
+    const r = gradeRule(
+      [bar(20, PAID * 1.30, PAID * 1.40), bar(40, PAID * 1.20, PAID * 1.35)],
+      PAID, FROM, RULE_TRAIL, LAST,
+    );
+    assert.equal(r.out, 'stop');
+    assert.ok(Math.abs(r.pct - 0.25) < 1e-9, `expected +25%, got ${r.pct}`);
+  });
+
+  it('leaves the stop alone until the arming level is reached', () => {
+    // Peaks at +15%, never arms, then collapses to the original -50%.
+    const r = gradeRule(
+      [bar(20, PAID * 1.05, PAID * 1.15), bar(40, PAID * 0.40, PAID * 0.90)],
+      PAID, FROM, RULE_TRAIL, LAST,
+    );
+    assert.equal(r.out, 'stop');
+    assert.ok(Math.abs(r.pct + 0.50) < 1e-9, `expected the -50% stop, got ${r.pct}`);
+  });
+
+  it('a breakeven rule exits at entry, not at a profit', () => {
+    const r = gradeRule(
+      [bar(20, PAID * 1.20, PAID * 1.30), bar(40, PAID * 0.80, PAID * 1.10)],
+      PAID, FROM, RULE_BE, LAST,
+    );
+    assert.equal(r.out, 'stop');
+    assert.equal(r.pct, 0);
+  });
+
+  it('still resolves a two-sided bar as the stop', () => {
+    const r = gradeRule([bar(20, PAID * 0.40, PAID * 1.90)], PAID, FROM,
+      { name: 'x', tp: 0.80, sl: 0.50 }, LAST);
+    assert.equal(r.out, 'stop');
+  });
+
+  it('reduces to gradePath when the rule has no moving stop', () => {
+    const path = [bar(20, PAID * 0.90, PAID * 1.10), bar(40, PAID * 0.95, PAID * 1.30)];
+    const plain = gradePath(path, PAID, FROM, 0.80, 0.50, LAST);
+    const viaRule = gradeRule(path, PAID, FROM, { name: 'x', tp: 0.80, sl: 0.50 }, LAST);
+    assert.equal(viaRule.out, plain.out);
+    assert.ok(Math.abs(viaRule.pct - plain.pct) < 1e-9);
   });
 });

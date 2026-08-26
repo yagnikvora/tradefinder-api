@@ -43,7 +43,10 @@ import {
   FileJournalRepository, MirrorJournalRepository,
   type JournalRepository, type JournalSyncStatus,
 } from './repository.js';
-import { databaseUrl, PostgresJournalRepository } from './postgres.js';
+import {
+  databaseUrl, getPool, PostgresJournalRepository, savePaths, type OptionPathRow,
+} from './postgres.js';
+import { store, STORE_KEYS } from '../store.js';
 import type {
   JournalChannel, JournalContract, JournalEntryInput, JournalShadow, JournalTrade,
 } from './types.js';
@@ -90,11 +93,49 @@ export const journalConfig = () => ({
   backfillDays: num('JOURNAL_BACKFILL_DAYS', 120, 1, 3650),
 });
 
-/** The alternative exits every trade is also scored under, on the same candle path. */
-export const SHADOW: Array<{ name: string; tp: number; sl: number }> = [
+/**
+ * An exit rule the journal can grade a path under — the shipped one, or an alternative.
+ *
+ * `armAt`/`trail` are what make a rule PATH-DEPENDENT rather than two fixed price levels. They
+ * exist because two fixed levels cannot express the thing the record actually shows going wrong:
+ * a position that was up 25% at 11:00 and was handed to the square-off at a loss.
+ */
+export interface ExitRule {
+  name: string;
+  tp: number;
+  sl: number;
+  /** Once the position has been up this much, the stop moves. Omitted = it never moves. */
+  armAt?: number;
+  /** Where it moves to: 'breakeven', or this many points below the running peak. */
+  trail?: number | 'breakeven';
+}
+
+/**
+ * The alternatives every settled trade is re-scored under, on its own candles.
+ *
+ * WHY THE TRAILING ONES WERE ADDED (2026-08-27). Over the first 65 trades the record decomposes
+ * into 5 trades that reached +80% and paid ₹78,723 — more than the whole book's profit — 54
+ * square-offs worth ₹26,305, and 6 stops costing ₹47,449. Two conclusions follow and they pull in
+ * opposite directions: the rare full winners ARE the edge, so no rule that caps the upside can be
+ * adopted (+30/-50 and +60/-30 both score worse here on real paths); but 17 trades were up 15% or
+ * more and still closed red, which is ₹67,340 of profit handed back to the clock.
+ *
+ * A trail is the only shape that can protect the second without capping the first. Whether it
+ * actually does cannot be answered from the trades already recorded — reconstructing a trail from
+ * a stored peak is look-ahead, because the real thing trails the RUNNING peak and would exit at
+ * the first retrace from an intermediate high. So these are graded live, on real paths, and the
+ * shipped exit stays where it is until they have enough trades to be worth reading.
+ *
+ * Arming levels are deliberately high. Of the 6 stops, 4 never got above +11%, so a low arm mostly
+ * converts trades that were going to lose anyway while clipping the winners that carry the book.
+ */
+export const SHADOW: ExitRule[] = [
   { name: '+30/-15', tp: 0.30, sl: 0.15 },
   { name: '+30/-50', tp: 0.30, sl: 0.50 },
   { name: '+60/-30', tp: 0.60, sl: 0.30 },
+  { name: 'BE@+20', tp: 0.80, sl: 0.50, armAt: 0.20, trail: 'breakeven' },
+  { name: 'trail25@+40', tp: 0.80, sl: 0.50, armAt: 0.40, trail: 0.25 },
+  { name: 'trail30@+50', tp: 0.80, sl: 0.50, armAt: 0.50, trail: 0.30 },
 ];
 
 /* ------------------------------------------------------------------------- the store --- */
@@ -333,6 +374,50 @@ export function gradePath(
 }
 
 /**
+ * Grade a path under a rule whose stop can MOVE — a breakeven or a trailing exit.
+ *
+ * `gradePath` above stays as it is because it grades the shipped exit and the tests pin it; this
+ * is the generalisation the shadow rules need, and it reduces to the same answer when a rule has
+ * no `armAt`.
+ *
+ * TWO THINGS HERE ARE LOAD-BEARING AND MUST SURVIVE AN EDIT.
+ *
+ *   THE TRAIL IS COMPUTED FROM THE PREVIOUS BAR'S PEAK, never this bar's high. Letting one bar
+ *   both set a new high and be stopped on the trail derived from that same high is how a
+ *   backtest sells every top: in the real session the trail had not moved yet when the low
+ *   printed. This single line is the difference between a believable result and a fantasy.
+ *
+ *   THE STOP IS STILL CHECKED BEFORE THE TARGET, so an ambiguous minute resolves against the
+ *   trade, exactly as everywhere else in this file.
+ */
+export function gradeRule(
+  bars: Array<{ minute: number; high: number; low: number; close: number }>,
+  paid: number,
+  fromMinute: number,
+  rule: ExitRule,
+  lastMinute: number,
+): { pct: number; out: 'target' | 'stop' | 'close'; minute: number } {
+  let peak = 0, lastClose = paid, lastMin = fromMinute;
+  for (const b of bars) {
+    if (b.minute <= fromMinute || b.minute > lastMinute) continue;
+    const up = (b.high - paid) / paid;
+    const down = (b.low - paid) / paid;
+
+    let stop = -rule.sl;
+    if (rule.armAt !== undefined && rule.trail !== undefined && peak >= rule.armAt) {
+      stop = rule.trail === 'breakeven' ? 0 : Math.max(-rule.sl, peak - rule.trail);
+    }
+
+    if (down <= stop) return { pct: stop, out: 'stop', minute: b.minute };
+    if (up >= rule.tp) return { pct: rule.tp, out: 'target', minute: b.minute };
+
+    if (up > peak) peak = up;
+    lastClose = b.close; lastMin = b.minute;
+  }
+  return { pct: (lastClose - paid) / paid, out: 'close', minute: lastMin };
+}
+
+/**
  * Upstox candles to the minute-of-session bars `gradePath` grades.
  *
  * EXTRACTED SO IT CAN BE TESTED, because the one line in it was wrong for the life of the module
@@ -356,6 +441,64 @@ export function sessionBars(
       high: c[2], low: c[3], close: c[4],
     }))
     .sort((a, b) => a.minute - b.minute);
+}
+
+/** One archived contract path: `[minute, high, low, close]` per bar. */
+export type ArchivedPath = Array<[number, number, number, number]>;
+
+/**
+ * Keep every settled contract's candle path, keyed by trade id.
+ *
+ * Stored through the same `store` the rest of the module uses, one document a month, so it lands
+ * beside the journal and is copied with it. Never throws — an archive that can break settlement
+ * would be trading the record for a research convenience.
+ */
+async function archivePaths(
+  day: string,
+  trades: JournalTrade[],
+  fetched: Map<string, Array<{ minute: number; high: number; low: number; close: number }>>,
+): Promise<void> {
+  const compact = new Map<string, ArchivedPath>();
+  for (const t of trades) {
+    if (!t.contract) continue;
+    const bars = fetched.get(t.contract.instrumentKey);
+    if (!bars?.length || compact.has(t.id)) continue;
+    compact.set(t.id, bars.map((b) => [b.minute, b.high, b.low, b.close] as [number, number, number, number]));
+  }
+  if (!compact.size) return;
+
+  // Local disk FIRST, for the same reason the journal writes locally first: disk is milliseconds
+  // and cannot be unreachable, and this is the copy that must exist before the key expires.
+  const key = `${STORE_KEYS.journalPaths}_${day.slice(0, 7)}`;
+  const doc = (await store.read<Record<string, ArchivedPath>>(key)) ?? {};
+  let added = 0;
+  for (const [id, bars] of compact) {
+    if (doc[id]) continue;
+    doc[id] = bars;
+    added++;
+  }
+  if (added) await store.write(key, doc);
+
+  // Then the shared store, best effort. A failure here is logged by the caller's catch and costs
+  // nothing permanent — the local copy is already safe and `journal-archive-push` can retry it.
+  if (!databaseUrl()) return;
+  const rows: OptionPathRow[] = [];
+  for (const t of trades) {
+    const bars = compact.get(t.id);
+    if (!bars || !t.contract) continue;
+    rows.push({
+      day: t.day,
+      instrumentKey: t.contract.instrumentKey,
+      symbol: t.symbol,
+      strike: t.contract.strike ?? null,
+      optType: t.contract.type ?? null,
+      expiry: t.contract.expiry ?? null,
+      lotSize: t.contract.lotSize ?? null,
+      role: 'traded',
+      bars,
+    });
+  }
+  if (rows.length) await savePaths(getPool(), rows);
 }
 
 /**
@@ -384,6 +527,15 @@ export async function settleDay(day: string, nowMs = Date.now()): Promise<number
       fetched.set(key, []);
     }
   }
+
+  // THE PATH IS ARCHIVED BEFORE ANYTHING IS GRADED, because it is perishable in a way nothing
+  // else here is. Upstox answers `UDAPI100011 Invalid Instrument key` for a contract whose series
+  // has expired — verified on 2026-08-27, when every July and August option in this journal became
+  // unfetchable and an exit-rule study across 61 settled trades could no longer be run at all. The
+  // trades survived; the evidence needed to ask a NEW question of them did not.
+  //
+  // Compact on purpose: [minute, high, low, close] per bar, which is everything `gradeRule` reads.
+  await archivePaths(day, pending, fetched).catch(() => {});
 
   const done: JournalTrade[] = [];
   for (const t of pending) {
@@ -416,7 +568,7 @@ export async function settleDay(day: string, nowMs = Date.now()): Promise<number
     t.mfeMinute = r.mfeMinute;
     t.maeMinute = r.maeMinute;
     t.shadow = SHADOW.map((s): JournalShadow => {
-      const w = gradePath(bars, t.entry.premium, t.entry.minute, s.tp, s.sl, cfg.squareOffMin);
+      const w = gradeRule(bars, t.entry.premium, t.entry.minute, s, cfg.squareOffMin);
       return { name: s.name, pct: +w.pct.toFixed(4), out: w.out, minute: w.minute };
     });
     t.status = 'closed';

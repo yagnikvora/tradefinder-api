@@ -137,9 +137,14 @@ describe('journal postgres · the schema', () => {
     assert.equal(db.calls.filter((c) => c.sql === SCHEMA).length, 1);
   });
 
-  it('creates the table and its indexes without dropping anything', () => {
+  it('creates every table and index without dropping anything', () => {
     assert.ok(SCHEMA.includes('CREATE TABLE IF NOT EXISTS momentum_journal'));
-    assert.equal((SCHEMA.match(/CREATE INDEX IF NOT EXISTS/g) ?? []).length, 3);
+    // The two archives. Neither absence is a cosmetic gap: an expired option series cannot be
+    // re-fetched, and a candidate the rule refused is never written down anywhere else — so a day
+    // missed by either table is a day no future study can ask a new question of.
+    assert.ok(SCHEMA.includes('CREATE TABLE IF NOT EXISTS momentum_option_path'));
+    assert.ok(SCHEMA.includes('CREATE TABLE IF NOT EXISTS momentum_candidate'));
+    assert.equal((SCHEMA.match(/CREATE INDEX IF NOT EXISTS/g) ?? []).length, 7);
     // Two machines run this on boot against the same database, and it must be safe every time.
     assert.ok(!/DROP|TRUNCATE|DELETE/i.test(SCHEMA), 'the schema must never destroy data');
   });

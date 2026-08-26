@@ -91,6 +91,23 @@ export const STORE_KEYS = {
    */
   sessionBell: 'session_bell',
   /**
+   * Settled contracts' own candle paths, one document a month, keyed by trade id.
+   *
+   * Kept because the source is perishable and the journal is not: once an option series expires
+   * Upstox rejects its instrument key outright, so a path not saved before expiry can never be
+   * fetched again. Without it the trades remain but no NEW exit rule can ever be tested against
+   * them. See `archivePaths` in journal/journal.ts.
+   */
+  journalPaths: 'journal_paths',
+  /**
+   * What each alert channel considered but did not take, per month.
+   *
+   * Its own key rather than a field on the journal because a candidate is not a trade: it has no
+   * contract, no money and no exit, and forcing it into the trade shape would mean a journal full
+   * of rows that are not positions. See `alerts/candidates.ts`.
+   */
+  candidates: 'candidates',
+  /**
    * Daily OHLC bars per symbol, so the baseline stops re-downloading 270 unchanged bars a
    * symbol on every build. See `data/daily-cache.ts` for what it does and does not save.
    */

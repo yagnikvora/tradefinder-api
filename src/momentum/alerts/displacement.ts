@@ -62,6 +62,7 @@ import { selectStrike } from '../services/strike.service.js';
 import type { MomentumConfig, StrikeChoice } from '../types.js';
 import type { MomentumQuote } from '../data/quotes.js';
 import { recordEntries } from '../journal/journal.js';
+import { flushCandidates, markTaken, observeCandidates } from './candidates.js';
 import { HTML, istClock, MARKDOWN, type Markup } from '../../alerts/markup.js';
 import { discordConfigured, sendDiscord } from '../../alerts/discord.js';
 import { sendTelegram, telegramConfigured } from '../../alerts/telegram.js';
@@ -390,6 +391,11 @@ export async function onScan(
 
     const day = istDay(nowMs);
     const state = await load(day);
+
+    // Logged BEFORE the cap check, on purpose: the candidates a full cap turns away are exactly
+    // the ones a capacity study needs, and returning early here is what threw them away before.
+    observeCandidates(inputs, minute, r, nowMs);
+
     if (state.announced.length >= r.maxPerDay) return [];
 
     const announced = new Set(state.announced);
@@ -419,11 +425,26 @@ export async function onScan(
         offExtremeAtr: c.offExtremeAtr, atr: c.atr, turnoverCr: c.turnoverCr, changePct: c.changePct,
       },
     })), nowMs);
+    markTaken(picked.map((c) => ({ symbol: c.symbol, minute: c.minute })), nowMs);
     return picked;
   } catch (e) {
     lastError = String((e as Error).message);
     return [];
   }
+}
+
+/**
+ * Write the candidate log, once the window it describes has closed.
+ *
+ * Called from the scheduler rather than from `onScan`, because the log's `taken` column is only
+ * true once the last in-window tick has delivered — flushing on the final tick itself would record
+ * that minute's picks as "not taken", which is a lie in the one column a capacity study reads.
+ * Idempotent: the day's log flushes once and then ignores further calls.
+ */
+export async function flushCandidateLog(nowMs = Date.now()): Promise<number> {
+  const r = rule();
+  if (minuteOfSession(nowMs) <= r.toMinute) return 0;
+  return flushCandidates(nowMs);
 }
 
 /**
