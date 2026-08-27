@@ -232,7 +232,7 @@ export async function recordEntries(
         id, day, channel, symbol: r.symbol, direction: r.direction,
         contract, lots: cfg.lots,
         entry: { at: nowMs, minute: r.minute ?? minute, premium: +paid.toFixed(2), spot: r.spot, source: 'auto' },
-        exit: null, mark: null, mfePct: null, maePct: null,
+        exit: null, mark: null, mfePct: null, maePct: null, markedFrom: null,
         spreadPctAtEntry: r.strike?.spreadPct ?? null,
         amountUsed: null, grossPnl: null, charges: null, netPnl: null, netPct: null,
         shadow: [],
@@ -301,6 +301,20 @@ export async function journalTick(nowMs = Date.now()): Promise<void> {
       t.mark = { at: nowMs, premium: +out.toFixed(2), pct: +pct.toFixed(4) };
       // The minute is recorded only when the extreme actually moves, so it always names the tick
       // that set it rather than the tick that last looked.
+      // Where the tick-by-tick record of this row begins.
+      //
+      // Only ever decided on the first mark, because that is the only moment it is knowable.
+      // Once the row carries excursions this must not be recomputed: `null` there means "candles
+      // covered the whole trade", which is what `backfillExcursions` and `settleDay` write, and
+      // re-deriving it from the extremes would undo their work on the very next tick.
+      if (t.mfePct === null) {
+        t.markedFrom = minute > t.entry.minute + 2 ? minute : null;
+      } else if (t.markedFrom === undefined) {
+        // A row from before this field existed. Dated from the earliest extreme it managed to
+        // record rather than from now, which would claim a blind window wider than the real one.
+        const seen = [t.mfeMinute, t.maeMinute].filter((m): m is number => m !== null && m !== undefined);
+        t.markedFrom = seen.length ? Math.min(...seen) : null;
+      }
       if (t.mfePct === null || pct > t.mfePct) { t.mfePct = pct; t.mfeMinute = minute; }
       if (t.maePct === null || pct < t.maePct) { t.maePct = pct; t.maeMinute = minute; }
       t.updatedAt = nowMs;
@@ -502,6 +516,80 @@ async function archivePaths(
 }
 
 /**
+ * Fill in the excursions of a position that was not watched from the start.
+ *
+ * The live pass builds `mfePct`/`maePct` tick by tick, so a row first marked at 02:09 PM knows
+ * nothing about the five hours before it — and the trade's own 1-minute candles have known all
+ * along. This reads them and replaces the partial figures with the real ones.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO IS CLOSE ANYTHING.
+ *
+ * A path that reached the target or the stop inside the blind window is a trade that, by the
+ * rules, should already have exited — and settling it here would be the tidy answer. It is also
+ * the answer that reaches into a position the operator may still be holding and books an exit
+ * they never took, on the strength of a candle nobody was watching. So the breach is written to
+ * the note instead, and the exit is left to `settleDay`, which grades the whole path from entry
+ * at square-off and will find the same level honestly.
+ *
+ * Self-limiting: clearing `markedFrom` is what takes a row out of the selection, so each one is
+ * fetched at most once no matter how often the timer fires.
+ */
+export async function backfillExcursions(day: string, nowMs = Date.now()): Promise<number> {
+  const cfg = journalConfig();
+  if (!cfg.enabled) return 0;
+  const repo = journalRepository();
+  const today = istDay(nowMs);
+
+  const gapped = (await repo.mine(day)).filter((t) => {
+    if (t.status !== 'open' || !t.contract || t.edited) return false;
+    // Never marked at all, or marked from well after entry. Two minutes of slack because the
+    // first mark landing a tick after the entry is not a gap.
+    if (t.mfePct === null) return true;
+    return t.markedFrom !== null && t.markedFrom !== undefined && t.markedFrom > t.entry.minute + 2;
+  });
+  if (!gapped.length) return 0;
+
+  const changed: JournalTrade[] = [];
+  for (const t of gapped) {
+    let bars: Array<{ minute: number; high: number; low: number; close: number }>;
+    try {
+      bars = sessionBars(await sessionCandles(t.contract!.instrumentKey, day, today, 'minutes', 1));
+    } catch {
+      continue; // Leave the gap flagged. A row that still says so is better than one that lies.
+    }
+    const path = bars.filter((b) => b.minute >= t.entry.minute);
+    if (!path.length) continue;
+
+    const paid = t.entry.premium;
+    let mfe = 0, mae = 0, mfeMinute: number | null = null, maeMinute: number | null = null;
+    let breach: { out: 'target' | 'stop'; minute: number } | null = null;
+    for (const b of path) {
+      const up = (b.high - paid) / paid, down = (b.low - paid) / paid;
+      if (down < mae) { mae = down; maeMinute = b.minute; }
+      if (up > mfe) { mfe = up; mfeMinute = b.minute; }
+      // Stop before target, the same way round `gradePath` resolves a bar that touches both.
+      if (!breach && down <= -cfg.slPct) breach = { out: 'stop', minute: b.minute };
+      if (!breach && up >= cfg.tpPct) breach = { out: 'target', minute: b.minute };
+    }
+
+    t.mfePct = +mfe.toFixed(4);
+    t.maePct = +mae.toFixed(4);
+    t.mfeMinute = mfeMinute;
+    t.maeMinute = maeMinute;
+    // The candles ran from entry, so there is no longer a window this row cannot account for.
+    t.markedFrom = null;
+    if (breach) {
+      const said = `${breach.out} touched at minute ${breach.minute} while unwatched`;
+      if (!t.note.includes(said)) t.note = [t.note, said].filter(Boolean).join(' · ');
+    }
+    t.updatedAt = nowMs;
+    changed.push(t);
+  }
+  if (changed.length) await repo.save(changed);
+  return changed.length;
+}
+
+/**
  * Fetch each open contract's own candles and write the authoritative exit.
  *
  * Runs after the square-off minute, and on boot for any earlier day left unsettled — which is
@@ -567,6 +655,9 @@ export async function settleDay(day: string, nowMs = Date.now()): Promise<number
     t.maePct = +r.mae.toFixed(4);
     t.mfeMinute = r.mfeMinute;
     t.maeMinute = r.maeMinute;
+    // The candles run from entry whatever the marker was doing at the time, so whatever gap the
+    // live pass left is now closed and the row should stop advertising one.
+    t.markedFrom = null;
     t.shadow = SHADOW.map((s): JournalShadow => {
       const w = gradeRule(bars, t.entry.premium, t.entry.minute, s, cfg.squareOffMin);
       return { name: s.name, pct: +w.pct.toFixed(4), out: w.out, minute: w.minute };

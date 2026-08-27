@@ -60,6 +60,21 @@ export interface JournalTrade {
    */
   mfeMinute?: number | null;
   maeMinute?: number | null;
+  /**
+   * Session minute of the FIRST live mark on this row, and so the point from which the two
+   * excursions above are actually known.
+   *
+   * It exists because those excursions are built tick by tick, which quietly assumes the marker
+   * was running for the whole trade. When it was not — the process started late, the feed was
+   * down for the morning, the machine was asleep — the row still reports a confident best and
+   * worst, and they describe only the part of the day that happened to be watched. A −42% low
+   * "at 02:09 PM" on a position entered at 09:27 is not wrong about the clock; it is wrong about
+   * what it covers, which is worse, because nothing on the row says so.
+   *
+   * Null means full coverage: either the marks began at entry, or `settleDay` has since re-graded
+   * the row from candles, which span the whole trade regardless of what was watched live.
+   */
+  markedFrom?: number | null;
   /** Bid-ask at entry, as a percentage of the mid. The friction the charges figure excludes. */
   spreadPctAtEntry: number | null;
   amountUsed: number | null;

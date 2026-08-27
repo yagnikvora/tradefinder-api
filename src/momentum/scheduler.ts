@@ -35,7 +35,9 @@ import { flushSessionState } from './data/session-state.js';
 import { seedSession, seedStatus, type SeedOutcome } from './data/session-seed.js';
 import { resetUniverse } from './data/universe.js';
 import { istDay, istMinutes, marketOpen, SESSION_CLOSE_MIN } from './session.js';
-import { journalBoot, journalSettleDue, journalTick } from './journal/journal.js';
+import {
+  backfillExcursions, journalBoot, journalSettleDue, journalTick,
+} from './journal/journal.js';
 import { flushCandidateLog } from './alerts/displacement.js';
 import { archiveNearMisses } from './journal/near-miss.js';
 import { sessionBellTick } from '../alerts/session-bell.js';
@@ -281,6 +283,13 @@ export async function startScheduler(): Promise<void> {
   }));
   every(2 * 60_000, () => void journalSettleDue().catch((e) => {
     lastError = { at: Date.now(), message: `journal settle: ${String((e as Error).message)}` };
+  }));
+  // Repair the excursions of anything that was not watched from entry — a feed that was down
+  // this morning, a process started at lunch. On the settle's timer because it is the same kind
+  // of job and spends the same kind of request, and it costs nothing on a normal day: a row
+  // drops out of the selection the moment it is filled, so there is usually nothing to fetch.
+  every(2 * 60_000, () => void backfillExcursions(istDay(Date.now())).catch((e) => {
+    lastError = { at: Date.now(), message: `journal backfill: ${String((e as Error).message)}` };
   }));
   // The candidate log, written once the displacement window has closed. On the same slow timer as
   // the settle because it is the same kind of job — idempotent, catches up after a restart, and of

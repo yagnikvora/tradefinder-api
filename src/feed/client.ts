@@ -335,8 +335,35 @@ async function connect(): Promise<void> {
 /* ------------------------------------------------------------------- public surface --- */
 
 /** Begin connecting, and keep reconnecting until `stopFeed`. Idempotent. */
+/**
+ * Is there a WebSocket to construct at all?
+ *
+ * `WebSocket` is a global on Node 22 and simply absent on Node 20, so an API started on the
+ * wrong runtime gets a feed that can never connect. That failure used to surface as
+ * `socket construction failed: WebSocket is not defined` on `feed.lastError` — technically
+ * accurate, buried in a status payload nobody reads, and indistinguishable at a glance from a
+ * network problem that might clear on its own. This one cannot clear: no amount of reconnecting
+ * will conjure the global, and everything downstream quietly degrades to REST while the trade
+ * journal's live marks stop entirely.
+ *
+ * So it is checked once, up front, and said out loud in the terminal where the process was
+ * started. `.nvmrc` already pins the version this needs.
+ */
+function webSocketAvailable(): boolean {
+  if (typeof WebSocket !== 'undefined') return true;
+  const msg =
+    `this Node (${process.version}) has no global WebSocket, so the live feed cannot start — ` +
+    'run the API on the version .nvmrc pins (nvm use), or start it with --experimental-websocket';
+  note(msg);
+  console.error(`\n  FEED DISABLED: ${msg}\n`);
+  return false;
+}
+
 export function startFeed(): void {
   if (!enabled() || wanted) return;
+  // Checked before `wanted` is set, so a process on the wrong runtime reports a stopped feed
+  // rather than one that is perpetually "connecting".
+  if (!webSocketAvailable()) return;
   wanted = true;
   attempt = 0;
   void connect();
