@@ -20,6 +20,7 @@
 // gets exactly one retry on the error classes that mean "the socket went away" rather than "your
 // SQL is wrong". Retrying a syntax error forever is how a scanner spends an afternoon failing.
 
+import net from 'node:net';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import type { JournalChannel, JournalTrade } from './types.js';
 import type { JournalRepository, JournalSyncStatus } from './repository.js';
@@ -160,6 +161,23 @@ function withoutSslMode(url: string): { url: string; disable: boolean } {
     return { url, disable: /sslmode=disable/.test(url) };
   }
 }
+
+/**
+ * Give each address in the Happy Eyeballs race long enough to actually finish.
+ *
+ * Node 20 turns `autoSelectFamily` on by default and allows each resolved address 250ms to
+ * complete its TCP handshake. Neon's endpoint resolves to one IPv6 address and three in AWS
+ * us-east-2, and from here the real handshake takes about 550ms — so every attempt overran the
+ * budget, the list was exhausted, and the connection died with ETIMEDOUT in under a second. The
+ * generous `connectionTimeoutMillis` below never got a say, which is what made this look like an
+ * unreachable database rather than a client-side stopwatch.
+ *
+ * 2500ms is the value Node itself moved the default to once the 250ms one proved too tight for
+ * connections that cross an ocean. Set here rather than at the entry point because this is the
+ * only long-haul connection the app makes, and a reader asking why it is needed is already in the
+ * right file.
+ */
+net.setDefaultAutoSelectFamilyAttemptTimeout(2500);
 
 export function getPool(url = databaseUrl()): Pool {
   if (!url) throw new Error('DATABASE_URL is not set');
