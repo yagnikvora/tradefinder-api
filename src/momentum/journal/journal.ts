@@ -35,6 +35,12 @@
 // entry and exit it records are the tradeable prices that existed; yours will differ, and
 // `PATCH /momentum/journal/:id` exists so you can replace either with what you actually got.
 // An edited trade is flagged and the page shows it as yours rather than the system's.
+//
+// THE ONE EXIT THAT IS NOT A RULE is `POST /momentum/journal/:id/exit`, which closes a single
+// open position at the live bid because you have just sold it. It still places no order — it
+// records the exit you took, at the price the feed was showing when you took it — and like an
+// edit it takes the row out of settlement's hands, or the nightly pass would grade your 11:00
+// exit as a 15:15 square-off.
 
 import { istDay, istMinutes, SESSION_CLOSE_MIN, SESSION_OPEN_MIN } from '../session.js';
 import { feedTick, subscribeKeys } from '../../feed/client.js';
@@ -262,6 +268,26 @@ export async function recordEntries(
 
 /* ---------------------------------------------------------------------- live marking --- */
 
+/**
+ * What a seller would get for one contract right now, straight off the feed.
+ *
+ * THE BID, NOT THE LAST TRADE. An exit is a sale, and pricing it at the LTP records a level
+ * nobody was actually offering. Falling back to the LTP when the book carries no bid is a small
+ * optimism, and it is the same one the running mark has always made.
+ *
+ * `maxAgeMs` is what makes this safe to reuse for a REAL exit rather than a display mark. A tick
+ * left over from this morning is not a price anything can be sold at now, and writing one into
+ * the record as today's exit would invent a fill. The mark pass passes no bound because a stale
+ * mark on screen is visibly stale — the row shows its age — while a stale exit is permanent.
+ */
+function sellSide(key: string, nowMs: number, maxAgeMs = Infinity): number | null {
+  const tick = feedTick(key);
+  if (!tick || nowMs - tick.at > maxAgeMs) return null;
+  const best = tick.depth?.[0];
+  const out = best && best.bidP > 0 ? best.bidP : tick.ltp ?? 0;
+  return out > 0 ? out : null;
+}
+
 /** Ask the feed for every open contract. Idempotent, so calling it every tick is free. */
 async function subscribeOpen(nowMs: number): Promise<void> {
   const day = istDay(nowMs);
@@ -291,11 +317,8 @@ export async function journalTick(nowMs = Date.now()): Promise<void> {
 
   for (const t of await repo.mine(day)) {
     if (t.status !== 'open' || !t.contract) continue;
-    const tick = feedTick(t.contract.instrumentKey);
-    // The bid is what a seller gets. Falling back to the last trade is a small optimism and
-    // only ever affects the live view — the settled record comes from candles.
-    const best = tick?.depth?.[0];
-    const out = best && best.bidP > 0 ? best.bidP : tick?.ltp ?? 0;
+    // No age bound here: the running mark carries its own timestamp and the page shows it.
+    const out = sellSide(t.contract.instrumentKey, nowMs) ?? 0;
     if (out > 0) {
       const pct = (out - t.entry.premium) / t.entry.premium;
       t.mark = { at: nowMs, premium: +out.toFixed(2), pct: +pct.toFixed(4) };
@@ -904,6 +927,77 @@ export async function journalPatch(id: string, patch: JournalPatch): Promise<Jou
   }
   price(t);
   await repo.save([t]);
+  return t;
+}
+
+/**
+ * How stale the feed's last packet may be and still count as a price you can sell at.
+ *
+ * Two minutes rather than a few seconds because a far strike can genuinely go a minute without
+ * printing, and refusing a real exit on a quiet contract is worse than pricing it a minute late.
+ * Past that the honest answer is that nobody knows what it is worth, and the operator types the
+ * fill they actually got.
+ */
+const EXIT_MARK_MAX_AGE_MS = 120_000;
+
+/**
+ * Close ONE open position now, at the live bid, because the operator has just sold it.
+ *
+ * This is the only exit in the file that happens because somebody decided it should. The other
+ * three are rules — the target, the stop and the square-off — and `journalTick` writes those on
+ * its own. That difference is why the row comes out stamped `manual` and `edited`: `settleDay`
+ * skips edited rows, and without that flag the next settlement pass would re-grade this trade
+ * against the shipped +80/−50 path and replace a real 11:04 exit with a modelled 15:15
+ * square-off. The exit that actually happened would be gone from the record.
+ *
+ * It refuses rather than guesses. No contract, already closed, or a feed that has not printed
+ * this instrument in two minutes all return an error, because every one of them would otherwise
+ * be resolved by inventing a price — and an invented exit is indistinguishable from a real one
+ * the moment it is written.
+ *
+ * Returns null when there is no such trade, matching `journalPatch`, so the route can answer 404.
+ */
+export async function journalExitNow(id: string, nowMs = Date.now()): Promise<JournalTrade | null> {
+  const repo = journalRepository();
+  const t = await repo.one(id);
+  if (!t) return null;
+  if (t.status !== 'open' || t.exit) throw new Error('that trade is already closed');
+  if (!t.contract) throw new Error('no contract was resolved for this trade, so there is nothing to sell');
+
+  const out = sellSide(t.contract.instrumentKey, nowMs, EXIT_MARK_MAX_AGE_MS);
+  if (out === null)
+    throw new Error(
+      `the feed has no price for ${t.contract.label} in the last ` +
+      `${Math.round(EXIT_MARK_MAX_AGE_MS / 1000)}s — record the fill you got with “my fill” instead`,
+    );
+
+  const minute = Math.max(0, istMinutes(nowMs) - SESSION_OPEN_MIN);
+  const premium = +out.toFixed(2);
+  const pct = (premium - t.entry.premium) / t.entry.premium;
+
+  // Snapshot before the first mutation, exactly as `journalPatch` does: this is the only copy of
+  // what the market said before the operator overrode it, and it is what "revert to settled"
+  // reads. `exit: null` rather than a copy because the guard above has already established that
+  // there is no exit yet — reverting this row has to put it back to open.
+  if (!t.edited) t.original = { entry: { ...t.entry }, exit: null };
+
+  // The excursions have to bracket the outcome. Exiting at the high of the day and leaving `mfe`
+  // below the exit would show a row that beat its own best price, which reads as a broken record
+  // rather than as the rounding it would actually be.
+  if (t.mfePct === null) t.markedFrom = minute > t.entry.minute + 2 ? minute : null;
+  if (t.mfePct === null || pct > t.mfePct) { t.mfePct = +pct.toFixed(4); t.mfeMinute = minute; }
+  if (t.maePct === null || pct < t.maePct) { t.maePct = +pct.toFixed(4); t.maeMinute = minute; }
+
+  t.mark = { at: nowMs, premium, pct: +pct.toFixed(4) };
+  t.exit = { at: nowMs, minute, premium, spot: null, source: 'manual', reason: 'manual' };
+  t.status = 'closed';
+  t.settled = true;
+  t.edited = true;
+  price(t);
+  await repo.save([t]);
+  // Push it at once rather than waiting for the next tick: this is the row most likely to be
+  // read from the other machine within the minute.
+  await repo.flush().catch(() => {});
   return t;
 }
 

@@ -19,7 +19,8 @@ import { buildMessages, previewAlerts, trendAlertStatus } from './alerts/trend-d
 import { ignitionAlertStatus } from './alerts/ignition.js';
 import { displacementAlertStatus } from './alerts/displacement.js';
 import {
-  journalBoot, journalPatch, journalRange, journalSettleDue, journalStatus, type JournalChannel,
+  journalBoot, journalExitNow, journalPatch, journalRange, journalSettleDue, journalStatus,
+  type JournalChannel,
 } from './journal/journal.js';
 import { databaseUrl, getPool, probe } from './journal/postgres.js';
 import { HTML, MARKDOWN } from '../alerts/markup.js';
@@ -618,6 +619,26 @@ export function momentumRouter(): express.Router {
       send(res, t, 'upstox');
     } catch (e) {
       fail(res, 400, String((e as Error).message));
+    }
+  });
+
+  // ----------------------------------- POST /momentum/journal/:id/exit ---------------
+  //
+  // Sell ONE open position at the live bid, right now, because the operator just did.
+  //
+  // Separate from PATCH rather than folded into it because the two mean different things. PATCH
+  // corrects a price the app already recorded; this ENDS a position that is still running, and
+  // the price it writes comes from the feed at the instant of the click rather than from the
+  // caller. Nothing is sent to a broker — this records the exit, it does not place it.
+  router.post('/journal/:id/exit', async (req: Request, res: Response) => {
+    try {
+      const t = await journalExitNow(String(req.params.id));
+      if (!t) return fail(res, 404, `no journal trade with id ${req.params.id}`);
+      send(res, t, 'upstox');
+    } catch (e) {
+      // 409, not 400: the request was well formed and the refusal is about the state of the
+      // trade or of the feed, which is a thing the page can tell the operator to act on.
+      fail(res, 409, String((e as Error).message));
     }
   });
 
