@@ -25,13 +25,19 @@ export interface JournalFill {
   source: 'auto' | 'manual';
 }
 
-export type ExitReason = 'target' | 'stop' | 'square-off' | 'manual' | 'untracked';
+/**
+ * `checkpoint` is a stop that fired AFTER it had been moved up — the position had already reached
+ * the arming level, so what closed it was the raised stop, not the original one. Kept distinct
+ * from `stop` because the two mean opposite things about the trade: a `stop` is a loss taken at
+ * the full risk, a `checkpoint` is a gain protected.
+ */
+export type ExitReason = 'target' | 'stop' | 'checkpoint' | 'square-off' | 'manual' | 'untracked';
 
 export interface JournalShadow {
   name: string;
   /** The return the alternative pair would have produced, as a fraction of premium. */
   pct: number;
-  out: 'target' | 'stop' | 'close';
+  out: 'target' | 'stop' | 'checkpoint' | 'close';
   minute: number | null;
 }
 

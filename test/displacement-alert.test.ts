@@ -207,10 +207,19 @@ describe('displacement alert — the message', () => {
 
   it('states the exits as premium prices, which need no model', () => {
     const text = buildMessage(c, strike(), MARKDOWN, NOW);
-    // entryCost 10 -> half out at 13.00, rest at 18.00, stop at 5.00
-    assert.match(text, /SELL HALF at ₹13\.00/);
-    assert.match(text, /REST at ₹18\.00/);
+    // entryCost 10 -> checkpoint arms at 12.40, stop parks at 10.20, target 18.00, hard stop 5.00
+    assert.match(text, /touches ₹12\.40/);
+    assert.match(text, /MOVE STOP to ₹10\.20/);
+    assert.match(text, /SELL ALL at ₹18\.00/);
     assert.match(text, /STOP at ₹5\.00/);
+  });
+
+  it('sells the whole position at the target rather than scaling out', () => {
+    // The scale-out this replaced graded worst of every shape tested on the 78 real trades:
+    // booking half caps the rare full winners that carry the book and pays charges twice.
+    const text = buildMessage(c, strike(), MARKDOWN, NOW);
+    assert.doesNotMatch(text, /SELL HALF/);
+    assert.doesNotMatch(text, /REST at/);
   });
 
   it('carries the contract, the lot and what one lot costs', () => {
@@ -229,8 +238,8 @@ describe('displacement alert — the message', () => {
 
   it('gives an approximate stock level off the delta, labelled as approximate', () => {
     const text = buildMessage(c, strike(), MARKDOWN, NOW);
-    // +30% of a ₹10 premium is ₹3, and at delta 0.5 that is ₹6 of underlying: 300 -> 306.
-    assert.match(text, /stock ≈ ₹306\.00/);
+    // +24% of a ₹10 premium is ₹2.40, and at delta 0.5 that is ₹4.80 of underlying: 300 -> 304.80.
+    assert.match(text, /stock ≈ ₹304\.80/);
   });
 
   it('states the readings that fired it, so the reader can disagree', () => {
@@ -243,7 +252,8 @@ describe('displacement alert — the message', () => {
   it('still sends when no chain was available, with the rule in words', () => {
     const text = buildMessage(c, null, MARKDOWN, NOW);
     assert.match(text, /No option chain this cycle/);
-    assert.match(text, /half out at \+30%/);
+    assert.match(text, /once up \+24% move the stop to \+2%/);
+    assert.match(text, /Sell all at \+80%/);
     assert.match(text, /hard stop −50%/);
     assert.match(text, /lot is 500/);
   });

@@ -84,6 +84,27 @@ export const journalConfig = () => ({
   /** Take-profit and stop, as a percentage of what the contract cost. */
   tpPct: num('JOURNAL_TP_PCT', 80, 1, 1000) / 100,
   slPct: num('JOURNAL_SL_PCT', 50, 1, 99) / 100,
+  /**
+   * THE CHECKPOINT. Once the position has been up `armAtPct`, the stop moves once to `lockPct`
+   * and never moves again. Set `JOURNAL_ARM_AT_PCT=0` to switch it off and grade at the two fixed
+   * levels exactly as before.
+   *
+   * WHY IT IS ON. Graded on all 78 journalled trades, each walked bar by bar on its own contract's
+   * minute candles: +80/−50 alone nets ₹59,166, and arming a +2% stop at +24% nets ₹79,147. The
+   * gain is not protection of winners — it converts 19 full-sized losses into small wins (+₹74,541)
+   * and pays ₹54,617 back by clipping 13 gains. It survives the pessimistic fill assumption too:
+   * refill every stop at the low of the bar that triggered it and it still leads by ₹13,488.
+   *
+   * WHY A SINGLE RUNG. Every trigger from +12% to +26% beats the flat rule, so this is a plateau
+   * rather than a fitted point — but the three-rung ladder that inspired it (+15→cost, +25→+10,
+   * +50→+25) nets only ₹62,809 and turns NEGATIVE under worst-case fills, because it fires 38
+   * times instead of 15 and every firing pays the spread again. One rung, and let winners run.
+   *
+   * WHY +2% RATHER THAN BREAKEVEN. A hair above cost, so a checkpoint exit clears the ₹120 round
+   * trip instead of landing exactly on it. Breakeven grades slightly worse (₹75,360).
+   */
+  armAtPct: num('JOURNAL_ARM_AT_PCT', 24, 0, 1000) / 100,
+  lockPct: num('JOURNAL_LOCK_PCT', 2, -99, 1000) / 100,
   /** Minute of session to square off anything still open. 360 = 15:15. */
   squareOffMin: num('JOURNAL_SQUARE_OFF_MIN', 360, 1, SESSION_CLOSE_MIN - SESSION_OPEN_MIN),
   /**
@@ -114,6 +135,12 @@ export interface ExitRule {
   armAt?: number;
   /** Where it moves to: 'breakeven', or this many points below the running peak. */
   trail?: number | 'breakeven';
+  /**
+   * Park the stop at this FIXED level once armed, and never move it again. Set instead of `trail`.
+   * A checkpoint does not follow the peak, so a position that runs to +60% and pulls back to +20%
+   * is left alone — which is why it beats both the trails and the multi-rung ladders on this book.
+   */
+  lock?: number;
 }
 
 /**
@@ -343,11 +370,17 @@ export async function journalTick(nowMs = Date.now()): Promise<void> {
       t.updatedAt = nowMs;
       changed.push(t);
 
+      // The stop in force right now. `mfePct` has already absorbed this tick above, which is
+      // correct here and not look-ahead: a live marker genuinely sees the high before it can act
+      // on it, unlike a candle where the two are simultaneous by construction.
+      const armed = cfg.armAtPct > 0 && (t.mfePct ?? 0) >= cfg.armAtPct;
+      const stop = armed ? cfg.lockPct : -cfg.slPct;
+
       // Stop checked before target: if this tick could be read either way, it is the stop.
-      if (pct <= -cfg.slPct || pct >= cfg.tpPct) {
+      if (pct <= stop || pct >= cfg.tpPct) {
         t.exit = {
           at: nowMs, minute, premium: t.mark.premium, spot: null, source: 'auto',
-          reason: pct <= -cfg.slPct ? 'stop' : 'target',
+          reason: pct <= stop ? (armed ? 'checkpoint' : 'stop') : 'target',
         };
         t.status = 'closed';
         price(t);
@@ -382,8 +415,17 @@ export function gradePath(
   tp: number,
   sl: number,
   lastMinute: number,
+  /**
+   * Optional single checkpoint: once the position has been up `armAt`, the stop moves once to
+   * `lock` and stays there. Omit it and this grades exactly as it always did.
+   *
+   * The arming test reads the peak as it stood BEFORE the current bar. Letting a bar both set the
+   * high that arms the checkpoint and be stopped on it is how a backtest invents money — in the
+   * real session the stop had not moved yet when that low printed.
+   */
+  checkpoint?: { armAt: number; lock: number },
 ): {
-  pct: number; out: 'target' | 'stop' | 'close'; minute: number;
+  pct: number; out: 'target' | 'stop' | 'checkpoint' | 'close'; minute: number;
   mfe: number; mae: number;
   /**
    * The minute each extreme was set, or null while that extreme is still 0.
@@ -401,10 +443,17 @@ export function gradePath(
     if (b.minute <= fromMinute || b.minute > lastMinute) continue;
     const down = (b.low - paid) / paid;
     const up = (b.high - paid) / paid;
+
+    // The stop in force for THIS bar, from the peak as it stood before it.
+    const armed = checkpoint !== undefined && checkpoint.armAt > 0 && mfe >= checkpoint.armAt;
+    const stop = armed ? checkpoint.lock : -sl;
+
     if (down < mae) { mae = down; maeMinute = b.minute; }
     if (up > mfe) { mfe = up; mfeMinute = b.minute; }
     lastClose = b.close; lastMin = b.minute;
-    if (down <= -sl) return { pct: -sl, out: 'stop', minute: b.minute, mfe, mae, mfeMinute, maeMinute };
+    if (down <= stop) {
+      return { pct: stop, out: armed ? 'checkpoint' : 'stop', minute: b.minute, mfe, mae, mfeMinute, maeMinute };
+    }
     if (up >= tp) return { pct: tp, out: 'target', minute: b.minute, mfe, mae, mfeMinute, maeMinute };
   }
   return { pct: (lastClose - paid) / paid, out: 'close', minute: lastMin, mfe, mae, mfeMinute, maeMinute };
@@ -441,8 +490,9 @@ export function gradeRule(
     const down = (b.low - paid) / paid;
 
     let stop = -rule.sl;
-    if (rule.armAt !== undefined && rule.trail !== undefined && peak >= rule.armAt) {
-      stop = rule.trail === 'breakeven' ? 0 : Math.max(-rule.sl, peak - rule.trail);
+    if (rule.armAt !== undefined && peak >= rule.armAt) {
+      if (rule.lock !== undefined) stop = rule.lock;
+      else if (rule.trail !== undefined) stop = rule.trail === 'breakeven' ? 0 : Math.max(-rule.sl, peak - rule.trail);
     }
 
     if (down <= stop) return { pct: stop, out: 'stop', minute: b.minute };
@@ -668,7 +718,10 @@ export async function settleDay(day: string, nowMs = Date.now()): Promise<number
       t.settled = true; price(t); done.push(t);
       continue;
     }
-    const r = gradePath(bars, t.entry.premium, t.entry.minute, cfg.tpPct, cfg.slPct, cfg.squareOffMin);
+    const r = gradePath(
+      bars, t.entry.premium, t.entry.minute, cfg.tpPct, cfg.slPct, cfg.squareOffMin,
+      cfg.armAtPct > 0 ? { armAt: cfg.armAtPct, lock: cfg.lockPct } : undefined,
+    );
     t.exit = {
       at: nowMs, minute: r.minute, premium: +(t.entry.premium * (1 + r.pct)).toFixed(2),
       spot: null, source: 'auto',
@@ -1010,7 +1063,11 @@ export async function journalStatus(nowMs = Date.now()): Promise<Record<string, 
   const today = await repo.mine(day).catch(() => [] as JournalTrade[]);
   return {
     enabled: cfg.enabled,
-    exit: `+${(100 * cfg.tpPct).toFixed(0)}% / -${(100 * cfg.slPct).toFixed(0)}%, square off at minute ${cfg.squareOffMin}`,
+    exit: `+${(100 * cfg.tpPct).toFixed(0)}% / -${(100 * cfg.slPct).toFixed(0)}%`
+      + (cfg.armAtPct > 0
+        ? `, stop to ${cfg.lockPct >= 0 ? '+' : ''}${(100 * cfg.lockPct).toFixed(0)}% once up ${(100 * cfg.armAtPct).toFixed(0)}%`
+        : '')
+      + `, square off at minute ${cfg.squareOffMin}`,
     chargePerLot: cfg.chargePerLot,
     lots: cfg.lots,
     today: {

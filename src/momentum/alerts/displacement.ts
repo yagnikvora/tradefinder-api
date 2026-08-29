@@ -112,11 +112,28 @@ export const rule = () => ({
 const allowCarried = (): boolean =>
   (process.env.DISPLACEMENT_ALLOW_CARRIED_BASELINE ?? '').trim().toLowerCase() === 'on';
 
-/** Take-profit and stop, as multiples of what the contract cost. */
+/**
+ * Take-profit, checkpoint and stop, as multiples of what the contract cost.
+ *
+ * THE CHECKPOINT REPLACED A SCALE-OUT (2026-08-30). This message used to say "sell half at +30%,
+ * stop to breakeven, rest to +80%". Graded on all 78 journalled trades against their own contracts'
+ * minute candles, that instruction is the worst of the shapes tested — ₹45,310 against ₹59,166 for
+ * simply holding to +80/−50, because booking half caps the rare full winners that carry the book
+ * and pays a second lot of charges for the privilege.
+ *
+ * What replaced it: hold the whole position, and once it has been up `armAt`, move the stop once to
+ * `lock` and leave it there. That nets ₹79,147 on the same 78 trades, and still leads by ₹13,488
+ * if every stop is assumed to fill at the low of the bar that triggered it. `armAt` is deliberately
+ * mid-plateau — every trigger from +12% to +26% beats the flat rule, so the exact number is not
+ * load-bearing.
+ */
 export const exits = () => ({
-  first: num('DISPLACEMENT_TP1_PCT', 30, 1, 500) / 100,
   second: num('DISPLACEMENT_TP2_PCT', 80, 1, 1000) / 100,
   stop: num('DISPLACEMENT_SL_PCT', 50, 1, 99) / 100,
+  /** Once up this much, the stop moves once — to `lock` — and never moves again. 0 switches it off. */
+  armAt: num('DISPLACEMENT_ARM_AT_PCT', 24, 0, 1000) / 100,
+  /** Where the stop parks once armed. A hair above cost, so the exit clears the round trip. */
+  lock: num('DISPLACEMENT_LOCK_PCT', 2, -99, 1000) / 100,
 });
 
 /* --------------------------------------------------------------------- the readings --- */
@@ -310,18 +327,27 @@ export function buildMessage(
     );
     // The exits are PREMIUM prices. No model, nothing to disagree with, and they are what the
     // order book will actually show — which is the whole reason they are stated this way.
-    const spot1 = approxSpotFor(c, strike, 1 + e.first);
+    const spotArm = approxSpotFor(c, strike, 1 + e.armAt);
     const spot2 = approxSpotFor(c, strike, 1 + e.second);
     const spotS = approxSpotFor(c, strike, 1 - e.stop);
-    out.push(
-      `       ① ${m.bold(`SELL HALF at ${px(cost * (1 + e.first))}`)} (+${(100 * e.first).toFixed(0)}%)` +
-        (spot1 === null ? '' : m.italic(` — stock ≈ ${px(spot1)}`)),
-    );
-    out.push(`       ② ${m.italic('then move the stop on the rest to your entry price')}`);
+    if (e.armAt > 0) {
+      // Assembled before it is styled, for the same reason line ③ is: `_a__b_` collapses into a
+      // bold marker in Discord markdown and renders as `</i><i>` on Telegram.
+      out.push(
+        `       ① ${m.italic(
+          `if it touches ${px(cost * (1 + e.armAt))} (+${(100 * e.armAt).toFixed(0)}%)`
+          + (spotArm === null ? '' : ` — stock ≈ ${px(spotArm)}`),
+        )}`,
+      );
+      out.push(
+        `       ② ${m.bold(`MOVE STOP to ${px(cost * (1 + e.lock))}`)} ` +
+          m.italic(`(${e.lock >= 0 ? '+' : ''}${(100 * e.lock).toFixed(0)}%) — then leave it there`),
+      );
+    }
     // One italic span, not two concatenated: `_a__b_` collapses into a bold marker in Discord
     // markdown and renders as `</i><i>` on Telegram, so the tail is assembled before it is styled.
     out.push(
-      `       ③ ${m.bold(`REST at ${px(cost * (1 + e.second))}`)} (+${(100 * e.second).toFixed(0)}%)` +
+      `       ${e.armAt > 0 ? '③' : '①'} ${m.bold(`SELL ALL at ${px(cost * (1 + e.second))}`)} (+${(100 * e.second).toFixed(0)}%)` +
         m.italic(`${spot2 === null ? '' : ` — stock ≈ ${px(spot2)}`}, or close by 15:15`),
     );
     out.push(
@@ -334,7 +360,10 @@ export function buildMessage(
     out.push(
       `    ${m.italic(
         `No option chain this cycle — pick the at-the-money monthly yourself${c.lotSize ? `, lot is ${c.lotSize}` : ''}. ` +
-        `Then: half out at +${(100 * e.first).toFixed(0)}%, stop to breakeven, rest at +${(100 * e.second).toFixed(0)}% or 15:15, hard stop −${(100 * e.stop).toFixed(0)}%.`,
+        (e.armAt > 0
+          ? `Then: hold it all, and once up +${(100 * e.armAt).toFixed(0)}% move the stop to ${e.lock >= 0 ? '+' : ''}${(100 * e.lock).toFixed(0)}% and leave it. `
+          : 'Then: ') +
+        `Sell all at +${(100 * e.second).toFixed(0)}% or 15:15, hard stop −${(100 * e.stop).toFixed(0)}%.`,
       )}`,
     );
   }

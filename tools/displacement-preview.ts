@@ -91,7 +91,11 @@ async function main(): Promise<void> {
   console.log(`\nreplaying ${day} through the live displacement alert`);
   console.log(`baseline on disk is for ${baseline.day}${baseline.day === day ? '' : '  <-- NOT this session, ATR and volume profile will be off'}`);
   console.log(`window ${clock(r.fromMinute)}-${clock(r.toMinute)} · RVOL ${r.minRvol}-${r.maxRvol}x · range >= ${r.minRangeAtr} ATR · move >= ${r.minMoveAtr} ATR · within ${r.maxOffExtremeAtr} ATR of the extreme · turnover >= ${r.minTurnoverCr}cr · max ${r.maxPerDay}/day`);
-  console.log(`exits +${100 * e.first}% / +${100 * e.second}% / −${100 * e.stop}%\n`);
+  console.log(
+    `exits: target +${100 * e.second}% · hard stop −${100 * e.stop}%`
+    + (e.armAt > 0 ? ` · checkpoint: once up +${100 * e.armAt}%, stop moves to ${e.lock >= 0 ? '+' : ''}${100 * e.lock}%` : '')
+    + '\n',
+  );
 
   // Load every symbol's session once.
   const loaded = new Map<string, Series>();
