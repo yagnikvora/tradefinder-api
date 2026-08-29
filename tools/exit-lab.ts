@@ -4,11 +4,15 @@
 //   npx tsx tools/exit-lab.ts              every rule, on every real trade in the journal
 //   npx tsx tools/exit-lab.ts --detail     also print the per-trade table for the winning rule
 //
-// THE PROBLEM IT EXISTS TO ANSWER. Of 65 real trades, 54 never touched either band and were handed
-// to the 15:15 square-off; 17 of them had been up 15% or more at some point and still closed red,
-// which is −₹67,340 of realised loss on positions that were, at some moment, winners. The median
-// trade peaks 115 minutes after entry and then gives back 18 points. A fixed +80/−50 pair cannot
-// see any of that, because it only ever looks at two price levels and never at the path between.
+// THE PROBLEM IT EXISTS TO ANSWER. Of the 78 real trades, 67 never touched either band and were
+// handed to the 15:15 square-off; 18 of them had been up 15% or more at some point and still closed
+// red. A fixed +80/−50 pair cannot see any of that, because it only ever looks at two price levels
+// and never at the path between.
+//
+// WHAT IT FOUND, once every path was archived (2026-08-30): a SINGLE checkpoint that parks the stop
+// just above cost after a modest gain is worth roughly +₹20,000 across these 78 trades, and the
+// result holds across every trigger from +12% to +26%. Multi-rung ladders lose — each extra rung
+// pays another spread and clips another runner.
 //
 // HOW EVERY RULE IS GRADED, identically:
 //
@@ -58,8 +62,24 @@ interface Rule {
   sl: number;
   /** Once the position has been up this much, the stop moves. Null = never moves. */
   armAt?: number;
-  /** Where the stop moves to once armed: 'breakeven', or trail this many points below the peak. */
+  /**
+   * Where the stop moves to once armed. Three shapes:
+   *   'breakeven'  park it at entry
+   *   a number     trail it this many points below the running peak
+   *   `lock`       park it at one FIXED level and never move it again (see below)
+   */
   trail?: number | 'breakeven';
+  /**
+   * Park the stop at this fixed fraction once `armAt` is reached, and leave it there. A checkpoint
+   * rather than a trail: it does not follow the peak, so a position that runs to +60% and pulls
+   * back to +20% is not cut. Set INSTEAD of `trail`.
+   *
+   * This is the family that came out ahead once every path was archived — a single checkpoint
+   * anywhere from +12% to +26% beats the shipped +80/−50, and beats it on the full 78 even when
+   * every stop is refilled at the low of the bar that triggered it. The multi-rung version of the
+   * same idea loses, because each extra rung is another spread paid and another runner clipped.
+   */
+  lock?: number;
   /** Minute of session to close anything still open. */
   lastMinute: number;
   /** Book HALF at `tp` and run the rest under the trail. Needs 2+ lots to be real. */
@@ -73,6 +93,12 @@ const RULES: Rule[] = [
   { name: '+50/-50  @15:15', note: 'middle target', tp: 0.50, sl: 0.50, lastMinute: SQ },
   { name: 'BE after +20%', note: 'stop to entry once up 20%', tp: 0.80, sl: 0.50, armAt: 0.20, trail: 'breakeven', lastMinute: SQ },
   { name: 'BE after +25%', note: 'stop to entry once up 25%', tp: 0.80, sl: 0.50, armAt: 0.25, trail: 'breakeven', lastMinute: SQ },
+  // The single-checkpoint family: arm once, park the stop just above cost, never move it again.
+  // Tested across every trigger from +10% to +50% on the complete archive — positive almost
+  // everywhere from +12% to +26%, so these three sample the plateau rather than its peak.
+  { name: 'lock +2 after +15%', note: 'one checkpoint, stop to +2%', tp: 0.80, sl: 0.50, armAt: 0.15, lock: 0.02, lastMinute: SQ },
+  { name: 'lock +2 after +20%', note: 'one checkpoint, stop to +2%', tp: 0.80, sl: 0.50, armAt: 0.20, lock: 0.02, lastMinute: SQ },
+  { name: 'lock +2 after +24%', note: 'one checkpoint, stop to +2%', tp: 0.80, sl: 0.50, armAt: 0.24, lock: 0.02, lastMinute: SQ },
   { name: 'trail 15 after +20%', note: 'give back at most 15 pts', tp: 0.80, sl: 0.50, armAt: 0.20, trail: 0.15, lastMinute: SQ },
   { name: 'trail 20 after +25%', note: 'give back at most 20 pts', tp: 0.80, sl: 0.50, armAt: 0.25, trail: 0.20, lastMinute: SQ },
   { name: 'trail 25 after +30%', note: 'give back at most 25 pts', tp: 0.80, sl: 0.50, armAt: 0.30, trail: 0.25, lastMinute: SQ },
@@ -105,14 +131,20 @@ function grade(bars: Bar[], paid: number, fromMinute: number, r: Rule): Graded {
 
     // The stop in force for THIS bar, derived from the peak as it stood before this bar.
     let stop = -r.sl;
-    if (r.armAt !== undefined && r.trail !== undefined && peak >= r.armAt) {
-      stop = r.trail === 'breakeven' ? 0 : Math.max(-r.sl, peak - r.trail);
+    if (r.armAt !== undefined && peak >= r.armAt) {
+      if (r.lock !== undefined) stop = r.lock;
+      else if (r.trail !== undefined) stop = r.trail === 'breakeven' ? 0 : Math.max(-r.sl, peak - r.trail);
     }
 
     // Stop first: an ambiguous bar is always the stop.
     if (down <= stop) {
       const exit = half ? booked + 0.5 * stop : stop;
-      return { pct: exit, out: half ? 'trail after half' : (stop >= 0 ? (stop > 0 ? 'trailed' : 'breakeven') : 'stop'), minute: b.minute };
+      const label = half ? 'trail after half'
+        : stop < 0 ? 'stop'
+        : stop === 0 ? 'breakeven'
+        : r.lock !== undefined ? 'checkpoint'
+        : 'trailed';
+      return { pct: exit, out: label, minute: b.minute };
     }
     if (r.tp !== null && up >= r.tp) {
       if (!r.scaleOut) return { pct: r.tp, out: 'target', minute: b.minute };
