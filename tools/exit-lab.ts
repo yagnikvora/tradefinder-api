@@ -88,7 +88,7 @@ interface Rule {
 
 const SQ = 360;      // 15:15
 const RULES: Rule[] = [
-  { name: '+80/-50  @15:15', note: 'SHIPPED — what runs today', tp: 0.80, sl: 0.50, lastMinute: SQ },
+  { name: '+80/-50  @15:15', note: 'the flat pair, no checkpoint', tp: 0.80, sl: 0.50, lastMinute: SQ },
   { name: '+30/-50  @15:15', note: 'lower target, same stop', tp: 0.30, sl: 0.50, lastMinute: SQ },
   { name: '+50/-50  @15:15', note: 'middle target', tp: 0.50, sl: 0.50, lastMinute: SQ },
   { name: 'BE after +20%', note: 'stop to entry once up 20%', tp: 0.80, sl: 0.50, armAt: 0.20, trail: 'breakeven', lastMinute: SQ },
@@ -99,6 +99,12 @@ const RULES: Rule[] = [
   { name: 'lock +2 after +15%', note: 'one checkpoint, stop to +2%', tp: 0.80, sl: 0.50, armAt: 0.15, lock: 0.02, lastMinute: SQ },
   { name: 'lock +2 after +20%', note: 'one checkpoint, stop to +2%', tp: 0.80, sl: 0.50, armAt: 0.20, lock: 0.02, lastMinute: SQ },
   { name: 'lock +2 after +24%', note: 'one checkpoint, stop to +2%', tp: 0.80, sl: 0.50, armAt: 0.24, lock: 0.02, lastMinute: SQ },
+  // The +6 lock family. THESE ARE THE ONES THAT MATTER: `journalConfig` ships armAtPct 24 and
+  // lockPct 6, so `lock +6 after +24%` is what the journal actually grades every trade under —
+  // and until now the lab did not test it, while labelling flat +80/-50 as "SHIPPED".
+  { name: 'lock +6 after +15%', note: 'one checkpoint, stop to +6%', tp: 0.80, sl: 0.50, armAt: 0.15, lock: 0.06, lastMinute: SQ },
+  { name: 'lock +6 after +20%', note: 'one checkpoint, stop to +6%', tp: 0.80, sl: 0.50, armAt: 0.20, lock: 0.06, lastMinute: SQ },
+  { name: 'lock +6 after +24%', note: 'SHIPPED — the journal grades on this', tp: 0.80, sl: 0.50, armAt: 0.24, lock: 0.06, lastMinute: SQ },
   { name: 'trail 15 after +20%', note: 'give back at most 15 pts', tp: 0.80, sl: 0.50, armAt: 0.20, trail: 0.15, lastMinute: SQ },
   { name: 'trail 20 after +25%', note: 'give back at most 20 pts', tp: 0.80, sl: 0.50, armAt: 0.25, trail: 0.20, lastMinute: SQ },
   { name: 'trail 25 after +30%', note: 'give back at most 25 pts', tp: 0.80, sl: 0.50, armAt: 0.30, trail: 0.25, lastMinute: SQ },

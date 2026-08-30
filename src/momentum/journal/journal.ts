@@ -928,6 +928,142 @@ function countSessionDays(from: string, to: string): number {
   return n;
 }
 
+/* -------------------------------------------------------------------------- exit lab --- */
+
+/** One rule's score over a set of trades. Rupees, because that is what the decision is in. */
+export interface ExitLabResult {
+  name: string;
+  net: number;
+  wins: number;
+  losses: number;
+  trades: number;
+  winRate: number | null;
+  /** The single worst and best trade under this rule. */
+  worst: number;
+  best: number;
+  /** Deepest peak-to-trough on the day-by-day equity curve this rule would have produced. */
+  maxDrawdown: number;
+  /** How the exits split. A rule that never fires its checkpoint is a rule doing nothing. */
+  outs: { target: number; stop: number; close: number };
+}
+
+export interface ExitLabReport {
+  from: string;
+  to: string;
+  /** Trades in range that could be graded, and the ones with no archived path. */
+  graded: number;
+  missing: number;
+  results: ExitLabResult[];
+}
+
+/**
+ * Re-grade real trades under arbitrary exit rules, from the archived candle paths.
+ *
+ * THE ARCHIVE IS THE ONLY SOURCE. This never touches Upstox, and that is a hard requirement
+ * rather than an optimisation: it answers an HTTP request, and a study that fetched sixty expired
+ * contracts on every slider drag would empty the quota in an afternoon — and would fail anyway,
+ * because Upstox rejects the instrument key of an expired series outright. A trade with no
+ * archived path is counted in `missing` and left out, which is the honest handling: silently
+ * grading a subset and reporting it as the whole book is how a study lies.
+ *
+ * The grading is `gradeRule`, the same function the shipped shadow rules go through, so a result
+ * here and a result in the journal's own shadow column cannot disagree about method — a minute
+ * that could have gone either way resolves as the stop in both.
+ */
+export async function exitLab(
+  from: string,
+  to: string,
+  channel: JournalChannel | null,
+  rules: ExitRule[],
+): Promise<ExitLabReport> {
+  const cfg = journalConfig();
+  const trades = (await journalRepository().range(from, to, channel)).filter(
+    (t) => t.contract && t.entry.premium > 0 && t.exit && t.exit.reason !== 'untracked',
+  );
+  const paths = await readArchivedPaths(trades);
+
+  const usable = trades.filter((t) => (paths.get(t.id)?.length ?? 0) > 0);
+  const results: ExitLabResult[] = rules.map((rule) => {
+    let net = 0, wins = 0, losses = 0, worst = 0, best = 0;
+    const outs = { target: 0, stop: 0, close: 0 };
+    // Day totals, so the drawdown is measured on the equity curve a trader would have lived
+    // through rather than on the order the rows happen to come back in.
+    const byDay = new Map<string, number>();
+
+    for (const t of usable) {
+      const bars = (paths.get(t.id) as ArchivedPath).map(([minute, high, low, close]) => ({
+        minute, high, low, close,
+      }));
+      const g = gradeRule(bars, t.entry.premium, t.entry.minute, rule, cfg.squareOffMin);
+      const pnl = +(g.pct * (t.amountUsed ?? 0) - cfg.chargePerLot * t.lots).toFixed(2);
+      net += pnl;
+      if (pnl > 0) wins++; else if (pnl < 0) losses++;
+      worst = Math.min(worst, pnl);
+      best = Math.max(best, pnl);
+      outs[g.out]++;
+      byDay.set(t.day, (byDay.get(t.day) ?? 0) + pnl);
+    }
+
+    let run = 0, peak = 0, maxDrawdown = 0;
+    for (const day of [...byDay.keys()].sort()) {
+      run += byDay.get(day) as number;
+      peak = Math.max(peak, run);
+      maxDrawdown = Math.max(maxDrawdown, peak - run);
+    }
+
+    return {
+      name: rule.name,
+      net: +net.toFixed(2),
+      wins,
+      losses,
+      trades: usable.length,
+      winRate: wins + losses > 0 ? +(wins / (wins + losses)).toFixed(4) : null,
+      worst: +worst.toFixed(2),
+      best: +best.toFixed(2),
+      maxDrawdown: +maxDrawdown.toFixed(2),
+      outs,
+    };
+  });
+
+  return { from, to, graded: usable.length, missing: trades.length - usable.length, results };
+}
+
+/**
+ * Archived paths for these trades: the shared store first, local month documents as the fallback.
+ *
+ * Neon first because it is the copy both machines see and the one that survives a reinstall.
+ * Never throws — a study that cannot read the archive returns nothing to grade, which the caller
+ * reports as `missing`, rather than failing the request.
+ */
+async function readArchivedPaths(trades: JournalTrade[]): Promise<Map<string, ArchivedPath>> {
+  const out = new Map<string, ArchivedPath>();
+  if (!trades.length) return out;
+
+  if (databaseUrl()) {
+    try {
+      const days = [...new Set(trades.map((t) => t.day))];
+      const { rows } = await getPool().query<{ day: string; instrument_key: string; bars: ArchivedPath }>(
+        `SELECT day::text AS day, instrument_key, bars FROM momentum_option_path
+          WHERE day = ANY($1::date[]) AND role = 'traded'`,
+        [days],
+      );
+      for (const r of rows) {
+        const t = trades.find((x) => x.day === r.day && x.contract?.instrumentKey === r.instrument_key);
+        if (t) out.set(t.id, r.bars);
+      }
+    } catch { /* the local months below are the fallback */ }
+  }
+
+  for (const month of [...new Set(trades.map((t) => t.day.slice(0, 7)))]) {
+    const doc = await store
+      .read<Record<string, ArchivedPath>>(`${STORE_KEYS.journalPaths}_${month}`)
+      .catch(() => null);
+    if (!doc) continue;
+    for (const [id, bars] of Object.entries(doc)) if (!out.has(id)) out.set(id, bars);
+  }
+  return out;
+}
+
 /* --------------------------------------------------------------------------- editing --- */
 
 export interface JournalPatch {

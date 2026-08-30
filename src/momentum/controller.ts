@@ -19,8 +19,8 @@ import { buildMessages, previewAlerts, trendAlertStatus } from './alerts/trend-d
 import { ignitionAlertStatus } from './alerts/ignition.js';
 import { displacementAlertStatus } from './alerts/displacement.js';
 import {
-  journalBoot, journalExitNow, journalPatch, journalRange, journalSettleDue, journalStatus,
-  type JournalChannel,
+  exitLab, journalBoot, journalExitNow, journalPatch, journalRange, journalSettleDue,
+  journalStatus, type ExitRule, type JournalChannel,
 } from './journal/journal.js';
 import { databaseUrl, getPool, probe } from './journal/postgres.js';
 import { HTML, MARKDOWN } from '../alerts/markup.js';
@@ -590,6 +590,62 @@ export function momentumRouter(): express.Router {
       // Journal rows are read off disk and are complete whether or not Upstox is reachable, so
       // the envelope's source says where the PRICES came from, not where the rows did.
       send(res, view, 'upstox');
+    } catch (e) {
+      fail(res, 500, String((e as Error).message));
+    }
+  });
+
+  // ------------------------------------- POST /momentum/journal/exit-lab -------------
+  //
+  // Re-grade the real trades in a range under exit rules supplied by the caller, on the archived
+  // 1-minute option paths. This is `tools/exit-lab.ts` as an endpoint, so the question "what would
+  // a different stop have made" can be asked from the journal page instead of a terminal.
+  //
+  // DECLARED BEFORE `/journal/:id`, or Express matches "exit-lab" as a trade id.
+  //
+  // POST rather than GET because the body is a list of rules, and because the answer is derived
+  // rather than fetched — there is nothing here worth a cache key.
+  router.post('/journal/exit-lab', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as {
+        from?: unknown; to?: unknown; channel?: unknown; rules?: unknown;
+      };
+      const today = istDay();
+      const from = parseDay(body.from, '2000-01-01');
+      const to = parseDay(body.to, today);
+      if (to < from) return fail(res, 400, '`to` is before `from`');
+      const channel = parseChannel(body.channel);
+      if (channel === false) return fail(res, 400, 'channel must be displacement, trend-day or ignition');
+
+      if (!Array.isArray(body.rules) || body.rules.length === 0)
+        return fail(res, 400, 'rules must be a non-empty array');
+      // Capped because each rule is a full walk of every archived path. Forty is far more than a
+      // sweep needs and still answers in well under a second.
+      if (body.rules.length > 40) return fail(res, 400, 'at most 40 rules at a time');
+
+      const rules: ExitRule[] = [];
+      for (const raw of body.rules as Array<Record<string, unknown>>) {
+        const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+        const tp = num(raw.tp);
+        const sl = num(raw.sl);
+        // A stop at or below −100% can never be hit and a target at zero is hit instantly; both
+        // produce a number that looks like an answer and is not one.
+        if (tp === null || tp <= 0 || tp > 20) return fail(res, 400, 'tp must be between 0 and 20 (as a fraction)');
+        if (sl === null || sl <= 0 || sl >= 1) return fail(res, 400, 'sl must be between 0 and 1 (as a fraction)');
+        const armAt = num(raw.armAt);
+        const lock = num(raw.lock);
+        const trail = raw.trail === 'breakeven' ? 'breakeven' as const : num(raw.trail);
+        rules.push({
+          name: String(raw.name ?? `+${Math.round(100 * tp)}/-${Math.round(100 * sl)}`).slice(0, 40),
+          tp,
+          sl,
+          ...(armAt !== null && armAt > 0 ? { armAt } : {}),
+          ...(lock !== null ? { lock } : {}),
+          ...(trail !== null ? { trail } : {}),
+        });
+      }
+
+      send(res, await exitLab(from, to, channel, rules), 'upstox');
     } catch (e) {
       fail(res, 500, String((e as Error).message));
     }
