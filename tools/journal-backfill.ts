@@ -43,6 +43,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { sessionCandles } from '../src/upstox.js';
+import { expiredSession, PlanRequiredError } from '../src/momentum/data/expired-candles.js';
 import { istDay } from '../src/momentum/session.js';
 import { rule, selectDisplacement, type DisplacementCandidate, type DisplacementInput } from '../src/momentum/alerts/displacement.js';
 import { gradePath, journalConfig, journalRepository, SHADOW } from '../src/momentum/journal/journal.js';
@@ -239,15 +240,23 @@ type OptionBar = { minute: number; high: number; low: number; close: number; ope
  * empty array, which reads as "the contract never traded" rather than "wrong endpoint". That is
  * exactly how the first run of this tool priced nothing at all for the current session.
  */
-async function optionSession(instrumentKey: string, day: string): Promise<OptionBar[]> {
-  const raw = await sessionCandles(instrumentKey, day, istDay(Date.now()), 'minutes', 1);
-  return raw
-    .map((c) => ({
-      minute: Math.round((c[0] * 1000 - atOf(day, 0)) / 60_000),
-      open: c[1], high: c[2], low: c[3], close: c[4],
-    }))
-    .filter((b) => b.minute >= 0 && b.minute < 375)
-    .sort((a, b) => a.minute - b.minute);
+async function optionSession(instrumentKey: string, day: string, expiry?: string): Promise<OptionBar[]> {
+  const raw = await sessionCandles(instrumentKey, day, istDay(Date.now()), 'minutes', 1).catch(() => []);
+  if (raw.length) {
+    return raw
+      .map((c) => ({
+        minute: Math.round((c[0] * 1000 - atOf(day, 0)) / 60_000),
+        open: c[1], high: c[2], low: c[3], close: c[4],
+      }))
+      .filter((b) => b.minute >= 0 && b.minute < 375)
+      .sort((a, b) => a.minute - b.minute);
+  }
+  // Series already expired: the live endpoint refuses the key outright, and the only remaining
+  // source is the expired-instruments API. Without this every session older than the current
+  // month prices nothing — 192 signals, 192 "without candles", which is how this was found.
+  if (!expiry) return [];
+  const bars = await expiredSession(instrumentKey, expiry, day);
+  return bars.map((b) => ({ minute: b.minute, open: b.open, high: b.high, low: b.low, close: b.close }));
 }
 
 /* ---------------------------------------------------------------------------- writing --- */
@@ -514,7 +523,10 @@ async function main(): Promise<void> {
       const con = resolveContract(series, c.symbol, c.entry, c.direction);
       if (!con) { noContract++; return null; }
 
-      const bars = await optionSession(con.instrumentKey, day).catch(() => [] as OptionBar[]);
+      const bars = await optionSession(con.instrumentKey, day, series.expiry).catch((e) => {
+        if (e instanceof PlanRequiredError) throw e;   // no point grinding through 200 more
+        return [] as OptionBar[];
+      });
       const at = bars.find((b) => b.minute === c.minute) ?? bars.find((b) => b.minute >= c.minute);
       if (!bars.length || !at || !(at.close > 0)) { noCandles++; return null; }
 

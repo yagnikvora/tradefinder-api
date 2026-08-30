@@ -34,6 +34,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { closePool, databaseUrl, getPool } from '../src/momentum/journal/postgres.js';
+import { expiredKey, expiredSession } from '../src/momentum/data/expired-candles.js';
 import type { JournalTrade } from '../src/momentum/journal/types.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -47,53 +48,9 @@ const opt = (name: string) => {
   return i >= 0 ? args[i + 1] : undefined;
 };
 
-/** `NSE_FO|121245` + `2026-08-25` -> `NSE_FO|121245|25-08-2026`. */
-export function expiredKey(instrumentKey: string, expiry: string): string {
-  const [y, m, d] = expiry.split('-');
-  return `${instrumentKey}|${d}-${m}-${y}`;
-}
-
-/**
- * The expired endpoint does NOT return what `/v3/historical-candle` returns, and `sessionBars`
- * cannot read it:
- *
- *   v3       [1753848540, 10.45, ...]                 epoch seconds, ASCENDING
- *   expired  ["2026-07-30T15:29:00+05:30", 10.45, ...] ISO string,   DESCENDING
- *
- * Feeding the ISO form to `sessionBars` makes `istMinutes(c[0] * 1000)` NaN, so every bar lands
- * with a null minute and the whole path is silently useless — which is exactly what happened on
- * the first run of this tool. Parse the clock time straight out of the string: the +05:30 offset
- * is already IST, so no timezone maths is needed or wanted.
- */
-function expiredBars(raw: unknown[][]): Array<{ minute: number; high: number; low: number; close: number }> {
-  const SESSION_OPEN_MIN = 9 * 60 + 15;
-  const out: Array<{ minute: number; high: number; low: number; close: number }> = [];
-  for (const c of raw) {
-    const stamp = String(c[0]);
-    const m = /T(\d{2}):(\d{2})/.exec(stamp);
-    if (!m) continue;
-    const minute = Number(m[1]) * 60 + Number(m[2]) - SESSION_OPEN_MIN;
-    const [high, low, close] = [Number(c[2]), Number(c[3]), Number(c[4])];
-    if (minute < 0 || !Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close)) continue;
-    out.push({ minute, high, low, close });
-  }
-  return out.sort((a, b) => a.minute - b.minute);
-}
-
-async function fetchExpiredCandles(key: string, day: string): Promise<unknown[][]> {
-  const token = process.env.UPSTOX_ACCESS_TOKEN;
-  if (!token) throw new Error('UPSTOX_ACCESS_TOKEN is not set');
-  const url = `${BASE}/v2/expired-instruments/historical-candle/${encodeURIComponent(key)}/1minute/${day}/${day}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
-  const text = await res.text();
-  if (!res.ok) {
-    let code = '';
-    try { code = JSON.parse(text)?.errors?.[0]?.errorCode ?? ''; } catch { /* keep the raw body */ }
-    if (code === 'UDAPI1149') throw new Error('PLAN: Upstox Plus subscription required for expired-instrument data');
-    throw new Error(`${res.status} ${code || text.slice(0, 90)}`);
-  }
-  return JSON.parse(text)?.data?.candles ?? [];
-}
+// Fetching and parsing both live in `src/momentum/data/expired-candles.ts` — one implementation,
+// because the ISO-vs-epoch difference and the idempotent key are exactly the two things that
+// silently produce an empty path when duplicated and allowed to drift.
 
 async function loadTrades(from?: string, to?: string): Promise<JournalTrade[]> {
   if (databaseUrl()) {
@@ -138,9 +95,8 @@ async function main() {
   let ok = 0, planBlocked = 0;
   const failures: string[] = [];
   for (const t of missing) {
-    const key = expiredKey(t.contract!.instrumentKey, t.contract!.expiry);
     try {
-      const bars = expiredBars(await fetchExpiredCandles(key, t.day));
+      const bars = await expiredSession(t.contract!.instrumentKey, t.contract!.expiry, t.day);
       if (!bars.length) { failures.push(`${t.day} ${t.symbol}: empty`); continue; }
       byMonth.get(t.day.slice(0, 7))![t.id] = bars.map((b) => [b.minute, b.high, b.low, b.close]);
       ok++;

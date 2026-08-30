@@ -22,9 +22,18 @@ async function main(): Promise<void> {
     try {
       const rows = await historical(t.key, 'minutes', 1, FROM, TO);
       let n = 0;
+      // Whether a day is already held is decided ONCE, before anything is appended. The guard used
+      // to be inside the loop and read `file.days[c.day].length > 300` as the array grew — so the
+      // first 301 bars of every NEW day were kept and the rest silently dropped, truncating each
+      // session at 14:15. It looked like a complete fetch: 301 > 300 passes the lab's own
+      // `bars > 300` filter, so the sessions replayed, with an hour and a quarter of the day
+      // missing from every range, VWAP and volume profile.
+      const complete = new Set(
+        Object.keys(file.days).filter((d) => file.days[d].length > 300),
+      );
       for (const c of rows) {
         if (c.minute < 0 || c.minute > 374) continue;
-        if (file.days[c.day] && file.days[c.day].length > 300) continue;
+        if (complete.has(c.day)) continue;
         (file.days[c.day] ??= []).push([c.minute, c.open, c.high, c.low, c.close, c.volume]);
         n++;
       }
