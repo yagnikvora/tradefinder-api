@@ -132,8 +132,12 @@ export const exits = () => ({
   stop: num('DISPLACEMENT_SL_PCT', 50, 1, 99) / 100,
   /** Once up this much, the stop moves once — to `lock` — and never moves again. 0 switches it off. */
   armAt: num('DISPLACEMENT_ARM_AT_PCT', 24, 0, 1000) / 100,
-  /** Where the stop parks once armed. A hair above cost, so the exit clears the round trip. */
-  lock: num('DISPLACEMENT_LOCK_PCT', 2, -99, 1000) / 100,
+  /**
+   * Where the stop parks once armed. Comfortably above cost, so a checkpoint exit is a small win
+   * rather than a scratch. See `journalConfig` for the grading behind the number and for why this
+   * one is fitted to 78 trades where `armAt` is a genuine plateau.
+   */
+  lock: num('DISPLACEMENT_LOCK_PCT', 6, -99, 1000) / 100,
 });
 
 /* --------------------------------------------------------------------- the readings --- */

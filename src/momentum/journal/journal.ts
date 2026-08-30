@@ -90,21 +90,29 @@ export const journalConfig = () => ({
    * levels exactly as before.
    *
    * WHY IT IS ON. Graded on all 78 journalled trades, each walked bar by bar on its own contract's
-   * minute candles: +80/−50 alone nets ₹59,166, and arming a +2% stop at +24% nets ₹79,147. The
-   * gain is not protection of winners — it converts 19 full-sized losses into small wins (+₹74,541)
-   * and pays ₹54,617 back by clipping 13 gains. It survives the pessimistic fill assumption too:
-   * refill every stop at the low of the bar that triggered it and it still leads by ₹13,488.
+   * minute candles: +80/−50 alone nets ₹59,166, and arming a +6% stop at +24% nets ₹91,248. The
+   * gain is not protection of winners — it converts full-sized losses into small wins and pays a
+   * part of that back by clipping gains. It survives the pessimistic fill assumption too: refill
+   * every stop at the low of the bar that triggered it and it still leads by ₹20,816.
    *
-   * WHY A SINGLE RUNG. Every trigger from +12% to +26% beats the flat rule, so this is a plateau
-   * rather than a fitted point — but the three-rung ladder that inspired it (+15→cost, +25→+10,
-   * +50→+25) nets only ₹62,809 and turns NEGATIVE under worst-case fills, because it fires 38
-   * times instead of 15 and every firing pays the spread again. One rung, and let winners run.
+   * WHY A SINGLE RUNG. Every trigger from +12% to +26% beats the flat rule, so the ARMING level is
+   * a plateau rather than a fitted point — but the three-rung ladder that inspired it (+15→cost,
+   * +25→+10, +50→+25) nets only ₹62,809 and turns NEGATIVE under worst-case fills, because it
+   * fires 38 times instead of 16 and every firing pays the spread again. One rung, and let
+   * winners run.
    *
-   * WHY +2% RATHER THAN BREAKEVEN. A hair above cost, so a checkpoint exit clears the ₹120 round
-   * trip instead of landing exactly on it. Breakeven grades slightly worse (₹75,360).
+   * WHY +6% AND NOT LESS. The lock only matters to trades that actually reach it, so raising it
+   * collects more on each without touching anything else — the same 15 trades that were exiting at
+   * +2% now exit at +6%, and exactly one (GAIL, 03-Aug) is newly cut, having dipped into the band
+   * and then run to +15.8%. Breakeven grades ₹75,360 and +2% grades ₹79,147.
+   *
+   * THE HONEST CAVEAT. Unlike the arming level, the LOCK is not a plateau: +4% to +6% all land
+   * within about ₹5k of each other and +8% falls away sharply to ₹73,047. 6 is the top of a sweep
+   * over 78 trades, so read it as fitted, not as a discovered constant. If it disappoints in live
+   * trading, step down to 4 rather than concluding the checkpoint itself is wrong.
    */
   armAtPct: num('JOURNAL_ARM_AT_PCT', 24, 0, 1000) / 100,
-  lockPct: num('JOURNAL_LOCK_PCT', 2, -99, 1000) / 100,
+  lockPct: num('JOURNAL_LOCK_PCT', 6, -99, 1000) / 100,
   /** Minute of session to square off anything still open. 360 = 15:15. */
   squareOffMin: num('JOURNAL_SQUARE_OFF_MIN', 360, 1, SESSION_CLOSE_MIN - SESSION_OPEN_MIN),
   /**

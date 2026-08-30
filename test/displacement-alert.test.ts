@@ -17,7 +17,7 @@ import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
 import {
-  buildMessage, rule, selectDisplacement,
+  buildMessage, exits, rule, selectDisplacement,
   type DisplacementCandidate, type DisplacementInput,
 } from '../src/momentum/alerts/displacement.js';
 import { HTML, MARKDOWN } from '../src/alerts/markup.js';
@@ -205,8 +205,24 @@ const strike = (over: Partial<StrikeChoice> = {}): StrikeChoice =>
 describe('displacement alert — the message', () => {
   const [c] = pick([input()]);
 
+  // The checkpoint levels are TUNED and move whenever the study is re-run. Pin them here so these
+  // tests cover the arithmetic and the wording, and let the one test below own the shipped values.
+  // Without this, retuning the rule fails a formatting test, which says nothing about formatting.
+  const pinned = <T>(fn: () => T): T => {
+    const before = [process.env.DISPLACEMENT_ARM_AT_PCT, process.env.DISPLACEMENT_LOCK_PCT];
+    process.env.DISPLACEMENT_ARM_AT_PCT = '24';
+    process.env.DISPLACEMENT_LOCK_PCT = '2';
+    try {
+      return fn();
+    } finally {
+      [process.env.DISPLACEMENT_ARM_AT_PCT, process.env.DISPLACEMENT_LOCK_PCT] = before as [string, string];
+      if (before[0] === undefined) delete process.env.DISPLACEMENT_ARM_AT_PCT;
+      if (before[1] === undefined) delete process.env.DISPLACEMENT_LOCK_PCT;
+    }
+  };
+
   it('states the exits as premium prices, which need no model', () => {
-    const text = buildMessage(c, strike(), MARKDOWN, NOW);
+    const text = pinned(() => buildMessage(c, strike(), MARKDOWN, NOW));
     // entryCost 10 -> checkpoint arms at 12.40, stop parks at 10.20, target 18.00, hard stop 5.00
     assert.match(text, /touches ₹12\.40/);
     assert.match(text, /MOVE STOP to ₹10\.20/);
@@ -250,7 +266,7 @@ describe('displacement alert — the message', () => {
   });
 
   it('still sends when no chain was available, with the rule in words', () => {
-    const text = buildMessage(c, null, MARKDOWN, NOW);
+    const text = pinned(() => buildMessage(c, null, MARKDOWN, NOW));
     assert.match(text, /No option chain this cycle/);
     assert.match(text, /once up \+24% move the stop to \+2%/);
     assert.match(text, /Sell all at \+80%/);
@@ -300,5 +316,28 @@ describe('displacement alert — the rule as shipped', () => {
     // 09:27 and 10:00 in minutes past 09:15.
     assert.equal(R.fromMinute, 12);
     assert.equal(R.toMinute, 45);
+  });
+
+  // The one place the tuned checkpoint is pinned. Changing it should fail exactly this assertion,
+  // and the failure should be read as "confirm the study, then update the number" rather than as
+  // a bug. Graded 2026-08-30 on all 78 journalled trades, on their own option candles:
+  // +80/-50 alone nets Rs59,166; arming a +6% stop at +24% nets Rs91,248, and Rs79,266 if every
+  // stop is refilled at the low of the bar that triggered it.
+  // Read with the env CLEARED, so this pins what the code ships rather than what the local `.env`
+  // happens to say — `.env` is gitignored and differs per machine, and a test that depends on it
+  // passes or fails for reasons that have nothing to do with the commit.
+  it('arms the checkpoint at +24% and parks the stop at +6%', () => {
+    const keys = ['DISPLACEMENT_ARM_AT_PCT', 'DISPLACEMENT_LOCK_PCT', 'DISPLACEMENT_TP2_PCT', 'DISPLACEMENT_SL_PCT'];
+    const before = keys.map((k) => process.env[k]);
+    for (const k of keys) delete process.env[k];
+    try {
+      const e = exits();
+      assert.equal(e.armAt, 0.24);
+      assert.equal(e.lock, 0.06);
+      assert.equal(e.second, 0.80);
+      assert.equal(e.stop, 0.50);
+    } finally {
+      keys.forEach((k, i) => { if (before[i] !== undefined) process.env[k] = before[i]; });
+    }
   });
 });
