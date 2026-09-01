@@ -123,6 +123,32 @@ export interface FeedTick {
 
 const ticks = new Map<string, FeedTick>();
 
+/**
+ * The sell-side range each instrument has traded through SINCE SOMEBODY LAST ASKED.
+ *
+ * WHY THIS IS NOT JUST ANOTHER FIELD ON `FeedTick`. `feedTick` reports the latest reading, which
+ * is the right answer for a display and the wrong one for a stop. The journal's mark pass runs
+ * every `refresh.quoteMs` — 15 seconds — and evaluates the target, the stop and the checkpoint
+ * against whatever the instantaneous bid happened to be at that moment. A move that goes through
+ * a level and comes back inside one poll is therefore invisible to it, while the 1-minute candle
+ * `settleDay` grades against sees it plainly, so the same trade closes at 13:17 in the settled
+ * record and never closes at all in the live one.
+ *
+ * That is not hypothetical. MPHASIS on 2026-09-01 wicked from 50.35 to 49.20 and back to 51.75
+ * inside minute 242, through a checkpoint lock at 49.50. Four polls covered that minute and none
+ * of them landed on the few seconds it was under the lock, so the row marked live until 15:15 and
+ * only then jumped to a 13:17 exit it had never shown.
+ *
+ * The feed sees every packet. Accumulating the extremes here and handing them over on demand
+ * closes the gap without polling faster, which would only narrow it.
+ *
+ * READ AND RESET, single consumer. `takeSellRange` empties the window it returns, so the caller
+ * gets each packet exactly once and the next window starts clean. That makes it wrong to call
+ * from two places — the second would see a hole — which is why it is documented as the journal's
+ * and nothing else reaches for it.
+ */
+const sellRange = new Map<string, { low: number; high: number }>();
+
 const EMPTY: Omit<FeedTick, 'instrumentKey' | 'isIndex' | 'day' | 'at' | 'feedTs'> = {
   ltp: 0, cp: 0, atp: 0, vtt: 0, oi: 0, oiHigh: 0, oiLow: 0, tbq: 0, tsq: 0, iv: 0,
   dayOpen: 0, dayHigh: 0, dayLow: 0, depth: [],
@@ -188,7 +214,38 @@ function applyPatch(patch: TickPatch, at: number, feedTs: number): void {
   // before a full one arrives, and that one cannot tell us which it is.
   if (patch.isIndex) next.isIndex = true;
 
+  // Computed from the MERGED tick rather than the patch, because a packet carrying only depth and
+  // one carrying only a price are both a new sell-side reading, and the other half comes from what
+  // we already held. Same bid-then-LTP fallback the journal's own `sellSide` uses, so the window
+  // and the instantaneous read can never disagree about what a seller would get.
+  const best = next.depth[0];
+  const sell = best && best.bidP > 0 ? best.bidP : next.ltp;
+  if (sell > 0) {
+    // A new session starts a new window, for the same reason the tick itself does not carry
+    // yesterday's readings forward: an overnight low is not a level anything traded through today.
+    const held = prev ? sellRange.get(patch.instrumentKey) : undefined;
+    sellRange.set(
+      patch.instrumentKey,
+      held ? { low: Math.min(held.low, sell), high: Math.max(held.high, sell) } : { low: sell, high: sell },
+    );
+  }
+
   ticks.set(patch.instrumentKey, next);
+}
+
+/**
+ * The sell-side low and high since this was last called, then start a fresh window.
+ *
+ * Null when nothing has arrived for the key since the last call — which is the honest answer and
+ * not a zero range: a silent instrument has not traded at the last price, it has not traded.
+ *
+ * THE JOURNAL'S MARK PASS IS THE ONLY CALLER. See `sellRange` for why a second one would break it.
+ */
+export function takeSellRange(key: string): { low: number; high: number } | null {
+  const r = sellRange.get(key);
+  if (!r) return null;
+  sellRange.delete(key);
+  return r;
 }
 
 /* ----------------------------------------------------------------- connection state --- */
@@ -462,6 +519,7 @@ export function feedStatus(nowMs = Date.now()): FeedStatus {
 /** Test seam — drop all state without touching the socket lifecycle. */
 export function resetFeedStore(): void {
   ticks.clear();
+  sellRange.clear();
   subscribed.clear();
   lastPacketAt = 0;
   packets = 0;

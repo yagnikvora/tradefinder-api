@@ -46,7 +46,7 @@ import { sessionCandles } from '../src/upstox.js';
 import { expiredSession, PlanRequiredError } from '../src/momentum/data/expired-candles.js';
 import { istDay } from '../src/momentum/session.js';
 import { rule, selectDisplacement, type DisplacementCandidate, type DisplacementInput } from '../src/momentum/alerts/displacement.js';
-import { gradePath, journalConfig, journalRepository, SHADOW } from '../src/momentum/journal/journal.js';
+import { dayEndOf, gradePath, journalConfig, journalRepository, SHADOW } from '../src/momentum/journal/journal.js';
 import { FileJournalRepository } from '../src/momentum/journal/repository.js';
 import { closePool, databaseUrl, getPool } from '../src/momentum/journal/postgres.js';
 import { universe } from '../src/momentum/data/universe.js';
@@ -577,6 +577,8 @@ async function main(): Promise<void> {
         maeMinute: g.maeMinute,
         // Deliberately null: candles carry no book, and a guessed spread is worse than a gap.
         spreadPctAtEntry: null,
+        // The hold-to-close counterfactual, from the same bars the grade came from.
+        dayEnd: dayEndOf(bars, paid, at.minute, size, cfg.lots, cfg.squareOffMin),
         amountUsed, grossPnl, charges, netPnl,
         netPct: netPnl === null || !amountUsed ? null : round(netPnl / amountUsed, 4),
         shadow,

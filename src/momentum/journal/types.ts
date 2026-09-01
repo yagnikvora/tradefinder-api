@@ -81,6 +81,25 @@ export interface JournalTrade {
    * the row from candles, which span the whole trade regardless of what was watched live.
    */
   markedFrom?: number | null;
+  /**
+   * What the contract was worth at the square-off, and what simply holding to it would have paid.
+   *
+   * THE COUNTERFACTUAL THE EXIT RULES ARE ACTUALLY JUDGED AGAINST. Every other number on this row
+   * describes the trade that was taken; this one describes the trade that was not, and the
+   * difference between them is the entire contribution of the target, the stop and the checkpoint.
+   * A row that banked +6% at 13:17 and a row that banked +6% at 15:15 are the same result and
+   * completely different decisions, and nothing else here can tell them apart.
+   *
+   * `netPnl` is charged the same brokerage as the real exit, so the two are directly subtractable
+   * — the comparison is meant to be read in rupees, not in percent, because that is where the
+   * fixed charge stops being negligible on a small position.
+   *
+   * Derived from the candle at `squareOffMin`, so it exists only once a row has been settled from
+   * candles: null on a live row, and null forever on one whose contract had none. The shadow rules
+   * answer a related question but not this one — they report where an ALTERNATIVE RULE would have
+   * exited, which lands on the close only when that rule happened never to fire.
+   */
+  dayEnd?: { premium: number; pct: number; netPnl: number } | null;
   /** Bid-ask at entry, as a percentage of the mid. The friction the charges figure excludes. */
   spreadPctAtEntry: number | null;
   amountUsed: number | null;

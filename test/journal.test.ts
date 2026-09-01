@@ -13,7 +13,9 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { gradePath, gradeRule, journalConfig, sessionBars, SHADOW } from '../src/momentum/journal/journal.js';
+import {
+  dayEndOf, gradePath, gradeRule, journalConfig, sessionBars, SHADOW,
+} from '../src/momentum/journal/journal.js';
 import type { UpstoxCandle } from '../src/upstox.js';
 
 /** A minute bar on the option's own premium. */
@@ -249,5 +251,45 @@ describe('journal · gradeRule (moving stops)', () => {
     const viaRule = gradeRule(path, PAID, FROM, { name: 'x', tp: 0.80, sl: 0.50 }, LAST);
     assert.equal(viaRule.out, plain.out);
     assert.ok(Math.abs(viaRule.pct - plain.pct) < 1e-9);
+  });
+});
+
+// THE COUNTERFACTUAL THE EXIT RULES ARE JUDGED AGAINST. A row that banked +6% at 13:17 and one
+// that banked +6% at 15:15 are the same result and a completely different decision; nothing else
+// on the row separates them. MPHASIS on 2026-09-01 is the case: checkpointed out at 49.50 on a
+// one-minute wick, then closed the session at 51.05.
+describe('journal · the day-end counterfactual', () => {
+  const SIZE = 275, LOTS = 1, CHARGE = journalConfig().chargePerLot;
+
+  it('prices the close against the entry, charged like a real exit', () => {
+    const d = dayEndOf([bar(100, 50, 52, 51), bar(359, 50, 52, 51.05)], 46.7, 75, SIZE, LOTS, LAST);
+    assert.equal(d?.premium, 51.05);
+    assert.equal(d?.pct, +((51.05 - 46.7) / 46.7).toFixed(4));
+    assert.equal(d?.netPnl, +((51.05 - 46.7) * SIZE - CHARGE).toFixed(2));
+  });
+
+  // Option candles run past 15:15. Grading against a close nobody could have taken would make
+  // every exit rule look worse than it was, which is the opposite of the point.
+  it('takes the last bar at or before the square-off, not the last bar there is', () => {
+    const d = dayEndOf([bar(359, 50, 52, 51), bar(375, 60, 62, 61)], 46.7, 75, SIZE, LOTS, LAST);
+    assert.equal(d?.premium, 51);
+  });
+
+  it('ignores bars at or before the entry', () => {
+    const d = dayEndOf([bar(10, 10, 12, 11)], 46.7, 75, SIZE, LOTS, LAST);
+    assert.equal(d, null);
+  });
+
+  // Same refusal `price` makes: a contract nobody could size is not a trade to compare against.
+  it('declines rather than inventing a number it cannot have', () => {
+    assert.equal(dayEndOf([], 46.7, 75, SIZE, LOTS, LAST), null);
+    assert.equal(dayEndOf([bar(359, 50, 52, 51)], 46.7, 75, 0, LOTS, LAST), null);
+    assert.equal(dayEndOf([bar(359, 50, 52, 51)], 0, 75, SIZE, LOTS, LAST), null);
+  });
+
+  it('reports a loss when the close is under the entry', () => {
+    const d = dayEndOf([bar(359, 30, 32, 31)], 46.7, 75, SIZE, LOTS, LAST);
+    assert.equal(d!.netPnl < 0, true);
+    assert.equal(d!.pct < 0, true);
   });
 });

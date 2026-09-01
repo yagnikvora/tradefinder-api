@@ -43,7 +43,7 @@
 // exit as a 15:15 square-off.
 
 import { istDay, istMinutes, SESSION_CLOSE_MIN, SESSION_OPEN_MIN } from '../session.js';
-import { feedTick, subscribeKeys } from '../../feed/client.js';
+import { feedTick, subscribeKeys, takeSellRange } from '../../feed/client.js';
 import { sessionCandles, type UpstoxCandle } from '../../upstox.js';
 import {
   FileJournalRepository, MirrorJournalRepository,
@@ -373,22 +373,39 @@ export async function journalTick(nowMs = Date.now()): Promise<void> {
         const seen = [t.mfeMinute, t.maeMinute].filter((m): m is number => m !== null && m !== undefined);
         t.markedFrom = seen.length ? Math.min(...seen) : null;
       }
-      if (t.mfePct === null || pct > t.mfePct) { t.mfePct = pct; t.mfeMinute = minute; }
-      if (t.maePct === null || pct < t.maePct) { t.maePct = pct; t.maeMinute = minute; }
+      // THE WHOLE WINDOW, NOT THE INSTANT. `out` is where the bid stands right now; `range` is
+      // everywhere it has been since the previous pass. Levels are tested against the range and
+      // the excursions are built from it, because a poll every `refresh.quoteMs` cannot otherwise
+      // see a move that goes through a level and comes back between two of its own samples — and
+      // the 1-minute candles `settleDay` grades against see exactly that. Without this the live
+      // row and the settled row disagree for the rest of the session: MPHASIS on 2026-09-01
+      // wicked through its checkpoint inside minute 242 and went on marking live until 15:15.
+      const range = takeSellRange(t.contract.instrumentKey) ?? { low: out, high: out };
+      const lowPct = (range.low - t.entry.premium) / t.entry.premium;
+      const highPct = (range.high - t.entry.premium) / t.entry.premium;
+
+      if (t.mfePct === null || highPct > t.mfePct) { t.mfePct = highPct; t.mfeMinute = minute; }
+      if (t.maePct === null || lowPct < t.maePct) { t.maePct = lowPct; t.maeMinute = minute; }
       t.updatedAt = nowMs;
       changed.push(t);
 
-      // The stop in force right now. `mfePct` has already absorbed this tick above, which is
+      // The stop in force right now. `mfePct` has already absorbed this window above, which is
       // correct here and not look-ahead: a live marker genuinely sees the high before it can act
       // on it, unlike a candle where the two are simultaneous by construction.
       const armed = cfg.armAtPct > 0 && (t.mfePct ?? 0) >= cfg.armAtPct;
       const stop = armed ? cfg.lockPct : -cfg.slPct;
 
-      // Stop checked before target: if this tick could be read either way, it is the stop.
-      if (pct <= stop || pct >= cfg.tpPct) {
+      // Stop checked before target: if this window could be read either way, it is the stop.
+      const hitStop = lowPct <= stop;
+      if (hitStop || highPct >= cfg.tpPct) {
+        // Filled AT THE LEVEL, not at the extreme the window reached through it — the same
+        // convention `gradePath` uses on a candle, and the one that does not credit the position
+        // with a price it only touched on the way past.
+        const exitPct = hitStop ? stop : cfg.tpPct;
         t.exit = {
-          at: nowMs, minute, premium: t.mark.premium, spot: null, source: 'auto',
-          reason: pct <= stop ? (armed ? 'checkpoint' : 'stop') : 'target',
+          at: nowMs, minute, premium: +(t.entry.premium * (1 + exitPct)).toFixed(2),
+          spot: null, source: 'auto',
+          reason: hitStop ? (armed ? 'checkpoint' : 'stop') : 'target',
         };
         t.status = 'closed';
         price(t);
@@ -676,6 +693,31 @@ export async function backfillExcursions(day: string, nowMs = Date.now()): Promi
  * Runs after the square-off minute, and on boot for any earlier day left unsettled — which is
  * what makes an overnight restart or a crashed afternoon cost the record nothing.
  */
+/**
+ * What holding to the square-off would have paid, from the same bars the grade came from.
+ *
+ * The LAST BAR AT OR BEFORE the square-off, not the last bar there is: option candles run a few
+ * minutes past 15:15 and grading to 15:30 would compare the exit rules against a close nobody
+ * could have taken. `gradePath` bounds itself the same way.
+ */
+export function dayEndOf(
+  bars: Array<{ minute: number; close: number }>,
+  paid: number,
+  fromMinute: number,
+  size: number,
+  lots: number,
+  squareOffMin: number,
+): JournalTrade['dayEnd'] {
+  const last = bars.filter((b) => b.minute > fromMinute && b.minute <= squareOffMin).pop();
+  if (!last || !(last.close > 0) || !(size > 0) || !(paid > 0)) return null;
+  return {
+    premium: +last.close.toFixed(2),
+    pct: +((last.close - paid) / paid).toFixed(4),
+    // Charged like the real exit, so the two subtract cleanly.
+    netPnl: +((last.close - paid) * size - journalConfig().chargePerLot * lots).toFixed(2),
+  };
+}
+
 export async function settleDay(day: string, nowMs = Date.now()): Promise<number> {
   const cfg = journalConfig();
   if (!cfg.enabled) return 0;
@@ -746,6 +788,10 @@ export async function settleDay(day: string, nowMs = Date.now()): Promise<number
       const w = gradeRule(bars, t.entry.premium, t.entry.minute, s, cfg.squareOffMin);
       return { name: s.name, pct: +w.pct.toFixed(4), out: w.out, minute: w.minute };
     });
+    t.dayEnd = dayEndOf(
+      bars, t.entry.premium, t.entry.minute,
+      t.contract!.lotSize * t.lots, t.lots, cfg.squareOffMin,
+    );
     t.status = 'closed';
     t.settled = true;
     price(t);

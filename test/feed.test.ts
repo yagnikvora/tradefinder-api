@@ -14,7 +14,7 @@ import { describe, it, beforeEach } from 'node:test';
 
 import { decodeFeed, subscribeFrame } from '../src/feed/proto.js';
 import {
-  feedCoverage, feedTick, feedUsable, injectPatches, resetFeedStore, setPhaseForTest,
+  feedCoverage, feedTick, feedUsable, injectPatches, resetFeedStore, setPhaseForTest, takeSellRange,
 } from '../src/feed/client.js';
 import { fromTick } from '../src/momentum/data/quotes.js';
 
@@ -432,5 +432,59 @@ describe('feed: mapping a tick onto the scanner reading', () => {
     assert.equal(q.openInterest, 6000);
     assert.equal(q.oiDayHigh, 7000);
     assert.equal(q.oiDayLow, 5000);
+  });
+});
+
+// THE WINDOW THE JOURNAL'S STOPS ARE TESTED AGAINST.
+//
+// `feedTick` reports the latest reading, which is right for a display and wrong for a stop: the
+// mark pass samples every 15 seconds and would miss a move that goes through a level and comes
+// back between two of its own polls. MPHASIS on 2026-09-01 did exactly that — 50.35 to 49.20 and
+// back to 51.75 inside one minute, through a checkpoint lock at 49.50 — and marked live until
+// 15:15 while the settled record closed it at 13:17.
+describe('feed · the sell-side window', () => {
+  beforeEach(() => resetFeedStore());
+
+  const at = (ltp: number, ms: number, bidP?: number) =>
+    injectPatches([{
+      instrumentKey: 'O', isIndex: false, ltp,
+      ...(bidP === undefined ? {} : { depth: [{ bidP, bidQ: 1, askP: bidP + 0.2, askQ: 1 }] }),
+    }], ms);
+
+  it('remembers a low that came and went between two reads', () => {
+    at(50.35, 1000);
+    at(49.20, 1500);   // the wick, gone before the next poll
+    at(51.75, 2000);
+    assert.deepEqual(takeSellRange('O'), { low: 49.20, high: 51.75 });
+  });
+
+  it('prefers the bid, like the exit it prices', () => {
+    at(50, 1000, 49.5);
+    assert.deepEqual(takeSellRange('O'), { low: 49.5, high: 49.5 });
+  });
+
+  it('starts a clean window after each read, so no packet is counted twice', () => {
+    at(50, 1000);
+    at(40, 1100);
+    assert.deepEqual(takeSellRange('O'), { low: 40, high: 50 });
+    at(45, 2000);
+    assert.deepEqual(takeSellRange('O'), { low: 45, high: 45 });
+  });
+
+  // Null, not a zero-width range at the last price: a silent instrument has not traded at that
+  // price, it has not traded. The caller falls back to its own instantaneous read.
+  it('says nothing when nothing has arrived since the last read', () => {
+    at(50, 1000);
+    takeSellRange('O');
+    assert.equal(takeSellRange('O'), null);
+    assert.equal(takeSellRange('never-seen'), null);
+  });
+
+  it('does not carry an overnight low into the new session', () => {
+    const tue = Date.UTC(2026, 8, 1, 6, 0);
+    const wed = Date.UTC(2026, 8, 2, 6, 0);
+    at(10, tue);
+    at(90, wed);
+    assert.deepEqual(takeSellRange('O'), { low: 90, high: 90 });
   });
 });
