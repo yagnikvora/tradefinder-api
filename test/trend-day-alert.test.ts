@@ -16,7 +16,9 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { buildMessage, buildMessages, newlyConfirmed, type TrendDayAlert } from '../src/momentum/alerts/trend-day.js';
+import {
+  buildMessage, buildMessages, needingChains, newlyConfirmed, type TrendDayAlert,
+} from '../src/momentum/alerts/trend-day.js';
 import { HTML, MARKDOWN } from '../src/alerts/markup.js';
 import type { ConvictionSummary, MomentumRow, SignalPlan, StrikeChoice } from '../src/momentum/types.js';
 
@@ -198,6 +200,30 @@ describe('trend-day alert: the message', () => {
     assert.equal(msg.includes('no ATR'), false);
   });
 
+  // A STALLED DAY STILL NAMES ITS CONTRACT. `priceContracts` prices every alert it sends, ranking
+  // a plan-less row against an ATR target rather than skipping it — because a row with no
+  // contract journals `untracked`, which is a signal nobody can grade afterwards. KALYANKJIL on
+  // 2026-09-01 was the case that proved it: stale by 3.1 minutes, alerted, and left no record.
+  it('still names the contract on a stalled day the plan builder declined', () => {
+    const msg = buildMessage([alert({ plan: null, atrUsed: 1.4 })], HTML, NOW);
+    assert.match(msg, /stopped making new extremes/);
+    assert.match(msg, /BUY 1420 PE/);
+    assert.match(msg, /₹21,300<\/b> per lot/);
+    // The lot is nameable, so the reader is never told to go and pick the contract themselves.
+    assert.equal(msg.includes('pick the contract yourself'), false);
+  });
+
+  // The target handed to the strike picker is an input to the ranking, not a level anybody
+  // promised. Printing rupees against it would contradict the line directly above it.
+  it('prints no target and no stop for a contract it has no plan for', () => {
+    const msg = buildMessage([alert({ plan: null, atrUsed: 1.4 })], HTML, NOW);
+    assert.equal(msg.includes('Target →'), false);
+    assert.equal(msg.includes('Stop →'), false);
+    // What IS a property of the contract rather than of a plan still prints.
+    assert.match(msg, /Delta 0\.42/);
+    assert.match(msg, /B\/E 1391\.60/);
+  });
+
   // Confirmation is a claim about the DAY. A stock still printing new extremes at the moment it
   // confirms is a chase, and the message says which it is rather than implying an entry.
   it('flags a row still making new extremes as the chase', () => {
@@ -288,5 +314,44 @@ describe('trend-day alert: the message', () => {
   it('escapes markup arriving in a symbol or a warning', () => {
     const msg = buildMessage([alert({ strike: strike({ warnings: ['spread & depth <thin>'] }) })], HTML, NOW);
     assert.match(msg, /spread &amp; depth &lt;thin&gt;/);
+  });
+});
+
+// Every alert that goes out now gets a contract, so plan-less rows compete for the same 20 chain
+// fetches a tick that used to be reserved for planned ones by the filter itself. The guarantee
+// that keeps that from being a silent regression is the ordering, not the cap.
+describe('trend-day alert: which rows get a chain', () => {
+  const many = (n: number, planned: boolean): TrendDayAlert[] =>
+    Array.from({ length: n }, (_, i) =>
+      alert({ symbol: `${planned ? 'P' : 'U'}${i}`, strike: null, plan: planned ? plan() : null }));
+
+  it('leaves out anything that already has a contract', () => {
+    assert.deepEqual(needingChains([alert()]).map((a) => a.symbol), []);
+  });
+
+  it('takes a plan-less row, which is the whole point of the change', () => {
+    const out = needingChains([alert({ plan: null, strike: null })]);
+    assert.equal(out.length, 1);
+  });
+
+  // The regression this exists to prevent: 25 confirmations in one tick, 5 of them stalled. The
+  // stalled ones must not push a planned row out of the 20 the cap allows.
+  it('spends the cap on planned rows before plan-less ones', () => {
+    const out = needingChains([...many(5, false), ...many(20, true)]);
+    assert.equal(out.length, 20);
+    assert.equal(out.every((a) => a.plan !== null), true);
+  });
+
+  // Under the cap nothing is dropped, and the conviction order `onScan` sorted into each group
+  // survives the partition — so a message still reads strongest-first within each half.
+  it('gives the spare slots to plan-less rows, planned ones first', () => {
+    const out = needingChains([...many(3, false), ...many(2, true)]);
+    assert.deepEqual(out.map((a) => a.symbol), ['P0', 'P1', 'U0', 'U1', 'U2']);
+  });
+
+  it('does not reorder the caller\'s array', () => {
+    const input = [...many(1, false), ...many(1, true)];
+    needingChains(input);
+    assert.deepEqual(input.map((a) => a.symbol), ['U0', 'P0']);
   });
 });

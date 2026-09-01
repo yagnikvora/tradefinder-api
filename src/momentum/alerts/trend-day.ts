@@ -39,6 +39,7 @@
 
 import { istDay, minuteOfSession } from '../session.js';
 import { store, STORE_KEYS } from '../store.js';
+import { getBaseline } from '../data/baseline.js';
 import { stockChain } from '../data/option-chain.js';
 import { universe } from '../data/universe.js';
 import { selectStrike } from '../services/strike.service.js';
@@ -167,6 +168,27 @@ export interface TrendDayAlert {
 }
 
 /**
+ * Which alerts still need a chain fetched, in the order the cap should spend itself.
+ *
+ * Pure and separated from `priceContracts` for the same reason `newlyConfirmed` is separated from
+ * `onScan`: the ordering is the whole correctness of the cap and it should be testable without a
+ * chain or a clock.
+ *
+ * PLANNED ROWS FIRST. Every alert that goes out now gets a contract, plan or no plan, so the
+ * plan-less rows compete for `MAX_CHAIN_FETCHES` slots that used to be reserved for planned ones
+ * by the filter itself. A stable partition keeps the conviction order inside each group and
+ * guarantees the first `MAX_CHAIN_FETCHES` still contains every row the old filter would have
+ * priced — so widening the filter cannot cost a planned row its chain on a heavy tick. Seventeen
+ * stocks confirmed on 2026-08-12 and eight landed in one tick; the cap is not hypothetical.
+ */
+export function needingChains(alerts: TrendDayAlert[]): TrendDayAlert[] {
+  return alerts
+    .filter((a) => !a.strike)
+    .sort((x, y) => Number(Boolean(y.plan)) - Number(Boolean(x.plan)))
+    .slice(0, MAX_CHAIN_FETCHES);
+}
+
+/**
  * Which rows have just confirmed and clear the floor — pure, so the whole selection is testable
  * without a clock, a chain or a disk.
  */
@@ -218,22 +240,63 @@ async function priceContracts(alerts: TrendDayAlert[], cfg: MomentumConfig, nowM
   // and the position cost down with the stop and the target, none of which needed it.
   for (const a of alerts) a.lotSize ??= uni.bySymbol.get(a.symbol)?.future?.lotSize ?? null;
 
-  // Selecting a strike genuinely does need the plan — the contract is ranked against the plan's
-  // target, and picking one without it would be naming a strike on no reasoning at all.
-  const needing = alerts.filter((a) => !a.strike && a.plan).slice(0, MAX_CHAIN_FETCHES);
+  // EVERY ALERT THAT GOES OUT GETS A CONTRACT, including one the plan builder declined.
+  //
+  // This used to require a plan, on the reasoning that a strike is ranked against the plan's
+  // target and picking one without it would be naming a strike on no reasoning at all. The
+  // reasoning was sound and the conclusion was wrong, because the target handed to the picker is
+  // not a recommendation — it is the move the contract has to survive, which is why
+  // `displacement.ts` derives its own from ATR and has never needed a plan at all.
+  //
+  // What the requirement actually cost: a confirmed day that has stopped making new extremes goes
+  // stale, `trendStale` withdraws the ATR budget, `roomAtr` reads 0 on an already-extended stock
+  // and `buildPlan` returns null. The alert still goes out — `usable` passes it on ATR alone —
+  // but it went out with no contract, so `recordEntries` journalled it `untracked`: no premium,
+  // no path, no grade, and no way to ever ask whether the trade was worth taking. KALYANKJIL on
+  // 2026-09-01 was stale by 3.1 minutes and cost a +12% session that the journal could not see.
+  //
+  // So: rank against the plan's target when there is one, and against the same ATR target the
+  // plan itself would have used when there is not. The MESSAGE still prints no stop and no
+  // target for a plan-less row — see `contractLines` — because the model genuinely declined to
+  // size those. Naming the contract is not the same claim as naming a level.
+  //
+  // PLANNED ROWS TAKE THE CAP FIRST, so widening the filter cannot cost a row a chain it would
+  // have had before. `alerts` arrives sorted by conviction and this is a stable partition, so the
+  // planned rows keep that order among themselves and are followed by the plan-less ones in
+  // theirs — which means the first `MAX_CHAIN_FETCHES` still contains every row the old filter
+  // would have priced. Without this the change would be a silent regression on the heavy ticks
+  // this cap exists for: 17 stocks confirmed on 2026-08-12 and 8 landed in one tick.
+  const needing = needingChains(alerts);
   if (!needing.length) return;
+
+  // Only fetched when something actually needs it, and only for the plan-less rows: the baseline
+  // is the same per-symbol ATR `buildPlan` works from, so the fallback target is the one the plan
+  // would have carried had its budget not been withdrawn.
+  const atrOf = needing.every((a) => a.plan)
+    ? new Map<string, number>()
+    : new Map(
+      Object.values((await getBaseline(nowMs).catch(() => ({ baseline: null }))).baseline?.symbols ?? {})
+        .filter((s) => s.atr > 0)
+        .map((s) => [s.symbol, s.atr] as const),
+    );
 
   await Promise.all(
     needing.map(async (a) => {
       try {
         const member = uni.bySymbol.get(a.symbol);
         if (!member) return;
+        // A plan-less row with no ATR either has nothing to rank against and nothing to say. That
+        // is the baseline hole the message already names, not this stalled-day case.
+        const atr = atrOf.get(a.symbol) ?? null;
+        const target = a.plan?.target
+          ?? (atr === null ? null : a.price + a.direction * cfg.signal.trend.targetAtr * atr);
+        if (target === null) return;
         const chain = await stockChain(a.symbol, member.equityKey, nowMs);
         a.strike = selectStrike({
           chain,
           direction: a.direction,
           spot: a.price,
-          targetPrice: a.plan!.target,
+          targetPrice: target,
           lotSize: a.lotSize,
           // The same band `buildSignal` uses for a trend re-entry. A confirmed trend day is a
           // 30–90 minute hold, not a scalp, so the payoff ranking on its own would walk out to
@@ -336,7 +399,13 @@ function block(a: TrendDayAlert, m: Markup): string[] {
       ` — ${m.bold(`₹${s.entryCost.toFixed(2)}`)} × ${s.lotSize ?? '?'} = ${m.bold(s.costPerLot === null ? '—' : inr(s.costPerLot))} per lot`,
     );
     const legs = [
-      s.profitPerLot !== null
+      // ONLY WHEN THERE IS A PLAN. A plan-less row is still given a contract so the journal can
+      // track it, and the picker was handed an ATR target to rank strikes against — but that
+      // target is an input to the ranking, not a level anybody promised. Printing rupees against
+      // it here would contradict the "the model will not size a target on it" line directly
+      // above. `riskPerLot` already returns null without a plan, so on such a row this whole
+      // line drops out and the contract stands on its own.
+      a.plan && s.profitPerLot !== null
         ? `🎯 Target → ${m.bold(`+${inr(s.profitPerLot)}`)}${s.gainPctAtTarget === null ? '' : ` (+${s.gainPctAtTarget.toFixed(0)}%)`}`
         : null,
       // The downside in rupees, first-order in delta. Labelled an estimate because it is one —
