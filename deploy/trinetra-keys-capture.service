@@ -1,0 +1,35 @@
+# Monthly capture of the option instrument-key map. Driven by trinetra-keys-capture.timer.
+#
+# WHY THIS IS A TIMER AND NOT SOMETHING YOU REMEMBER TO RUN. Upstox option keys are opaque tokens
+# (`NSE_FO|144219`) and the only endpoints that reveal them answer ONLY for unexpired contracts.
+# Miss the window and that series can never be mapped again from the live API — see the header of
+# tools/option-keys-capture.ts, which is blunt about it: "not merely harder, it is impossible."
+#
+# The recovery path (tools/option-keys-recover.ts) exists and works, but it needs an Upstox Plus
+# subscription and only reaches back to 2024-10-31. A timer that costs nothing is the cheaper
+# insurance, and it belongs on the always-on host rather than on a laptop that may be shut.
+
+[Unit]
+Description=Trinetra — capture option instrument keys before expiry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=trinetra
+Group=trinetra
+WorkingDirectory=/srv/trinetra/api
+EnvironmentFile=/srv/trinetra/api/.env
+# tsx, not node: the tools/ scripts are not part of `npm run build` and are run from source.
+# This is the one place the server needs devDependencies installed — see deploy.sh.
+ExecStart=/usr/bin/npx tsx tools/option-keys-capture.ts
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/trinetra/api/.cache
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trinetra-keys

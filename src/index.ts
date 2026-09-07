@@ -214,4 +214,49 @@ app.get('/health/volume', async (_q, res) => {
 // exit, and a market-data server going dark is a far worse outcome than a logged error.
 process.on('unhandledRejection', (e) => console.error('[api] unhandled rejection:', e));
 
-app.listen(PORT, () => console.log(`\n  TradeFinder API  →  http://localhost:${PORT}\n`));
+/**
+ * WHICH INTERFACE THE API ANSWERS ON, and why the default is loopback rather than 0.0.0.0.
+ *
+ * `app.listen(PORT)` binds every interface. On a laptop that is harmless; on a public host it
+ * publishes an API that has no authentication of any kind — `app.use(cors())` above is open to
+ * every origin — and nine of its routes MUTATE. `POST /momentum/baseline/rebuild` spends ~416
+ * Upstox candle requests per call against a 2000-per-30-minute budget, so a stranger with curl
+ * can empty the quota that the 08:00 baseline build needs; `PATCH /momentum/journal/:id` and
+ * `POST /momentum/journal/settle` edit the one record in this app that cannot be rebuilt.
+ *
+ * Binding to 127.0.0.1 costs nothing here because NOTHING REACHES THIS DIRECTLY. Every consumer
+ * is server-side: the Next pages import `lib/api.ts` from server components, and `lib/proxy.ts`
+ * exists so the browser polls the web app's own origin instead of this port. So the deployment is
+ * nginx -> Next (3000) -> here (4100) over loopback, and only nginx is ever public.
+ *
+ * HOST is still an env var rather than a constant: a container needs 0.0.0.0 to be reachable from
+ * outside its namespace, and that is a legitimate setup. It is opt-in because the safe choice
+ * should be the one you get by forgetting to make a choice.
+ */
+const HOST = process.env.HOST || '127.0.0.1';
+
+/**
+ * A NAMED PIPE IN `PORT`, which is how IIS hands a Node app its socket.
+ *
+ * Under iisnode — Plesk on Windows, and IIS generally — `process.env.PORT` is not a number. It is
+ * a pipe path like `\\.\pipe\5f3a...`, and IIS is already listening on the other end of it. Two
+ * things then go wrong with the plain numeric path above, and both fail QUIETLY:
+ *
+ *   `Number('\\\\.\\pipe\\...')` is NaN, so `Number(...) || 4100` falls back to 4100 and the
+ *   process binds a TCP port nothing is connected to. The app logs a clean startup line and IIS
+ *   answers 500 for every request, because the pipe it is waiting on never got a listener.
+ *
+ *   `listen(path, host)` is not a valid overload. A pipe has no interface to bind, so the host
+ *   argument has to be omitted rather than passed as loopback.
+ *
+ * Hence the branch: if PORT is set and is not a finite number, treat it as a pipe and listen on it
+ * directly. Everything else — a laptop, a VPS, a container — is unchanged.
+ */
+const rawPort = process.env.PORT ?? '';
+const isPipe = rawPort !== '' && !Number.isFinite(Number(rawPort));
+
+if (isPipe) {
+  app.listen(rawPort, () => console.log(`\n  Trinetra API  →  ${rawPort} (iisnode)\n`));
+} else {
+  app.listen(PORT, HOST, () => console.log(`\n  Trinetra API  →  http://${HOST}:${PORT}\n`));
+}

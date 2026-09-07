@@ -1,0 +1,17 @@
+# Lets the service account restart its own two units, and nothing else.
+#
+#   sudo cp deploy/trinetra.sudoers /etc/sudoers.d/trinetra
+#   sudo chmod 440 /etc/sudoers.d/trinetra
+#   sudo visudo -c                              # MUST print "parsed OK" before you log out
+#
+# WHY THIS FILE EXISTS. deploy.sh runs as `trinetra` and ends with `systemctl restart`, which needs
+# root. The alternatives are worse: running the whole deploy as root means `npm ci` executes
+# package install scripts as root, and giving the account general sudo makes the service account a
+# root account with extra steps. This grants exactly two verbs on exactly two units.
+#
+# The commands are listed in full, with no wildcard on the unit name. `systemctl restart *` would
+# let this account restart sshd or the firewall; naming the units means it cannot.
+trinetra ALL=(root) NOPASSWD: /bin/systemctl restart trinetra-api, \
+                              /bin/systemctl restart trinetra-web, \
+                              /bin/systemctl status trinetra-api, \
+                              /bin/systemctl status trinetra-web

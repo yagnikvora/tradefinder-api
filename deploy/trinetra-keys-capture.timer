@@ -1,0 +1,21 @@
+# Fires on the 22nd of each month at 18:00 IST.
+#
+# WHY THE 22nd. The monthly series expires on the LAST TUESDAY, which falls between the 25th and
+# the 31st. The 22nd is therefore always at least three days clear of it, which leaves room for
+# the run to fail on a holiday or a bad network and still be retried by hand before the deadline.
+# Persistent=true covers the other failure: a host that was powered off on the 22nd runs the
+# capture as soon as it is back, rather than silently skipping that month.
+
+[Unit]
+Description=Monthly option-key capture for Trinetra
+Documentation=file:///srv/trinetra/api/deploy/README.md
+
+[Timer]
+OnCalendar=*-*-22 18:00:00
+Persistent=true
+# The IST assumption lives here rather than in the app, which does its own +330 arithmetic and
+# does not care what the host clock is set to.
+Unit=trinetra-keys-capture.service
+
+[Install]
+WantedBy=timers.target

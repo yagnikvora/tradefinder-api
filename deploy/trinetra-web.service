@@ -1,0 +1,54 @@
+# systemd unit for the Trinetra web app — the Next.js dashboard.
+#
+#   sudo cp deploy/trinetra-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now trinetra-web
+#
+# WHY API_BASE IS SET HERE BUT NEXT_PUBLIC_API_BASE IS NOT. They are read at different times.
+# `API_BASE` is read at request time by the server components and the route handlers in
+# web/app/api/**, so setting it in this unit works. `NEXT_PUBLIC_*` is INLINED INTO THE BUNDLE AT
+# BUILD TIME — setting it here does nothing at all, and the browser would keep whatever value was
+# present during `next build`. If you ever need it, export it in deploy.sh before the build.
+#
+# The API_BASE below is loopback on purpose: the API binds 127.0.0.1 (see api/src/index.ts) and
+# every page reaches it server-side, so nothing about this app requires port 4100 to be public.
+
+[Unit]
+Description=Trinetra Web
+Documentation=file:///srv/trinetra/api/deploy/README.md
+After=network-online.target trinetra-api.service
+Wants=network-online.target
+# Wants, not Requires: the dashboard should still render — and say the upstream is unreachable —
+# when the API is down. Requires would take the page down with it and leave nothing to read.
+Wants=trinetra-api.service
+
+[Service]
+Type=simple
+
+# --- edit for this host -------------------------------------------------------
+User=trinetra
+Group=trinetra
+WorkingDirectory=/srv/trinetra/web
+ExecStart=/usr/bin/npx next start -p 3000
+# ------------------------------------------------------------------------------
+
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=API_BASE=http://127.0.0.1:4100
+
+Restart=always
+RestartSec=10
+
+# Next writes nothing outside .next once built, so this needs no ReadWritePaths — but it also
+# means a rebuild MUST happen before the restart, never after it. deploy.sh does them in order.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trinetra-web
+
+[Install]
+WantedBy=multi-user.target

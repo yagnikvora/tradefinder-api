@@ -1,0 +1,67 @@
+# systemd unit for the Trinetra API — the scanner, the alerts and the journal writer.
+#
+# This supersedes tools/tradefinder-api.service, which was an unedited template: it pointed at
+# /home/pi, ran as `pi`, started `npm start`, and referenced a `tradefinder-recorder.service` that
+# does not exist in this repository. Delete that file once this one is installed.
+#
+#   1. Edit User= / WorkingDirectory= / EnvironmentFile= if your layout differs from /srv/trinetra.
+#   2. sudo cp deploy/trinetra-api.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload && sudo systemctl enable --now trinetra-api
+#   4. curl http://127.0.0.1:4100/health          -> {"ok":true}
+#
+# WHY ExecStart IS `node dist/index.js` AND NOT `npm start`. `npm start` runs `tsx src/index.ts`,
+# and tsx is a devDependency. A server installed with `npm ci --omit=dev` — which is what you want
+# in production — therefore cannot boot at all, and the failure arrives as a module-not-found at
+# 08:00 rather than at deploy time. `npm run build` emits plain ESM to dist/ (the imports already
+# carry .js extensions), so the runtime needs only cors, express and pg. Verified: the compiled
+# build boots and answers /health.
+
+[Unit]
+Description=Trinetra API
+Documentation=file:///srv/trinetra/api/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- edit for this host -------------------------------------------------------
+User=trinetra
+Group=trinetra
+WorkingDirectory=/srv/trinetra/api
+ExecStart=/usr/bin/node dist/index.js
+# Holds UPSTOX_ACCESS_TOKEN and DATABASE_URL. Keep it 0600 — both are live credentials.
+EnvironmentFile=/srv/trinetra/api/.env
+# ------------------------------------------------------------------------------
+
+Environment=NODE_ENV=production
+
+# Restart=always, not on-failure. The process is expected to outlive transient upstream faults,
+# and the one thing worse than a restart loop is a scanner that quietly stopped at 09:20 and is
+# not noticed until the journal has no trades for the day.
+Restart=always
+RestartSec=10
+
+# Hardening. The app reads its source tree and writes exactly one directory, so `strict` plus a
+# single ReadWritePaths is enough — and it is worth having, because this process holds a token
+# that can place no orders but can read your whole account, and a database credential that can.
+#
+# ReadWritePaths IS NOT OPTIONAL. Under ProtectSystem=strict the entire filesystem is read-only
+# apart from what is listed here, and the app writes .cache/ constantly — the session flush every
+# 60s, the journal on every alert, the baseline each morning. Omit this line and the service
+# starts cleanly and then fails on the first write, which is the most confusing possible ordering.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/srv/trinetra/api/.cache
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trinetra-api
+
+[Install]
+WantedBy=multi-user.target
