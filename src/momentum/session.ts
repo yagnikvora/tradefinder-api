@@ -27,6 +27,21 @@ export const istMinutes = (nowMs: number = Date.now()): number => {
   return d.getUTCHours() * 60 + d.getUTCMinutes();
 };
 
+/**
+ * When a session minute happened, as epoch ms. The inverse of `istMinutes`.
+ *
+ * WHY THIS EXISTS. An exit derived from candles is graded hours after it happened: the minute is
+ * known exactly and the moment the grading RAN has nothing to do with it. Reaching for
+ * `Date.now()` there stamps the job's own clock onto the trade, which is invisible while
+ * settlement runs at 15:16 and absurd the moment it does not — a 15:15 square-off re-settled
+ * after dinner printed as 10:26 PM, with an eleven-hour holding period to match.
+ *
+ * Only for minutes that belong to `day`'s session. A live event already knows its own timestamp
+ * and must keep it; this is for reconstructing one that does not.
+ */
+export const sessionAt = (day: string, minute: number): number =>
+  Date.parse(`${day}T00:00:00Z`) + (SESSION_OPEN_MIN + minute - IST_OFFSET_MIN) * 60_000;
+
 /** Today in IST as YYYY-MM-DD. Not the host's date — at 03:00 IST those differ. */
 export const istDay = (nowMs: number = Date.now()): string => ist(nowMs).toISOString().slice(0, 10);
 

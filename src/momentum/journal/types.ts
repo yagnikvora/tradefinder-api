@@ -129,8 +129,12 @@ export interface JournalTrade {
    * Without it "revert to settled" cannot revert: settlement re-derives the EXIT from candles but
    * takes the entry premium as given, so a row edited and then reverted would keep the typed
    * entry and grade a fresh exit against it — a third set of numbers that was never true.
+   *
+   * `lots` is snapshotted with them because the edit dialog always sends it: a revert that put
+   * the settled prices back but left the typed size in place produced a position that was never
+   * held at a price that was never paid.
    */
-  original?: { entry: JournalFill; exit: JournalTrade['exit'] };
+  original?: { entry: JournalFill; exit: JournalTrade['exit']; lots?: number };
 }
 
 export interface JournalEntryInput {

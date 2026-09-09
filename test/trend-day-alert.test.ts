@@ -116,6 +116,38 @@ describe('trend-day alert: which rows are announced', () => {
     assert.equal(newlyConfirmed([bull], new Set(['KPITTECH|-1']), NOW, 65).length, 1);
   });
 
+  /* ------------------------------------------------ one stock, one position, one day --- */
+  //
+  // Displacement fires between 09:27 and 10:00 and a trend day cannot confirm before 10:30, so
+  // whatever displacement took this morning is settled by the time this channel looks. Taking it
+  // again is not a second idea — it is the same move, read twice by two detectors built to notice
+  // it at different hours, and it puts a second lot of premium on one thesis while the journal
+  // reports two independent signals. On 2026-09-09 it happened three times in one morning.
+
+  it('refuses a stock displacement has already taken today', () => {
+    assert.equal(
+      newlyConfirmed([row('ADANIENT')], none, NOW, 65, new Set(['ADANIENT'])).length, 0,
+      'ADANIENT was bought at 09:54 by displacement and again at 10:30 by this channel',
+    );
+  });
+
+  it('blocks on the symbol, not the direction — the opposite read is worse, not different', () => {
+    const bull = row('ADANIENT', { direction: 'Bullish' });
+    const bear = row('ADANIENT', { direction: 'Bearish' });
+    assert.equal(newlyConfirmed([bull], none, NOW, 65, new Set(['ADANIENT'])).length, 0);
+    assert.equal(newlyConfirmed([bear], none, NOW, 65, new Set(['ADANIENT'])).length, 0);
+  });
+
+  it('leaves every other stock alone', () => {
+    const rows = [row('ADANIENT'), row('KPITTECH'), row('COALINDIA')];
+    const out = newlyConfirmed(rows, none, NOW, 65, new Set(['ADANIENT', 'COALINDIA']));
+    assert.deepEqual(out.map((r) => r.symbol), ['KPITTECH']);
+  });
+
+  it('is a no-op when displacement has taken nothing', () => {
+    assert.equal(newlyConfirmed([row('KPITTECH')], none, NOW, 65, none).length, 1);
+  });
+
   it('ignores a row with no conviction reading at all', () => {
     assert.equal(newlyConfirmed([{ symbol: 'X', conviction: null } as unknown as MomentumRow], none, NOW, 65).length, 0);
   });

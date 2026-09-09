@@ -282,6 +282,22 @@ async function load(day: string): Promise<AlertState> {
   return saved && saved.day === day ? { day, announced: saved.announced ?? [] } : { ...EMPTY, day };
 }
 
+/**
+ * The symbols this channel has already spent the day on — read by the OTHER channels, so one
+ * stock cannot be bought twice on one morning under two different names.
+ *
+ * Displacement is the one that gets to claim a symbol, because it is the one that fires first:
+ * its window closes at 10:00 and a trend day cannot confirm before 10:30. By the time trend-day
+ * looks, this answer is final for the day.
+ *
+ * Reads the announced set rather than the journal on purpose. That set is written BEFORE the
+ * message is sent, so it is true even for an alert whose contract could not be resolved — which
+ * still cost the alert and still named the stock.
+ */
+export async function displacementTaken(day: string): Promise<Set<string>> {
+  return new Set((await load(day)).announced);
+}
+
 /* ---------------------------------------------------------------------- the message --- */
 
 const inr = (v: number): string => `₹${Math.round(v).toLocaleString('en-IN')}`;

@@ -44,6 +44,7 @@ import { stockChain } from '../data/option-chain.js';
 import { universe } from '../data/universe.js';
 import { selectStrike } from '../services/strike.service.js';
 import { recordEntries } from '../journal/journal.js';
+import { displacementTaken } from './displacement.js';
 import { latestTrendPlans, type TrendDayPlan } from '../engine/momentum.engine.js';
 import type {
   ConvictionSummary, MomentumConfig, MomentumRow, SignalPlan, StrikeChoice,
@@ -197,6 +198,20 @@ export function newlyConfirmed(
   announced: Set<string>,
   nowMs: number,
   floor: number,
+  /**
+   * Symbols another channel has already taken today — see `displacementTaken`.
+   *
+   * ONE STOCK, ONE POSITION, whatever names the day gives it. A displacement alert at 09:50 and
+   * a trend-day confirmation at 10:30 on the same underlying are not two ideas: it is the same
+   * move, read twice by two detectors that were built to notice it at different hours. Buying it
+   * again puts a second lot of premium on one thesis while the journal reports two independent
+   * signals, which flatters the count and doubles the loss when the move fails. On 2026-09-09 it
+   * happened three times in one morning — ADANIENT, COALINDIA and HDFCLIFE were each taken twice.
+   *
+   * Blocked on the SYMBOL, not on the direction: the second read being bearish where the first
+   * was bullish makes it a worse trade, not a different one.
+   */
+  blocked: Set<string> = new Set(),
 ): MomentumRow[] {
   return rows.filter((r) => {
     const c = r.conviction;
@@ -206,6 +221,7 @@ export function newlyConfirmed(
     // that stops a restart from announcing a whole afternoon at once.
     if (nowMs - c.confirmedAt > MAX_CONFIRM_AGE_MS) return false;
     if (c.score < floor) return false;
+    if (blocked.has(r.symbol)) return false;
     return !announced.has(key(r.symbol, c.direction === 'Bullish' ? 1 : -1));
   });
 }
@@ -776,7 +792,12 @@ export async function onScan(
       return [];
     }
 
-    const fresh = newlyConfirmed(rows, announced, nowMs, minConviction());
+    // Whatever displacement has already bought this morning is not available to be bought again.
+    // Read every scan rather than cached: displacement's window overlaps the early part of this
+    // one, so the set can still grow between two ticks of this channel.
+    const fresh = newlyConfirmed(
+      rows, announced, nowMs, minConviction(), await displacementTaken(day),
+    );
     if (!fresh.length) return [];
 
     const alerts: TrendDayAlert[] = fresh

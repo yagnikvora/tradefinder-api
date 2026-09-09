@@ -42,7 +42,9 @@
 // edit it takes the row out of settlement's hands, or the nightly pass would grade your 11:00
 // exit as a 15:15 square-off.
 
-import { istDay, istMinutes, SESSION_CLOSE_MIN, SESSION_OPEN_MIN } from '../session.js';
+import {
+  istDay, istMinutes, sessionAt, SESSION_CLOSE_MIN, SESSION_MINUTES, SESSION_OPEN_MIN,
+} from '../session.js';
 import { feedTick, subscribeKeys, takeSellRange } from '../../feed/client.js';
 import { sessionCandles, type UpstoxCandle } from '../../upstox.js';
 import {
@@ -347,7 +349,16 @@ export async function journalTick(nowMs = Date.now()): Promise<void> {
   await subscribeOpen(nowMs).catch(() => {});
 
   const day = istDay(nowMs);
-  const minute = Math.max(0, istMinutes(nowMs) - SESSION_OPEN_MIN);
+  // THE TICK IS A LIVE MARKER, and every number it writes is stamped with the minute it is
+  // running in. Outside the session that is not a session minute at all — 22:30 is minute 795 —
+  // and the square-off below fires on `minute >= squareOffMin`, which every minute of the evening
+  // satisfies. A row reopened at night by "revert to settled" was being closed on the spot at
+  // minute 795, against a mark left over from the morning, before settlement ever saw it.
+  //
+  // Nothing here has anything true to say once the close has passed. `settleDay` owns those rows
+  // and prices them from the contract's own candles.
+  const minute = istMinutes(nowMs) - SESSION_OPEN_MIN;
+  if (minute < 0 || minute > SESSION_MINUTES) return;
   const changed: JournalTrade[] = [];
 
   for (const t of await repo.mine(day)) {
@@ -412,7 +423,14 @@ export async function journalTick(nowMs = Date.now()): Promise<void> {
       }
     }
     if (t.status === 'open' && minute >= cfg.squareOffMin && t.mark) {
-      t.exit = { at: nowMs, minute, premium: t.mark.premium, spot: null, source: 'auto', reason: 'square-off' };
+      // Stamped at the square-off minute, not at whichever tick first noticed it had passed. The
+      // two are the same on a running process and differ after a restart, and "the 15:15
+      // square-off" is a rule with a time of its own — it did not happen at 15:23 because that is
+      // when the process woke up.
+      t.exit = {
+        at: sessionAt(day, cfg.squareOffMin), minute: cfg.squareOffMin,
+        premium: t.mark.premium, spot: null, source: 'auto', reason: 'square-off',
+      };
       t.status = 'closed';
       price(t);
       if (!changed.includes(t)) changed.push(t);
@@ -750,17 +768,35 @@ export async function settleDay(day: string, nowMs = Date.now()): Promise<number
 
   const done: JournalTrade[] = [];
   for (const t of pending) {
-    // An edited trade is the operator's record of their own fill. Settlement must not
-    // overwrite it — it would silently replace what they typed with what the market did.
-    if (t.edited) { t.settled = true; t.updatedAt = nowMs; done.push(t); continue; }
     const bars = fetched.get(t.contract!.instrumentKey) ?? [];
+    // An edited trade is the operator's record of their own fill. Settlement must not overwrite
+    // it — it would silently replace what they typed with what the market did.
+    //
+    // BUT NOT EVERYTHING HERE IS THEIRS. `dayEnd` and the shadow grades describe what the
+    // CONTRACT did: both are computed from bars and the entry alone, neither reads `t.exit`, and
+    // on a hand-exited row they are the only things that can answer whether getting out early was
+    // right. Skipping the whole block withheld them from exactly the rows that needed them most —
+    // a manual exit came back with no 15:15 counterfactual to judge itself against.
+    if (t.edited) {
+      if (bars.length) {
+        t.dayEnd = dayEndOf(
+          bars, t.entry.premium, t.entry.minute,
+          t.contract!.lotSize * t.lots, t.lots, cfg.squareOffMin,
+        );
+        t.shadow = SHADOW.map((s): JournalShadow => {
+          const w = gradeRule(bars, t.entry.premium, t.entry.minute, s, cfg.squareOffMin);
+          return { name: s.name, pct: +w.pct.toFixed(4), out: w.out, minute: w.minute };
+        });
+      }
+      t.settled = true; t.updatedAt = nowMs; done.push(t); continue;
+    }
     if (!bars.length) {
       // No candles for the contract. Keep whatever the live marks concluded rather than
       // inventing a price, and say so.
       if (!t.exit) {
         t.exit = {
-          at: nowMs, minute: t.entry.minute, premium: t.entry.premium, spot: null,
-          source: 'auto', reason: 'untracked',
+          at: sessionAt(day, t.entry.minute), minute: t.entry.minute, premium: t.entry.premium,
+          spot: null, source: 'auto', reason: 'untracked',
         };
         t.note = [t.note, 'no candles for the contract; exit not priced'].filter(Boolean).join(' · ');
         t.status = 'closed';
@@ -772,8 +808,13 @@ export async function settleDay(day: string, nowMs = Date.now()): Promise<number
       bars, t.entry.premium, t.entry.minute, cfg.tpPct, cfg.slPct, cfg.squareOffMin,
       cfg.armAtPct > 0 ? { armAt: cfg.armAtPct, lock: cfg.lockPct } : undefined,
     );
+    // `at` comes from the minute the candle says it happened, NOT from `nowMs`. Settlement is a
+    // catch-up job: it grades an afternoon that is already over, and on a restart it grades days
+    // that are weeks over. Stamping it with its own clock is how a 12:05 checkpoint came to be
+    // filed at 3:16 PM, and how a row re-settled in the evening claimed an eleven-hour hold.
     t.exit = {
-      at: nowMs, minute: r.minute, premium: +(t.entry.premium * (1 + r.pct)).toFixed(2),
+      at: sessionAt(day, r.minute), minute: r.minute,
+      premium: +(t.entry.premium * (1 + r.pct)).toFixed(2),
       spot: null, source: 'auto',
       reason: r.out === 'close' ? 'square-off' : r.out,
     };
@@ -1136,8 +1177,22 @@ export async function journalPatch(id: string, patch: JournalPatch): Promise<Jou
     if (t.original) {
       t.entry = t.original.entry;
       t.exit = t.original.exit;
+      // The size comes back with the prices. The edit dialog always sends `lots`, so leaving it
+      // behind on a revert left the operator's position size attached to the app's entry price —
+      // a row that was never held, at a price that was never paid.
+      if (t.original.lots !== undefined) t.lots = t.original.lots;
       t.status = t.exit ? 'closed' : 'open';
       delete t.original;
+    }
+    // The running mark was measured against the entry that has just been thrown away, so its
+    // `pct` now describes a trade this row is not: a revert came back still advertising +33%
+    // against an entry that made it -5.7%. The premium is an observed price and stays; only the
+    // percentage is re-expressed against the entry now in force.
+    if (t.mark && t.entry.premium > 0) {
+      t.mark = {
+        ...t.mark,
+        pct: +((t.mark.premium - t.entry.premium) / t.entry.premium).toFixed(4),
+      };
     }
     t.edited = false;
     // Left unsettled on purpose: the next settlement pass owns this row again, and for a past
@@ -1148,7 +1203,8 @@ export async function journalPatch(id: string, patch: JournalPatch): Promise<Jou
     // Snapshot before the first mutation, never after — a second edit must not overwrite the
     // only copy of what the market actually said.
     const wasEdited = t.edited;
-    if (!wasEdited) t.original = { entry: { ...t.entry }, exit: t.exit ? { ...t.exit } : null };
+    if (!wasEdited)
+      t.original = { entry: { ...t.entry }, exit: t.exit ? { ...t.exit } : null, lots: t.lots };
     if (patch.entryPremium !== undefined) {
       t.entry.premium = +patch.entryPremium.toFixed(2);
       t.entry.source = 'manual';
@@ -1222,7 +1278,7 @@ export async function journalExitNow(id: string, nowMs = Date.now()): Promise<Jo
   // what the market said before the operator overrode it, and it is what "revert to settled"
   // reads. `exit: null` rather than a copy because the guard above has already established that
   // there is no exit yet — reverting this row has to put it back to open.
-  if (!t.edited) t.original = { entry: { ...t.entry }, exit: null };
+  if (!t.edited) t.original = { entry: { ...t.entry }, exit: null, lots: t.lots };
 
   // The excursions have to bracket the outcome. Exiting at the high of the day and leaving `mfe`
   // below the exit would show a row that beat its own best price, which reads as a broken record
@@ -1234,7 +1290,12 @@ export async function journalExitNow(id: string, nowMs = Date.now()): Promise<Jo
   t.mark = { at: nowMs, premium, pct: +pct.toFixed(4) };
   t.exit = { at: nowMs, minute, premium, spot: null, source: 'manual', reason: 'manual' };
   t.status = 'closed';
-  t.settled = true;
+  // DELIBERATELY LEFT UNSETTLED. `edited` is what protects this fill from being re-graded — the
+  // settle pass checks that flag and keeps its hands off the prices. `settled` means something
+  // else: that the after-close pass has been over this row and given it the things only candles
+  // can, its archived option path and its 15:15 counterfactual. Setting it here hid the row from
+  // `settleDay` altogether, so a hand-exited trade was the one kind in the journal that never got
+  // its path archived — and the path expires with the series about four weeks later.
   t.edited = true;
   price(t);
   await repo.save([t]);

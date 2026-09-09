@@ -96,14 +96,18 @@ describe('journal · exit now', () => {
     assert.equal(t.exit?.premium, 12.5);
   });
 
-  it('locks settlement out of the row', async () => {
+  it('locks the prices without hiding the row from settlement', async () => {
     await seed();
     book(14, 16);
     const t = (await journalExitNow(ID, NOW))!;
-    // Without both of these `settleDay` re-grades the trade against the shipped +80/-50 path and
-    // replaces a real 11:00 exit with a modelled 15:15 square-off.
-    assert.equal(t.edited, true, 'settleDay skips only edited rows');
-    assert.equal(t.settled, true);
+    // `edited` is the lock, and it is the whole lock: `settleDay` checks that flag and keeps its
+    // hands off the prices, so a real 11:00 exit is never replaced by a modelled 15:15 square-off.
+    assert.equal(t.edited, true, 'settleDay leaves the prices of edited rows alone');
+    // `settled` is NOT a lock and must not be set here. It means the after-close pass has been
+    // over this row, and claiming it early hid the trade from `settleDay` altogether — which cost
+    // it the two things only that pass can give: its archived option path, which expires with the
+    // series about four weeks later, and the 15:15 counterfactual the exit is judged against.
+    assert.equal(t.settled, false, 'the after-close pass still owes this row a path and a dayEnd');
   });
 
   it('books the money, charges included', async () => {
